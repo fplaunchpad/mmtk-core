@@ -18,6 +18,15 @@ pub struct GlobalState {
     pub(crate) initialized: AtomicBool,
     /// The current GC status.
     pub(crate) gc_status: Mutex<GcStatus>,
+    /// Lock-free mirror of whether a GC is in progress (i.e. `gc_status != NotInGC`).
+    /// Written under the `gc_status` mutex (in `MMTK::set_gc_status`) but READABLE
+    /// without taking that lock, via `MMTK::gc_in_progress_relaxed`. The OCaml binding
+    /// needs a lock-free GC-in-progress query: its STW parker holds the binding's own
+    /// STW lock, and the collector takes `gc_status` BEFORE that lock (in
+    /// `stop_all_mutators`), so reading `gc_status` from the parker would invert the
+    /// lock order and deadlock. This atomic lets the parker self-heal an orphaned
+    /// binding-side STW flag (bug #3c) by consulting MMTk's real state lock-free.
+    pub(crate) gc_in_progress_flag: AtomicBool,
     /// When did the last GC start? Only accessed by the last parked worker.
     pub(crate) gc_start_time: AtomicRefCell<Option<Instant>>,
     /// Is the current GC an emergency collection? Emergency means we may run out of memory soon, and we should
@@ -202,6 +211,7 @@ impl Default for GlobalState {
         Self {
             initialized: AtomicBool::new(false),
             gc_status: Mutex::new(GcStatus::NotInGC),
+            gc_in_progress_flag: AtomicBool::new(false),
             gc_start_time: AtomicRefCell::new(None),
             stacks_prepared: AtomicBool::new(false),
             emergency_collection: AtomicBool::new(false),

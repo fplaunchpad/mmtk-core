@@ -359,6 +359,12 @@ impl<VM: VMBinding> MMTK<VM> {
             self.stats.start_gc();
         }
         *gc_status = s;
+        // Mirror into the lock-free flag (still under the gc_status mutex, so the
+        // mirror cannot lag the authoritative value for any observer that also takes
+        // the mutex; lock-free readers see a Release/Acquire-consistent value).
+        self.state
+            .gc_in_progress_flag
+            .store(*gc_status != GcStatus::NotInGC, Ordering::Release);
         if *gc_status == GcStatus::NotInGC {
             // FIXME stats
             if self.stats.get_gathering_stats() {
@@ -370,6 +376,18 @@ impl<VM: VMBinding> MMTK<VM> {
     /// Return true if a collection is in progress.
     pub fn gc_in_progress(&self) -> bool {
         *self.state.gc_status.lock().unwrap() != GcStatus::NotInGC
+    }
+
+    /// Lock-free variant of [`gc_in_progress`]. Reads an atomic mirror of the GC
+    /// status instead of taking the `gc_status` mutex, so it is safe to call from a
+    /// context that already holds a lock the collector acquires AFTER `gc_status`
+    /// (taking `gc_status` there would invert the lock order). Used by the OCaml
+    /// binding's STW parker to self-heal an orphaned STW flag (bug #3c). The value
+    /// is the same truth as `gc_in_progress`, only possibly observed without the
+    /// happens-before of the mutex; callers must tolerate a brief skew, which the
+    /// parker does (it re-checks on a bounded timeout).
+    pub fn gc_in_progress_relaxed(&self) -> bool {
+        self.state.gc_in_progress_flag.load(Ordering::Acquire)
     }
 
     /// Return true if a collection is in progress and past the preparatory stage.
