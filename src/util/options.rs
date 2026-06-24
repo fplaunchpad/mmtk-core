@@ -663,6 +663,10 @@ pub enum GCTriggerSelector {
     /// GC is triggered by internal heuristics, and the heap size is varying between the two given values.
     /// The two values are the lower and the upper bound of the heap size.
     DynamicHeapSize(usize, usize),
+    /// Stock-OCaml-style space-overhead sizing: after each GC the heap limit is set to
+    /// `live × (1 + overhead/100)`, clamped to `[min, max]`. The three values are the
+    /// min heap bytes, the max heap bytes, and the overhead percent (e.g. 100 => 2× live).
+    SpaceOverheadSize(usize, usize, usize),
     /// Delegate the GC triggering to the binding.
     Delegated,
 }
@@ -678,6 +682,7 @@ impl GCTriggerSelector {
         match self {
             Self::FixedHeapSize(s) => *s,
             Self::DynamicHeapSize(_, s) => *s,
+            Self::SpaceOverheadSize(_, s, _) => *s,
             _ => unreachable!("Cannot get max heap size"),
         }
     }
@@ -722,6 +727,7 @@ impl GCTriggerSelector {
         match self {
             Self::FixedHeapSize(size) => *size > 0,
             Self::DynamicHeapSize(min, max) => min <= max,
+            Self::SpaceOverheadSize(min, max, _) => min <= max,
             Self::Delegated => true,
         }
     }
@@ -738,6 +744,10 @@ impl FromStr for GCTriggerSelector {
             static ref DYNAMIC_HEAP_REGEX: Regex =
                 Regex::new(r"^DynamicHeapSize:(?P<min>\d+[kKmMgGtT]?),(?P<max>\d+[kKmMgGtT]?)$")
                     .unwrap();
+            static ref SPACE_OVERHEAD_REGEX: Regex = Regex::new(
+                r"^SpaceOverheadSize:(?P<min>\d+[kKmMgGtT]?),(?P<max>\d+[kKmMgGtT]?),(?P<oh>\d+)$"
+            )
+            .unwrap();
         }
 
         if s.is_empty() {
@@ -750,6 +760,11 @@ impl FromStr for GCTriggerSelector {
             let min = Self::parse_size(&captures["min"])?;
             let max = Self::parse_size(&captures["max"])?;
             return Ok(Self::DynamicHeapSize(min, max));
+        } else if let Some(captures) = SPACE_OVERHEAD_REGEX.captures(s) {
+            let min = Self::parse_size(&captures["min"])?;
+            let max = Self::parse_size(&captures["max"])?;
+            let oh = captures["oh"].parse::<usize>().map_err(|e| e.to_string())?;
+            return Ok(Self::SpaceOverheadSize(min, max, oh));
         } else if s.starts_with("Delegated") {
             return Ok(Self::Delegated);
         }

@@ -57,6 +57,23 @@ impl<VM: VMBinding> GCTrigger<VM> {
 
                     Box::new(MemBalancerTrigger::new(min_pages, max_pages))
                 }
+                GCTriggerSelector::SpaceOverheadSize(min, max, overhead_pct) => {
+                    'space_overhead: {
+                        let min_pages = conversions::bytes_to_pages_up(min);
+                        let max_pages = conversions::bytes_to_pages_up(max);
+                        if *options.plan == crate::util::options::PlanSelector::NoGC {
+                            warn!("Cannot use space-overhead heap size with NoGC. Using fixed heap size (max) instead.");
+                            break 'space_overhead Box::new(FixedHeapSizeTrigger {
+                                total_pages: max_pages,
+                            });
+                        }
+                        Box::new(SpaceOverheadTrigger::new(
+                            min_pages,
+                            max_pages,
+                            overhead_pct as f64 / 100.0,
+                        ))
+                    }
+                }
                 GCTriggerSelector::Delegated => {
                     <VM::VMCollection as crate::vm::Collection<VM>>::create_gc_trigger()
                 }
@@ -348,6 +365,73 @@ impl<VM: VMBinding> GCTriggerPolicy<VM> for FixedHeapSizeTrigger {
 
     fn can_heap_size_grow(&self) -> bool {
         false
+    }
+}
+
+/// A simple stock-OCaml-style trigger: after each GC, size the heap to a fixed
+/// multiple of the live set — `heap_limit = live × (1 + overhead)` — clamped to
+/// `[min, max]`. Unlike MemBalancer (whose sqrt rule gives *sublinear* headroom and
+/// underprovisions large-live-set programs), the headroom here is LINEAR in live, so
+/// the heap always has room proportional to what is alive: few major GCs while RSS
+/// still tracks the live set. This is exactly OCaml's `Gc.space_overhead`.
+pub struct SpaceOverheadTrigger {
+    min_heap_pages: usize,
+    max_heap_pages: usize,
+    /// Headroom factor: heap = live × (1 + overhead). (e.g. 1.0 => 2× live.)
+    overhead: f64,
+    current_heap_pages: AtomicUsize,
+}
+impl SpaceOverheadTrigger {
+    fn new(min_heap_pages: usize, max_heap_pages: usize, overhead: f64) -> Self {
+        Self {
+            min_heap_pages,
+            max_heap_pages,
+            overhead,
+            current_heap_pages: AtomicUsize::new(min_heap_pages),
+        }
+    }
+}
+impl<VM: VMBinding> GCTriggerPolicy<VM> for SpaceOverheadTrigger {
+    fn is_gc_required(
+        &self,
+        space_full: bool,
+        space: Option<SpaceStats<VM>>,
+        plan: &dyn Plan<VM = VM>,
+    ) -> bool {
+        plan.collection_required(space_full, space)
+    }
+
+    fn on_gc_end(&self, mmtk: &'static MMTK<VM>) {
+        // Only resize after a FULL/major GC. A nursery GC's `get_reserved_pages()` is
+        // transiently inflated (un-released nursery + Immix block fragmentation), so
+        // resizing on it overshoots — badly, since smaller nurseries do more nursery
+        // GCs. Post-full-GC, reserved ≈ the live set.
+        if let Some(gen) = mmtk.get_plan().generational() {
+            if !gen.last_collection_full_heap() {
+                return;
+            }
+        }
+        // Size the heap to live × (1 + overhead), clamped to [min, max].
+        let live = mmtk.get_plan().get_reserved_pages();
+        let target = ((live as f64) * (1.0 + self.overhead)) as usize;
+        let clamped = target.clamp(self.min_heap_pages, self.max_heap_pages);
+        self.current_heap_pages.store(clamped, Ordering::Relaxed);
+    }
+
+    fn is_heap_full(&self, plan: &dyn Plan<VM = VM>) -> bool {
+        plan.get_reserved_pages() > self.current_heap_pages.load(Ordering::Relaxed)
+    }
+
+    fn get_current_heap_size_in_pages(&self) -> usize {
+        self.current_heap_pages.load(Ordering::Relaxed)
+    }
+
+    fn get_max_heap_size_in_pages(&self) -> usize {
+        self.max_heap_pages
+    }
+
+    fn can_heap_size_grow(&self) -> bool {
+        self.current_heap_pages.load(Ordering::Relaxed) < self.max_heap_pages
     }
 }
 
