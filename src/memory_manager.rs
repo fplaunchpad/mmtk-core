@@ -28,6 +28,35 @@ use crate::vm::ReferenceGlue;
 use crate::vm::VMBinding;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Process-global toggle for allocation-time zero-fill (RQ8, ocaml-mmtk).
+///
+/// Default `true` = mmtk-core zeros recyclable lines / fresh pages before handing
+/// them to the mutator (the original, always-safe behaviour). A binding may set it
+/// `false` to skip that eager zeroing when (and only when) the VM fully initializes
+/// every object before any GC-observable safepoint AND the plan is stop-the-world —
+/// a concurrent marker can observe the header-written / fields-unwritten window and
+/// must keep zeroing on. The two allocation-time zeroing sites
+/// (`ImmixAllocator::acquire_recyclable_lines` and
+/// `Space::get_new_pages_and_initialize`) consult this at runtime; GC-time metadata
+/// bzero is unaffected. See [`set_alloc_zeroed`] / [`is_alloc_zeroed`].
+pub(crate) static ALLOC_ZEROED: AtomicBool = AtomicBool::new(true);
+
+/// Set whether allocation-time zero-fill is performed (RQ8, ocaml-mmtk). Process
+/// global; the default is `true` (zero — safe for every plan). A binding must call
+/// this **before any allocation** (e.g. right after `mmtk_init`, once the plan is
+/// known) if it wants to disable zeroing. `false` is only sound for a VM that fully
+/// initializes objects before any GC-observable safepoint under a stop-the-world
+/// plan; keep it `true` for concurrent-marking plans.
+pub fn set_alloc_zeroed(zeroed: bool) {
+    ALLOC_ZEROED.store(zeroed, Ordering::Relaxed);
+}
+
+/// Whether allocation-time zero-fill is currently enabled (RQ8, ocaml-mmtk).
+pub fn is_alloc_zeroed() -> bool {
+    ALLOC_ZEROED.load(Ordering::Relaxed)
+}
 
 /// Initialize an MMTk instance. A VM should call this method after creating an [`crate::MMTK`]
 /// instance but before using any of the methods provided in MMTk (except `process()` and `process_bulk()`).

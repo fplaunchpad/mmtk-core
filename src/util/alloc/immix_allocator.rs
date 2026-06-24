@@ -250,13 +250,16 @@ impl<VM: VMBinding> ImmixAllocator<VM> {
                     end_line,
                     self.tls
                 );
-                // RQ8: gated off under `no_zero_alloc` (STW plans only) — OCaml
-                // initializes every block before the next GC-observable point.
-                #[cfg(not(feature = "no_zero_alloc"))]
-                crate::util::memory::zero(
-                    self.bump_pointer.cursor,
-                    self.bump_pointer.limit - self.bump_pointer.cursor,
-                );
+                // RQ8 (ocaml-mmtk): allocation-time zero-fill is a runtime toggle
+                // (`memory_manager::set_alloc_zeroed`), default on. A binding turns it
+                // off for stop-the-world plans whose VM initializes every block before
+                // the next GC-observable safepoint; it stays on for concurrent marking.
+                if crate::memory_manager::is_alloc_zeroed() {
+                    crate::util::memory::zero(
+                        self.bump_pointer.cursor,
+                        self.bump_pointer.limit - self.bump_pointer.cursor,
+                    );
+                }
                 debug_assert!(
                     align_allocation_no_fill::<VM>(self.bump_pointer.cursor, align, offset) + size
                         <= self.bump_pointer.limit

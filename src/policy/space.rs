@@ -226,8 +226,10 @@ pub trait Space<VM: VMBinding>: 'static + SFT + Sync + Downcast {
         }
 
         // TODO: Concurrent zeroing
-        // RQ8: `no_zero_alloc` (STW plans only) skips eager page zeroing — see Cargo.toml.
-        if self.common().zeroed && !cfg!(feature = "no_zero_alloc") {
+        // RQ8 (ocaml-mmtk): eager page zeroing is a runtime toggle
+        // (`memory_manager::set_alloc_zeroed`), default on. Skipped only when a
+        // binding has disabled it (stop-the-world plan + init-before-safepoint VM).
+        if self.common().zeroed && crate::memory_manager::is_alloc_zeroed() {
             memory::zero(res.start, bytes);
         }
 
