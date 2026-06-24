@@ -58,6 +58,33 @@ pub fn is_alloc_zeroed() -> bool {
     ALLOC_ZEROED.load(Ordering::Relaxed)
 }
 
+/// Is the current GC a nursery (minor) GC? (GH#5, ocaml-mmtk.)
+///
+/// Returns `false` for non-generational plans and for full-heap collections; `true`
+/// only while a generational plan is performing a nursery collection. The
+/// underlying flag is set at GC prepare time and valid throughout the GC, so this is
+/// safe to consult from `Scanning::process_weak_refs`. This re-exports the
+/// otherwise module-sealed [`crate::plan::is_nursery_gc`] so a binding can make its
+/// weak / ephemeron / finaliser liveness pass generational-aware: at a nursery GC a
+/// mature (or freshly promoted) referent has no current mark bit and must be treated
+/// as live rather than cleared.
+pub fn current_gc_is_nursery<VM: VMBinding>(mmtk: &MMTK<VM>) -> bool {
+    crate::plan::is_nursery_gc(mmtk.get_plan())
+}
+
+/// Is `object` resident in the nursery? (GH#5, ocaml-mmtk.)
+///
+/// Returns `false` for non-generational plans, and for any object that is mature or
+/// has been promoted out of the nursery. For plans where young and mature share a
+/// space and are distinguished only by per-object metadata (StickyImmix) this uses
+/// that metadata; where address-based membership is unavailable it errs toward
+/// `false` (mature) — see [`crate::plan::generational::global::GenerationalPlan`].
+pub fn is_object_in_nursery<VM: VMBinding>(mmtk: &MMTK<VM>, object: ObjectReference) -> bool {
+    mmtk.get_plan()
+        .generational()
+        .is_some_and(|p| p.is_object_in_nursery(object))
+}
+
 /// Initialize an MMTk instance. A VM should call this method after creating an [`crate::MMTK`]
 /// instance but before using any of the methods provided in MMTk (except `process()` and `process_bulk()`).
 ///
