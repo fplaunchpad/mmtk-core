@@ -73,6 +73,22 @@ impl WorkerParker {
         new == self.worker_count
     }
 
+    /// Set the total number of (live) workers.
+    ///
+    /// This is used by dynamic worker scaling: the OCaml binding defers spawning GC worker
+    /// threads until the first GC and sizes the pool to the number of running domains.  The
+    /// rendezvous in `inc_parked_workers` requires `worker_count` to equal the number of LIVE
+    /// worker threads, so this must be called BEFORE any worker for the upcoming GC parks (and
+    /// never while a GC is in progress / any worker is parked).
+    fn set_worker_count(&mut self, worker_count: usize) {
+        debug_assert_eq!(
+            self.parked_workers, 0,
+            "set_worker_count called while {} worker(s) are parked",
+            self.parked_workers
+        );
+        self.worker_count = worker_count;
+    }
+
     /// Decrease the packed-workers counter.
     /// Called after a worker is resumed from the parked state.
     fn dec_parked_workers(&mut self) {
@@ -93,6 +109,16 @@ impl WorkerMonitor {
             }),
             workers_have_anything_to_do: Default::default(),
         }
+    }
+
+    /// Set the number of live GC worker threads the parked-worker rendezvous expects.
+    ///
+    /// Used by dynamic worker scaling (see `WorkerParker::set_worker_count`).  Must only be
+    /// called when no GC is in progress and no worker is parked (i.e. before the workers for the
+    /// upcoming GC park), so the "all workers parked" barrier counts exactly the live threads.
+    pub fn set_worker_count(&self, worker_count: usize) {
+        let mut guard = self.sync.lock().unwrap();
+        guard.parker.set_worker_count(worker_count);
     }
 
     /// Make a request.  Can be called by a mutator to request the workers to work towards the

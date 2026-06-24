@@ -252,6 +252,22 @@ impl<VM: VMBinding> MMTK<VM> {
         probe!(mmtk, collection_initialized);
     }
 
+    /// Like [`Self::initialize_collection`], but defer the spawning of GC worker threads to the
+    /// first GC, where the worker pool is sized to the live mutator count (dynamic worker
+    /// scaling).  Worker-pool preallocation (queues/stealers/shared state) still happens eagerly
+    /// at `MMTK::new`; only the OS threads are deferred.  Collection is considered initialised
+    /// after this call (allocation may proceed and trigger the first GC, which spawns the
+    /// workers).
+    pub fn initialize_collection_deferred(&'static self, tls: VMThread) {
+        assert!(
+            !self.state.is_initialized(),
+            "MMTk collection has been initialized (was initialize_collection() already called before?)"
+        );
+        self.scheduler.defer_spawn_gc_threads(self, tls);
+        self.state.initialized.store(true, Ordering::SeqCst);
+        probe!(mmtk, collection_initialized);
+    }
+
     /// Prepare an MMTk instance for calling the `fork()` system call.
     ///
     /// The `fork()` system call is available on Linux and some UNIX variants, and may be emulated

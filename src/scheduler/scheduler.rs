@@ -11,13 +11,14 @@ use crate::global_state::GcStatus;
 use crate::mmtk::MMTK;
 use crate::util::opaque_pointer::*;
 use crate::util::options::AffinityKind;
+use crate::vm::ActivePlan;
 use crate::vm::Collection;
 use crate::vm::VMBinding;
 use crate::Plan;
 use crossbeam::deque::Steal;
 use enum_map::{Enum, EnumMap};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 pub struct GCWorkScheduler<VM: VMBinding> {
@@ -29,6 +30,19 @@ pub struct GCWorkScheduler<VM: VMBinding> {
     pub(crate) worker_monitor: Arc<WorkerMonitor>,
     /// How to assign the affinity of each GC thread. Specified by the user.
     affinity: AffinityKind,
+    /// Dynamic worker scaling: context retained from `initialize_collection` so worker threads
+    /// can be spawned lazily at the first GC, sized to the live mutator (domain) count.  `None`
+    /// once the workers have been spawned (or if eager spawning was used).
+    deferred_spawn: Mutex<Option<DeferredSpawn<VM>>>,
+}
+
+/// Retained context for dynamic worker scaling (deferred worker-thread spawn).  See
+/// [`GCWorkScheduler::defer_spawn_gc_threads`] and [`GCWorkScheduler::ensure_workers_spawned`].
+struct DeferredSpawn<VM: VMBinding> {
+    /// The MMTk instance, needed to construct `GCWorker` instances at spawn time.
+    mmtk: &'static MMTK<VM>,
+    /// The VM thread that initialised collection; passed to `Collection::spawn_gc_thread`.
+    tls: VMThread,
 }
 
 // FIXME: GCWorkScheduler should be naturally Sync, but we cannot remove this `impl` yet.
@@ -74,11 +88,19 @@ impl<VM: VMBinding> GCWorkScheduler<VM> {
             worker_group,
             worker_monitor,
             affinity,
+            deferred_spawn: Mutex::new(None),
         })
     }
 
+    /// The number of worker *slots* — the maximum number of workers that may run.  Used to size
+    /// per-worker data structures (block pools, etc.) at plan/space construction, which must be
+    /// large enough for the highest worker ordinal that can ever run.  Under dynamic worker
+    /// scaling the number of *live* worker threads (`worker_group.worker_count()`) may be smaller
+    /// and is decided lazily at the first GC, but a worker's ordinal is always in
+    /// `[0, num_workers())`, so sizing to the preallocated slot count is correct (and safe even
+    /// before any thread is spawned).
     pub fn num_workers(&self) -> usize {
-        self.worker_group.as_ref().worker_count()
+        self.worker_group.as_ref().max_workers()
     }
 
     /// Create GC threads for the first time.  It will also create the `GCWorker` instances.
@@ -87,6 +109,44 @@ impl<VM: VMBinding> GCWorkScheduler<VM> {
     /// group.  We may add more worker groups in the future.
     pub fn spawn_gc_threads(self: &Arc<Self>, mmtk: &'static MMTK<VM>, tls: VMThread) {
         self.worker_group.initial_spawn(tls, mmtk);
+    }
+
+    /// Dynamic worker scaling: instead of spawning all GC worker threads at
+    /// `initialize_collection`, retain the spawn context and defer the actual spawn to the first
+    /// GC, where the pool is sized to the live mutator count.  Preallocation (queues, stealers,
+    /// `GCWorkerShared`) has already happened in `WorkerGroup::new`; only the threads are deferred.
+    pub fn defer_spawn_gc_threads(self: &Arc<Self>, mmtk: &'static MMTK<VM>, tls: VMThread) {
+        let mut deferred = self.deferred_spawn.lock().unwrap();
+        *deferred = Some(DeferredSpawn { mmtk, tls });
+    }
+
+    /// Dynamic worker scaling: ensure the GC worker threads are spawned, sizing the pool (once,
+    /// the first time this runs) to `clamp(number_of_mutators, 1, max_workers)`.
+    ///
+    /// This MUST be called by a mutator on the path to requesting the first GC, while no GC is in
+    /// progress and no worker is parked, so that `WorkerMonitor`'s worker count is fixed to the
+    /// number of live worker threads BEFORE any of them park for that GC.  After the first call it
+    /// is a cheap no-op (the deferred context is consumed).
+    pub fn ensure_workers_spawned(self: &Arc<Self>) {
+        // Fast path: already spawned (deferred context consumed).  Avoids the lock on every GC.
+        // The `Mutex` makes the spawn happen exactly once even if two mutators race here.
+        let mut deferred = self.deferred_spawn.lock().unwrap();
+        let Some(DeferredSpawn { mmtk, tls }) = deferred.take() else {
+            return;
+        };
+
+        let max = self.worker_group.max_workers();
+        let domains = <VM::VMActivePlan as ActivePlan<VM>>::number_of_mutators();
+        let active = domains.clamp(1, max);
+        debug!(
+            "Dynamic worker scaling: spawning {} GC worker thread(s) (domains={}, max={}).",
+            active, domains, max
+        );
+
+        // Fix the rendezvous count to the number of threads we are about to spawn, BEFORE any of
+        // them can park.  No worker exists yet, so no worker can be parked here.
+        self.worker_monitor.set_worker_count(active);
+        self.worker_group.deferred_initial_spawn(active, tls, mmtk);
     }
 
     /// Ask all GC workers to exit for forking.
@@ -123,8 +183,12 @@ impl<VM: VMBinding> GCWorkScheduler<VM> {
     }
 
     /// Request a GC to be scheduled.  Called by mutator via `GCTrigger`.
-    pub(crate) fn request_schedule_collection(&self) {
+    pub(crate) fn request_schedule_collection(self: &Arc<Self>) {
         debug!("A mutator is sending GC-scheduling request to workers...");
+        // Dynamic worker scaling: lazily spawn the worker threads (sized to the live domain
+        // count) on the first GC.  Done here — on the mutator, before it notifies/parks and
+        // before any worker exists/parks — so the rendezvous count is fixed first.
+        self.ensure_workers_spawned();
         self.worker_monitor.make_request(WorkerGoal::Gc);
     }
 

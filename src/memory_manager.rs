@@ -622,6 +622,11 @@ pub fn initialize_collection<VM: VMBinding>(mmtk: &'static MMTK<VM>, tls: VMThre
     mmtk.initialize_collection(tls);
 }
 
+/// Wrapper for [`crate::mmtk::MMTK::initialize_collection_deferred`] (dynamic worker scaling).
+pub fn initialize_collection_deferred<VM: VMBinding>(mmtk: &'static MMTK<VM>, tls: VMThread) {
+    mmtk.initialize_collection_deferred(tls);
+}
+
 /// Process MMTk run-time options. Returns true if the option is processed successfully.
 ///
 /// Arguments:

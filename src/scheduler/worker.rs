@@ -272,7 +272,10 @@ enum WorkerCreationState<VM: VMBinding> {
     /// The initial state.  `GCWorker` structs have not been created and GC worker threads have not
     /// been spawn.
     Initial {
-        /// The local work queues for to-be-created workers.
+        /// The local work queues for to-be-created workers.  There is one per *preallocated*
+        /// worker slot (`max_workers`).  Dynamic worker scaling may spawn only a prefix of these
+        /// (the first `active` slots); the rest stay unused but are kept so the `GCWorkerShared`
+        /// stealers at those indices remain valid (they are simply never polled).
         local_work_queues: Vec<deque::Worker<Box<dyn GCWork<VM>>>>,
     },
     /// All worker threads are spawn and running.  `GCWorker` structs have been transferred to
@@ -293,8 +296,14 @@ enum WorkerCreationState<VM: VMBinding> {
 
 /// A worker group to manage all the GC workers.
 pub(crate) struct WorkerGroup<VM: VMBinding> {
-    /// Shared worker data
+    /// Shared worker data.  This vector is sized to the *maximum* number of workers
+    /// (`max_workers`) at construction time.  Dynamic worker scaling may activate only a prefix
+    /// of these slots; only `active_count` of them correspond to live worker threads.
     pub workers_shared: Vec<Arc<GCWorkerShared<VM>>>,
+    /// The number of *active* (live) worker threads.  This is `0` until the first spawn, after
+    /// which it is fixed at the chosen size.  This — not `workers_shared.len()` — is the number
+    /// that the parked-worker rendezvous counts and that `surrender`/`respawn` reuse.
+    active_count: std::sync::atomic::AtomicUsize,
     /// The stateful part.  `None` means state transition is underway.
     state: Mutex<Option<WorkerCreationState<VM>>>,
 }
@@ -305,13 +314,16 @@ pub(crate) struct WorkerGroup<VM: VMBinding> {
 unsafe impl<VM: VMBinding> Sync for WorkerGroup<VM> {}
 
 impl<VM: VMBinding> WorkerGroup<VM> {
-    /// Create a WorkerGroup
-    pub fn new(num_workers: usize) -> Arc<Self> {
-        let local_work_queues = (0..num_workers)
+    /// Create a WorkerGroup with `max_workers` *preallocated* slots (shared data + local work
+    /// queues + stealers).  No worker threads are spawned yet, and `active_count` is `0`.
+    /// Dynamic worker scaling later activates between 1 and `max_workers` of these via
+    /// [`Self::deferred_initial_spawn`].
+    pub fn new(max_workers: usize) -> Arc<Self> {
+        let local_work_queues = (0..max_workers)
             .map(|_| deque::Worker::new_fifo())
             .collect::<Vec<_>>();
 
-        let workers_shared = (0..num_workers)
+        let workers_shared = (0..max_workers)
             .map(|i| {
                 Arc::new(GCWorkerShared::<VM>::new(Some(
                     local_work_queues[i].stealer(),
@@ -321,19 +333,42 @@ impl<VM: VMBinding> WorkerGroup<VM> {
 
         Arc::new(Self {
             workers_shared,
+            active_count: std::sync::atomic::AtomicUsize::new(0),
             state: Mutex::new(Some(WorkerCreationState::Initial { local_work_queues })),
         })
     }
 
-    /// Spawn GC worker threads for the first time.
+    /// The maximum number of workers this group can ever activate (the preallocated slot count).
+    pub fn max_workers(&self) -> usize {
+        self.workers_shared.len()
+    }
+
+    /// Spawn GC worker threads for the first time, activating ALL preallocated slots.
     pub fn initial_spawn(&self, tls: VMThread, mmtk: &'static MMTK<VM>) {
+        self.deferred_initial_spawn(self.max_workers(), tls, mmtk);
+    }
+
+    /// Spawn `active` GC worker threads for the first time (dynamic worker scaling).
+    ///
+    /// Only the first `active` of the preallocated slots are activated: their `GCWorker` structs
+    /// are created from the matching local work queues and handed to freshly spawned threads.  The
+    /// remaining queues stay in the `Initial` state's buffer, unused.  `active` is clamped to
+    /// `[1, max_workers]`.  This sets `active_count`, which the parked-worker rendezvous and
+    /// surrender/respawn then use.  The caller MUST set `WorkerMonitor`'s worker count to the same
+    /// value before any worker parks.
+    pub fn deferred_initial_spawn(&self, active: usize, tls: VMThread, mmtk: &'static MMTK<VM>) {
+        let active = active.clamp(1, self.max_workers());
         let mut state = self.state.lock().unwrap();
 
-        let WorkerCreationState::Initial { local_work_queues } = state.take().unwrap() else {
+        let WorkerCreationState::Initial { mut local_work_queues } = state.take().unwrap() else {
             panic!("GCWorker structs have already been created");
         };
 
-        let workers = self.create_workers(local_work_queues, mmtk);
+        // Take the first `active` queues for the workers we will spawn; keep the rest unused.
+        let spawn_queues: Vec<_> = local_work_queues.drain(0..active).collect();
+        let workers = self.create_workers(spawn_queues, mmtk);
+        self.active_count
+            .store(active, std::sync::atomic::Ordering::SeqCst);
         self.spawn(workers, tls);
 
         *state = Some(WorkerCreationState::Spawned);
@@ -353,6 +388,11 @@ impl<VM: VMBinding> WorkerGroup<VM> {
     }
 
     /// Create `GCWorker` instances.
+    ///
+    /// `local_work_queues` holds the queues for the workers to be created — there may be fewer of
+    /// them than `workers_shared` slots when dynamic worker scaling activates only a prefix.  The
+    /// first `local_work_queues.len()` shared slots are paired with the queues (a `GCWorker`'s
+    /// ordinal is its index into both `local_work_queues` and `workers_shared`).
     #[allow(clippy::vec_box)] // See `WorkerCreationState::Surrendered`.
     fn create_workers(
         &self,
@@ -361,7 +401,7 @@ impl<VM: VMBinding> WorkerGroup<VM> {
     ) -> Vec<Box<GCWorker<VM>>> {
         debug!("Creating GCWorker instances...");
 
-        assert_eq!(self.workers_shared.len(), local_work_queues.len());
+        assert!(local_work_queues.len() <= self.workers_shared.len());
 
         // Each `GCWorker` instance corresponds to a `GCWorkerShared` at the same index.
         let workers = (local_work_queues.into_iter())
@@ -430,9 +470,13 @@ impl<VM: VMBinding> WorkerGroup<VM> {
         workers.len() == self.worker_count()
     }
 
-    /// Get the number of workers in the group
+    /// Get the number of *active* (live) workers in the group.  This is `0` before the first
+    /// spawn and the chosen active size thereafter.  It may be smaller than the number of
+    /// preallocated `workers_shared` slots (see [`Self::max_workers`]) under dynamic worker
+    /// scaling.  The surrender/respawn machinery and the parked-worker rendezvous all count
+    /// active workers, not preallocated slots.
     pub fn worker_count(&self) -> usize {
-        self.workers_shared.len()
+        self.active_count.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Return true if there're any pending designated work
