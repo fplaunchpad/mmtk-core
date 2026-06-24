@@ -226,7 +226,8 @@ pub trait Space<VM: VMBinding>: 'static + SFT + Sync + Downcast {
         }
 
         // TODO: Concurrent zeroing
-        if self.common().zeroed {
+        // RQ8: `no_zero_alloc` (STW plans only) skips eager page zeroing — see Cargo.toml.
+        if self.common().zeroed && !cfg!(feature = "no_zero_alloc") {
             memory::zero(res.start, bytes);
         }
 

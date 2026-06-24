@@ -250,6 +250,9 @@ impl<VM: VMBinding> ImmixAllocator<VM> {
                     end_line,
                     self.tls
                 );
+                // RQ8: gated off under `no_zero_alloc` (STW plans only) — OCaml
+                // initializes every block before the next GC-observable point.
+                #[cfg(not(feature = "no_zero_alloc"))]
                 crate::util::memory::zero(
                     self.bump_pointer.cursor,
                     self.bump_pointer.limit - self.bump_pointer.cursor,

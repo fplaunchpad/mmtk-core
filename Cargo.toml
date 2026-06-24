@@ -99,6 +99,17 @@ harness = false
 [features]
 default = ["builtin_env_logger", "log/release_max_level_off"]
 
+# OCaml binding (RQ8): skip eager allocation-time zero-fill. OCaml fully
+# initializes every block before any GC-observable safepoint (vanilla OCaml's
+# minor heap is itself never zeroed), so zeroing recyclable lines / fresh pages
+# before the mutator fills them is a redundant double-write (~20% of cycles on
+# allocation-heavy workloads). SAFE for stop-the-world plans ONLY. Do NOT enable
+# for a concurrent-marking plan (ConcurrentImmix): a concurrent marker can observe
+# an object in the header-written / fields-unwritten window, where unzeroed fields
+# read as garbage pointers. This gates only allocation-time zeroing (sites in
+# immix_allocator.rs and policy/space.rs); GC-time metadata bzero is untouched.
+no_zero_alloc = []
+
 # Built-in env_logger.  This feature is enabled by default.
 # The user can disable this default feature to remove `env_logger` from the dependencies.
 # See `crate::util::logger` for more details.
