@@ -439,12 +439,22 @@ impl<VM: VMBinding> GCWorkScheduler<VM> {
             WorkerGoal::Gc => {
                 // We are in the progress of GC.
 
-                // In stop-the-world GC, mutators cannot request for GC while GC is in progress.
-                // When we support concurrent GC, we should remove this assertion.
-                assert!(
-                    !goals.debug_is_requested(WorkerGoal::Gc),
-                    "GC request sent to WorkerMonitor while GC is still in progress."
-                );
+                // In stop-the-world GC, mutators cannot request a GC while a GC is in progress,
+                // so a pending `Gc` request here is a logic error.  Under a *concurrent* plan,
+                // however, a mutator's allocation poll may legitimately request the next GC while
+                // concurrent marking is still running (the request flag is re-armed at the start of
+                // the InitialMark pause, `notify_mutators_paused`, so a mutator can re-request once
+                // mutators resume into the concurrent-marking window).  That request is simply
+                // coalesced in `goals.requests[Gc]` and serviced by the next `respond_to_requests`
+                // after this GC completes — it survives `on_current_goal_completed`, which only
+                // clears `current`.  So only assert for non-concurrent plans (GH#14): the STW-only
+                // assertion the original comment said to remove "when we support concurrent GC".
+                if worker.mmtk.get_plan().concurrent().is_none() {
+                    assert!(
+                        !goals.debug_is_requested(WorkerGoal::Gc),
+                        "GC request sent to WorkerMonitor while GC is still in progress."
+                    );
+                }
 
                 // We are in the middle of GC, and the last GC worker parked.
                 trace!("The last worker parked during GC.  Try to find more work to do...");
