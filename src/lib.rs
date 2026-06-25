@@ -36,6 +36,9 @@ pub use mmtk::MMTKBuilder;
 pub(crate) use mmtk::MMAPPER;
 pub use mmtk::MMTK;
 
+/// LXR runtime configuration (P1 scaffolding — additive, gated to the future LXR plan).
+pub mod args;
+
 mod global_state;
 pub use crate::global_state::LiveBytesStats;
 

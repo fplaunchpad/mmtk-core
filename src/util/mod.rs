@@ -58,6 +58,8 @@ pub(crate) mod object_enum;
 pub(crate) mod object_forwarding;
 /// Reference processing implementation.
 pub(crate) mod reference_processor;
+/// LXR reference-counting helpers (P1 scaffolding — additive, used by the LXR plan only).
+pub(crate) mod rc;
 /// Utilities funcitons for Rust
 pub(crate) mod rust_util;
 /// Sanity checker for GC.

@@ -233,6 +233,31 @@ no_mmap_annotation = []
 # only be used if you understand how VO bit works internally. Use at your own risk.
 vo_bit_access = []
 
+# ---- LXR (P1 scaffolding) compile-time A/B switches ----
+# These are the `lxr_*` cargo features that `src/args.rs` and `src/util/rc.rs` read via
+# `cfg!(feature = "...")`. They are declared here (all OFF by default) so that the vendored LXR
+# scaffolding compiles without `unexpected_cfgs` warnings and so the switches are available for
+# later tuning sweeps (P4/P5). With all of them off we get LXR's *default* configuration.
+# None of these affect existing plans (they are only read by the LXR-only modules).
+lxr_no_lazy = []           # disable lazy decrements
+lxr_no_nursery_evac = []   # disable RC nursery evacuation
+lxr_no_mature_evac = []    # disable RC mature evacuation
+lxr_no_prefetch = []       # disable RC-table prefetch hints
+lxr_rc_bits_2 = []         # 2-bit RC entries (default)
+lxr_rc_bits_4 = []         # 4-bit RC entries
+lxr_rc_bits_8 = []         # 8-bit RC entries
+lxr_buf_256 = []           # inc/dec buffer size 256
+lxr_buf_512 = []           # inc/dec buffer size 512
+lxr_buf_1024 = []          # inc/dec buffer size 1024 (default)
+lxr_buf_2048 = []          # inc/dec buffer size 2048
+lxr_lock_3 = []            # log2 bytes per RC lock bit (3..9; default 9)
+lxr_lock_4 = []
+lxr_lock_5 = []
+lxr_lock_6 = []
+lxr_lock_7 = []
+lxr_lock_8 = []
+lxr_lock_9 = []
+
 # Do not modify the following line - ci-common.sh matches it
 # -- Mutally exclusive features --
 # Only one feature from each group can be provided. Otherwise build will fail.

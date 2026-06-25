@@ -24,7 +24,24 @@ pub enum BarrierSelector {
     /// Object remembering pre-write barrier with weak reference loading barrier.
     // TODO: We might be able to generalize this to object remembering pre-write barrier.
     SATBBarrier,
+    /// LXR's coalescing field-logging write barrier (P1 scaffolding — additive).
+    ///
+    /// Unlike `ObjectBarrier` (1 unlog bit per *object*), this barrier uses a per-*field* (per-slot)
+    /// unlog bit (`GLOBAL_FIELD_UNLOG_BIT_SPEC`) so a field is only logged once per epoch. The
+    /// matching `BarrierSemantics` impl (`LXRFieldBarrierSemantics`) is **not** part of P1: it
+    /// depends on the LXR plan and its `ProcessIncs`/`ProcessDecs` gc_work, which land in P3.
+    /// Appended after `SATBBarrier` so existing variants keep their discriminants.
+    FieldBarrier,
 }
+
+/// LXR field-logging barrier "unlogged" sentinel (a slot whose write need not be re-logged).
+/// Used by the LXR field barrier (P3); defined here so the constant is available to the
+/// additive scaffolding. (LXR: `barriers::UNLOGGED_VALUE`.)
+#[allow(dead_code)]
+pub const UNLOGGED_VALUE: u8 = 0b1;
+/// LXR field-logging barrier "logged" sentinel. (LXR: `barriers::LOGGED_VALUE`.)
+#[allow(dead_code)]
+pub const LOGGED_VALUE: u8 = 0b0;
 
 impl BarrierSelector {
     /// A const function to check if two barrier selectors are the same.

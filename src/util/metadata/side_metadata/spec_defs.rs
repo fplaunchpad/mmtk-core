@@ -60,7 +60,25 @@ define_side_metadata_specs!(
     SFT_DENSE_CHUNK_MAP_INDEX   = (global: true, log_num_of_bits: 3, log_bytes_in_region: LOG_BYTES_IN_CHUNK),
     // Mark chunks (any plan that uses the chunk map should include this spec in their global sidemetadata specs)
     CHUNK_MARK   = (global: true, log_num_of_bits: 3, log_bytes_in_region: crate::util::heap::chunk_map::Chunk::LOG_BYTES),
+    // ---- LXR (P1, additive) ----
+    // Per-object reference count, used by the LXR plan only. `log_num_of_bits` is the
+    // number of bits per RC entry (LXR default: 2 bits => values 0..3 with MAX_REF_COUNT as
+    // the "sticky" saturated count); `log_bytes_in_region` is LXR's RC granularity (= min
+    // object size). Global so it is mapped once for the whole heap; placed LAST in the global
+    // list so it does not perturb the offsets of the pre-existing core global specs (which the
+    // generational/concurrent log-bit accounting assumes). See the budget note below.
+    RC_TABLE = (global: true, log_num_of_bits: crate::util::rc::LOG_REF_COUNT_BITS, log_bytes_in_region: crate::util::rc::LOG_MIN_OBJECT_SIZE),
 );
+
+// ---- Global side-metadata budget note (LXR P1) ----
+// Our `GLOBAL_LOG_BIT_SPEC` is a *VM-side* global spec the binding declares with
+// `VMGlobalLogBitSpec::side_first()`, i.e. it lives in the separate VM global region
+// (`GLOBAL_SIDE_METADATA_VM_BASE_OFFSET`), NOT in this core global list. So appending
+// `RC_TABLE` here cannot collide with the binding's log/unlog bit — they are laid out in
+// disjoint regions. The new field-granular `GLOBAL_FIELD_UNLOG_BIT_SPEC` LXR needs is likewise
+// a VM-side spec (declared in the binding), laid out *after* the log bit via `side_after`, so it
+// too stays clear of this core list. The only constraint we honour here is "append, never
+// insert", so existing core specs keep their offsets.
 
 // This defines all LOCAL side metadata used by mmtk-core.
 define_side_metadata_specs!(
@@ -98,6 +116,12 @@ define_side_metadata_specs!(
     COMPRESSOR_MARK = (global: false, log_num_of_bits: 0, log_bytes_in_region: LOG_BYTES_IN_WORD as usize),
     // Block offset vectors by Compressor
     COMPRESSOR_OFFSET_VECTOR = (global: false, log_num_of_bits: LOG_BITS_IN_ADDRESS, log_bytes_in_region: crate::policy::compressor::forwarding::Block::LOG_BYTES),
+    // ---- LXR (P1, additive) ----
+    // Marks the immix lines that a straddling (larger-than-a-line) object spans. Used by the
+    // LXR plan only, to decide whether a line's RC entry belongs to a straddle continuation.
+    // Local (per-policy) and per-line. Appended LAST in the local list so pre-existing local
+    // specs keep their offsets.
+    RC_STRADDLE_LINES = (global: false, log_num_of_bits: 3, log_bytes_in_region: crate::policy::immix::line::Line::LOG_BYTES),
 );
 
 #[cfg(test)]

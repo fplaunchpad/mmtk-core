@@ -94,6 +94,17 @@ pub trait ObjectModel<VM: VMBinding> {
     /// This bit is also referred to as unlogged bit in Java MMTk for this reason.
     const GLOBAL_LOG_BIT_SPEC: VMGlobalLogBitSpec;
 
+    /// A global 1-bit-per-*field* (per word) metadata used by LXR's coalescing field-logging
+    /// write barrier (P1 scaffolding — additive).
+    ///
+    /// **Defaulted** so that existing bindings (the OCaml binding, the DummyVM) compile unchanged:
+    /// the default lays it out as the first VM-side global spec. This default is only a placeholder
+    /// — it is never mapped or accessed unless a plan actually selects `BarrierSelector::FieldBarrier`
+    /// (i.e. the LXR plan, P3). A binding that enables LXR must override this to lay the field-unlog
+    /// bit out *after* its `GLOBAL_LOG_BIT_SPEC` (via `side_after`) so the two do not overlap.
+    const GLOBAL_FIELD_UNLOG_BIT_SPEC: VMGlobalFieldUnlogBitSpec =
+        VMGlobalFieldUnlogBitSpec::side_first();
+
     /// A local word-size metadata for the forwarding pointer, used by copying plans. It is almost always
     /// located in the object header as it is fine to destroy an object header in order to copy it.
     const LOCAL_FORWARDING_POINTER_SPEC: VMLocalForwardingPointerSpec;
@@ -480,6 +491,7 @@ pub trait ObjectModel<VM: VMBinding> {
 
 pub mod specs {
     use crate::util::constants::LOG_BITS_IN_WORD;
+    use crate::util::constants::LOG_BYTES_IN_ADDRESS;
     use crate::util::constants::LOG_BYTES_IN_PAGE;
     use crate::util::constants::LOG_MIN_OBJECT_SIZE;
     use crate::util::metadata::side_metadata::*;
@@ -587,6 +599,17 @@ pub mod specs {
         true,
         0,
         LOG_MIN_OBJECT_SIZE
+    );
+    // Field-unlog bit: 1 bit per *word* (per slot), global. Used by LXR's coalescing
+    // field-logging write barrier (P1 scaffolding — additive). Unlike `VMGlobalLogBitSpec`
+    // (1 bit per object), this has `log_bytes_in_region = LOG_BYTES_IN_ADDRESS` so there is one
+    // bit per pointer-sized field.
+    define_vm_metadata_spec!(
+        /// 1-bit global metadata to log a *field* (per word), for LXR's field-logging barrier.
+        VMGlobalFieldUnlogBitSpec,
+        true,
+        0,
+        LOG_BYTES_IN_ADDRESS
     );
     // Forwarding pointer: word size per object, local
     define_vm_metadata_spec!(

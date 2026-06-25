@@ -366,6 +366,20 @@ pub enum WorkBucketStage {
     Release,
     /// Resume mutators and end GC.
     Final,
+    // ---- LXR (P1, additive) ----
+    // These RC stages are APPENDED after `Final` (rather than inserted where LXR places them,
+    // before `Prepare`) so every pre-existing variant keeps its discriminant and the scheduler's
+    // sequential stage-walk order is unchanged. They are inert for all existing plans: no plan
+    // adds work to them, so they open and immediately drain. `FIRST_STW_STAGE` is deliberately
+    // left at `Prepare` (LXR moves it to `FinishConcurrentWork`); that change is part of the LXR
+    // plan's scheduling and lands in P3.
+    /// LXR: drain any in-flight concurrent work before a stop-the-world RC/mark pause.
+    FinishConcurrentWork,
+    /// LXR: the stage in which root/mature reference-count increments are processed
+    /// (LXR aliases `RCProcessIncs` to this).
+    Initial,
+    /// LXR: stop-the-world reference-count decrement processing and immix line/block sweep.
+    STWRCDecsAndSweep,
 }
 
 impl WorkBucketStage {
@@ -413,4 +427,14 @@ impl WorkBucketStage {
             WorkBucketStage::Unconstrained | WorkBucketStage::Concurrent
         )
     }
+
+    // ---- LXR (P1, additive) ----
+    // LXR refers to two of its RC phases by the existing stages they reuse. We mirror that as
+    // associated-const aliases so LXR gc_work (P3) can name them. `RCProcessIncs` reuses the
+    // appended `Initial` stage; `RCEvacuateMature` reuses the existing `Closure` stage (RC
+    // mature evacuation runs as part of the closure).
+    #[allow(non_upper_case_globals)]
+    pub const RCProcessIncs: Self = Self::Initial;
+    #[allow(non_upper_case_globals)]
+    pub const RCEvacuateMature: Self = Self::Closure;
 }
