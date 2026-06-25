@@ -439,22 +439,25 @@ impl<VM: VMBinding> GCWorkScheduler<VM> {
             WorkerGoal::Gc => {
                 // We are in the progress of GC.
 
-                // In stop-the-world GC, mutators cannot request a GC while a GC is in progress,
-                // so a pending `Gc` request here is a logic error.  Under a *concurrent* plan,
-                // however, a mutator's allocation poll may legitimately request the next GC while
-                // concurrent marking is still running (the request flag is re-armed at the start of
-                // the InitialMark pause, `notify_mutators_paused`, so a mutator can re-request once
-                // mutators resume into the concurrent-marking window).  That request is simply
-                // coalesced in `goals.requests[Gc]` and serviced by the next `respond_to_requests`
-                // after this GC completes — it survives `on_current_goal_completed`, which only
-                // clears `current`.  So only assert for non-concurrent plans (GH#14): the STW-only
-                // assertion the original comment said to remove "when we support concurrent GC".
-                if worker.mmtk.get_plan().concurrent().is_none() {
-                    assert!(
-                        !goals.debug_is_requested(WorkerGoal::Gc),
-                        "GC request sent to WorkerMonitor while GC is still in progress."
-                    );
-                }
+                // NO assertion here (GH#14 + GH#6).  The upstream assert was
+                //   assert!(!goals.debug_is_requested(WorkerGoal::Gc),
+                //           "GC request sent to WorkerMonitor while GC is still in progress.")
+                // whose premise — "in stop-the-world GC, mutators cannot request a GC while a GC is
+                // in progress" — is FALSE for a *multi-mutator* binding like OCaml, regardless of
+                // plan.  ANY number of domains can request the next GC while one is in progress:
+                //   * concurrent plan — a domain re-requests during the concurrent-marking window
+                //     (the flag is re-armed at InitialMark, `notify_mutators_paused`);
+                //   * STW plan (e.g. GenImmix) at high domain count — a second domain hits its
+                //     allocation poll, or a domain being *created* refills its initial TLAB
+                //     (`caml_mmtk_domain_init` -> `Space::acquire`), and requests a GC before it is
+                //     stopped/poisoned.
+                // The original (concurrent-only) gate left this assert live for STW plans, where it
+                // fired at >=8 domains, panicked the GC worker, poisoned the WorkerMonitor mutex,
+                // killed all workers, and deadlocked every domain in `park_until_resumed` (gc_active
+                // stuck true).  The request is harmless: it is coalesced in `goals.requests[Gc]`
+                // (an idempotent bit) and serviced by the next `respond_to_requests` after this GC
+                // completes — it survives `on_current_goal_completed`, which only clears `current`.
+                // Confirmed via rr: par_binarytrees d8 GenImmix panicked here. See GH#14 / GH#6.
 
                 // We are in the middle of GC, and the last GC worker parked.
                 trace!("The last worker parked during GC.  Try to find more work to do...");
