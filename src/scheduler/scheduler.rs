@@ -484,6 +484,25 @@ impl<VM: VMBinding> GCWorkScheduler<VM> {
         }
     }
 
+    /// For a concurrent plan, return `true` if concurrent marking is in progress and the
+    /// `Concurrent` work bucket has drained.  When this holds, concurrent marking has no more
+    /// reachable tracing work and the GC must transition to the `FinalMark` STW pause.  This is the
+    /// GC-worker-side self-driving trigger for that transition: it does NOT depend on a mutator
+    /// hitting the allocation poll (`GCTrigger::poll` -> `Plan::collection_required`), which is the
+    /// only other place that requests `FinalMark`.  Returns `false` for non-concurrent plans (their
+    /// `Plan::concurrent()` is `None`), so the normal STW path is untouched.
+    ///
+    /// Only ever called from `on_last_parked`, i.e. when *all* workers are parked, so no
+    /// `Concurrent` packet is in flight; an empty (drained) bucket therefore really means
+    /// concurrent marking has finished.
+    fn concurrent_marking_drained(&self, worker: &GCWorker<VM>) -> bool {
+        let Some(concurrent) = worker.mmtk.get_plan().concurrent() else {
+            return false;
+        };
+        concurrent.concurrent_work_in_progress()
+            && self.work_buckets[WorkBucketStage::Concurrent].is_drained()
+    }
+
     /// Respond to a worker reqeust.
     fn respond_to_requests(
         &self,
@@ -491,6 +510,17 @@ impl<VM: VMBinding> GCWorkScheduler<VM> {
         goals: &mut WorkerGoals,
     ) -> LastParkedResult {
         assert!(goals.current().is_none());
+
+        if !goals.debug_is_requested(WorkerGoal::Gc) && self.concurrent_marking_drained(worker) {
+            // No mutator requested a GC, but concurrent marking drained while all workers are
+            // parked.  Self-request a GC so the next pause is scheduled immediately instead of
+            // waiting for a mutator allocation poll.  With concurrent marking in progress,
+            // `Plan::schedule_collection` resolves a `Gc` goal to the `FinalMark` pause.  This
+            // mirrors the mutator-driven path (`GCTrigger::request` ->
+            // `make_request(WorkerGoal::Gc)`), except the request originates here on the GC-worker
+            // side.
+            goals.set_request(WorkerGoal::Gc);
+        }
 
         let Some(goal) = goals.poll_next_goal() else {
             // No requests.  Park this worker, too.
