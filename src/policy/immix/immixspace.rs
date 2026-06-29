@@ -575,22 +575,63 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         self.copy_alloc_bytes.store(0, Ordering::SeqCst);
     }
 
-    /// RC-pause release. Minimal cut (`Pause::RefCount`): sweep the unpromoted clean nursery blocks,
-    /// flush the page resource, reset the inc buffer + the reused-line counter. The post-SATB mature
-    /// sweeping and the lazy-decrement draining are DEFERRED (Full/FinalMark only / lazy-dec
-    /// machinery). Vendored/adapted from lxr-v0.32.0 immixspace.rs.
+    /// RC-pause release. Minimal cut (`Pause::RefCount`): sweep the unpromoted nursery blocks back
+    /// to the page resource's free list, flush, reset the inc buffer + reused-line counter. The
+    /// post-SATB mature sweeping and lazy-decrement draining are DEFERRED.
     pub fn release_rc(&mut self, pause: crate::plan::lxr::Pause) {
         debug_assert_eq!(
             pause,
             crate::plan::lxr::Pause::RefCount,
             "minimal LXR cut only schedules RefCount pauses; Full/FinalMark release_rc deferred"
         );
-        self.block_allocation
-            .sweep_nursery_blocks(&self.scheduler, pause);
+        self.rc_sweep_nursery_blocks();
+        // Reset the per-phase nursery-block bookkeeping (the counters, not the freelist — the actual
+        // blocks were released individually above).
+        self.block_allocation.reset_nursery_counters();
         self.flush_page_resource();
         self.rc.reset_inc_buffer_size();
         self.is_end_of_satb_or_full_gc = false;
         self.reused_lines_consumed.store(0, Ordering::Relaxed);
+    }
+
+    /// Sweep the unpromoted nursery blocks: any block allocated (clean) in THIS mutator phase that
+    /// did NOT get an object promoted into it (i.e. it is still in the `Unallocated`/nursery state,
+    /// or its whole RC table is zero) is dead and is released back to the page resource free list.
+    ///
+    /// This replaces the reference LXR's `block_allocation::sweep_nursery_blocks`, which relies on
+    /// its bump-cursor *nosweep* page resource (where a bulk accounting release + cursor reset
+    /// recycles the address range). Our base uses the standard free-list `BlockPageResource`, so we
+    /// must `release_block` each dead block individually (deinit + push to the free list) for it to
+    /// actually be reusable — otherwise the swept nursery blocks leak (heap grows unbounded).
+    ///
+    /// A block is "promoted" (kept) iff it is in a live block state (`Unmarked`/`Marked`/`Reusable`)
+    /// AND has any non-zero RC entry. A clean block handed out this phase that received no surviving
+    /// object has an all-zero RC table and is reclaimed here.
+    fn rc_sweep_nursery_blocks(&self) {
+        let mut released = 0usize;
+        for chunk in self.chunk_map.all_chunks() {
+            for block in chunk.iter_region::<Block>() {
+                let state = block.get_state();
+                if state == BlockState::Unallocated {
+                    continue;
+                }
+                // Only consider blocks touched in the current phase (clean nursery or reused). Mature
+                // blocks from prior phases are swept lazily via SweepBlocksAfterDecs, not here.
+                if !block.is_nursery_or_reusing() {
+                    continue;
+                }
+                // A promoted nursery block has at least one live (rc>0) object; an unpromoted one is
+                // all-zero and dead. `rc_dead()` scans the block's RC table.
+                if block.rc_dead() {
+                    self.release_block(block);
+                    released += 1;
+                }
+            }
+        }
+        if released != 0 {
+            self.num_clean_blocks_released_young
+                .fetch_add(released, Ordering::Relaxed);
+        }
     }
 
     /// Get the number of defrag headroom pages.
@@ -784,6 +825,13 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         } else {
             block.deinit();
         }
+        self.pr.release_block(block);
+    }
+
+    /// Push an already-deinitialised block back to the page resource free list (accounting +
+    /// freelist). Used by the RC mature sweep (`Block::rc_sweep_mature`), which has already run
+    /// `deinit_rc` under the per-block lock, so we must NOT deinit again here.
+    pub(crate) fn release_block_to_free_list(&self, block: Block) {
         self.pr.release_block(block);
     }
 

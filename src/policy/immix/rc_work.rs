@@ -63,9 +63,9 @@ impl<VM: VMBinding> GCWork<VM> for SweepBlocksAfterDecs {
                 );
             }
         }
-        if count != 0 {
-            lxr.immix_space.block_page_resource().bulk_release_blocks(count);
-        }
+        // NOTE: `rc_sweep_mature` now pushes each freed block back to the page-resource free list
+        // itself (via `release_block_to_free_list`), so we do NOT call `bulk_release_blocks` here —
+        // that was an accounting-only release that leaked the blocks under our free-list PR.
         if count != 0
             && (lxr.current_pause().is_none()
                 || mmtk.scheduler.work_buckets[WorkBucketStage::STWRCDecsAndSweep].is_open())

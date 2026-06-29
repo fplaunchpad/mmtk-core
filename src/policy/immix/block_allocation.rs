@@ -22,7 +22,7 @@ use crate::plan::lxr::Pause;
 use crate::plan::lxr::LXR;
 use crate::util::constants::LOG_BYTES_IN_PAGE;
 use crate::util::linear_scan::Region;
-use crate::{policy::space::Space, scheduler::GCWorkScheduler, vm::*};
+use crate::{policy::space::Space, vm::*};
 use atomic::Ordering;
 use std::cell::UnsafeCell;
 use std::sync::atomic::AtomicUsize;
@@ -71,15 +71,11 @@ impl<VM: VMBinding> BlockAllocation<VM> {
         unsafe { *self.space.get() = space as *const ImmixSpace<VM> }
     }
 
-    /// Reset allocated_block_buffer and free nursery blocks.
-    pub fn sweep_nursery_blocks(&self, _scheduler: &GCWorkScheduler<VM>, _pause: Pause) {
-        let in_place_promoted_nursery_blocks =
-            self.in_place_promoted_nursery_blocks.load(Ordering::Relaxed);
-        let num_blocks = self.clean_nursery_blocks();
-        self.space()
-            .block_page_resource()
-            .bulk_release_blocks(num_blocks - in_place_promoted_nursery_blocks);
-        self.space().block_page_resource().reset();
+    /// Reset the per-phase nursery-block counters at the end of an RC pause. The actual freeing of
+    /// unpromoted nursery blocks is done by `ImmixSpace::rc_sweep_nursery_blocks` (which
+    /// `release_block`s each dead block to the free list — the standard `BlockPageResource` cannot
+    /// recycle blocks via a bulk accounting release the way the reference's nosweep PR does).
+    pub fn reset_nursery_counters(&self) {
         self.num_nursery_blocks.store(0, Ordering::SeqCst);
         self.in_place_promoted_nursery_blocks
             .store(0, Ordering::SeqCst);

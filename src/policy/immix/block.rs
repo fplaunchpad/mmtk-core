@@ -562,6 +562,11 @@ impl Block {
             }
             let dead = if defrag || self.attempt_dealloc() {
                 self.deinit_rc(space);
+                // Return the block to the page resource's free list so it is actually reusable.
+                // (The reference's nosweep PR recycled via a bulk accounting release + cursor
+                // reset; our standard free-list `BlockPageResource` needs each block pushed back
+                // individually, else freed blocks leak.) This does the accounting release too.
+                space.release_block_to_free_list(*self);
                 true
             } else {
                 false
