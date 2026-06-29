@@ -3,7 +3,6 @@ use super::gc_work::LXRRCWorkContext;
 use super::mutator::ALLOCATOR_MAPPING;
 use super::rc::ProcessDecs;
 use super::rc::RCImmixCollectRootEdges;
-use crate::policy::immix::block::Block;
 use crate::scheduler::gc_work::Release;
 use crate::scheduler::gc_work::StopMutators;
 use crate::scheduler::gc_work::UnsupportedProcessEdges;
@@ -142,21 +141,17 @@ impl<VM: VMBinding> Plan for LXR<VM> {
         }
     }
 
-    fn notify_mutators_paused(&self, _scheduler: &GCWorkScheduler<VM>) {
-        // Pause-START phase-epoch bump (mutator→GC transition), the partner of the bump at the END
-        // of the epilogue (GC→mutator). Two bumps per GC make the parity meaningful: odd = mutator
-        // phase, even = GC phase, so `is_nursery_or_reusing()` correctly identifies blocks allocated
-        // in the just-ended mutator phase. This hook runs AFTER all mutators have stopped (called by
-        // `StopMutators`), so no mutator can stamp a block with the new even epoch — the analogue of
-        // the reference's `gc_pause_start` (which our base lacks). It runs before the Prepare bucket
-        // opens, hence before any RC inc reads block nursery state.
-        //
-        // Bisect knob MMTK_RC_SINGLE_BUMP reverts to the pre-leak-fix single-bump scheme (bump only
-        // at release end) to confirm whether the double-bump regressed the previously-clean pause.
-        if std::env::var_os("MMTK_RC_SINGLE_BUMP").is_none() {
-            Block::update_global_phase_epoch(&self.immix_space);
-        }
-    }
+    // NOTE: there is intentionally NO pause-start phase-epoch bump. We use the SINGLE-bump scheme
+    // (one `update_global_phase_epoch` per GC, at the END of the epilogue). The two-bumps-per-GC
+    // scheme I tried — adding a pause-start bump in `notify_mutators_paused` — REGRESSED the pause:
+    // with freeing fully off it SIGSEGV'd (h64) while single-bump was clean. The pause-start bump
+    // makes the epoch even DURING the inc phase, which flips `is_nursery_or_reusing()` while
+    // `promote()`/`set_as_in_place_promoted()` are writing per-block metadata, corrupting block
+    // state. Commit 1711b5e48f was single-bump AND sanity-clean (zero Invalid reference), so the
+    // single-bump scheme is the provably-correct one. (Trade-off: a clean nursery block allocated in
+    // the *next* mutator phase carries an even epoch under single-bump, so cross-GC nursery
+    // classification is imperfect — but `rc_dead()` still gates every free, so this can only under-
+    // reclaim (leak), never free a live block.)
 
     fn get_allocator_mapping(&self) -> &'static EnumMap<AllocationSemantics, AllocatorSelector> {
         &ALLOCATOR_MAPPING
