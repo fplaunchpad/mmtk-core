@@ -507,6 +507,10 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         plan_stats: Option<StatsForDefrag>,
         unlog_bits_op: UnlogBitsOperation,
     ) {
+        // lxr P2.G: the P3 LXR plan drives a separate prepare_rc path; under our gate no plan
+        // sets rc_enabled, so this mark-based prepare must never run for an RC space. The assert
+        // documents that and can never fire (rc_enabled always false until P3).
+        debug_assert!(!self.rc_enabled);
         if major_gc {
             // Update mark_state
             if VM::VMObjectModel::LOCAL_MARK_BIT_SPEC.is_on_side() {
@@ -587,6 +591,10 @@ impl<VM: VMBinding> ImmixSpace<VM> {
 
     /// Release for the immix space.
     pub(crate) fn release(&mut self, major_gc: bool, unlog_bits_op: UnlogBitsOperation) {
+        // lxr P2.G: the P3 LXR plan drives a separate release_rc path; under our gate no plan
+        // sets rc_enabled, so this mark-based release must never run for an RC space. The assert
+        // documents that and can never fire (rc_enabled always false until P3).
+        debug_assert!(!self.rc_enabled);
         if major_gc {
             // Update line_unavail_state for hole searching after this GC.
             if !super::BLOCK_ONLY {
