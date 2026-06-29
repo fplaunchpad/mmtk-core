@@ -205,10 +205,16 @@ impl<VM: VMBinding> LXR<VM> {
         // P4: map the VM-side global log bit (needs_log_bit) + the per-field unlog bit
         // (needs_field_log_bit) the coalescing field barrier uses. The binding lays the
         // field-unlog spec `side_after` the log bit, so they occupy disjoint regions.
-        let spec = crate::util::metadata::extract_side_metadata(&[
+        let mut spec = crate::util::metadata::extract_side_metadata(&[
             *VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC,
             *VM::VMObjectModel::GLOBAL_FIELD_UNLOG_BIT_SPEC,
         ]);
+        // RC_TABLE is a global side-metadata spec (whole-heap reference counts), but it is only
+        // DEFINED in spec_defs — no plan/space registered it in its global metadata context, so its
+        // per-chunk pages were never mapped/committed. Without this, rc.count/rc.inc fault reading
+        // uncommitted metadata on the first RC pause (the object is valid; only its RC metadata is
+        // uncommitted). Register it so the whole heap's RC counts are backed.
+        spec.push(crate::util::rc::RC_TABLE);
         let mut plan_args = CreateSpecificPlanArgs {
             global_args: args,
             constraints: &LXR_CONSTRAINTS,
