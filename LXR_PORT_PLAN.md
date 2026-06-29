@@ -89,8 +89,19 @@ deferred machinery (cycle collection, mature evac, defrag, unloading, survival p
 deps. Porting it wholesale is a non-starter. **Our base `plan/immix/` is only 318 lines** (global.rs 233 /
 15 Plan methods, mutator.rs 62, gc_work.rs 17, mod.rs 6) — a clean, working, minimal Immix Plan impl.
 
-**So construct LXR incrementally from the working Immix plan:**
-- **P3.5 (next):** clone `plan/immix/{global,mutator,gc_work,mod}.rs` → `plan/lxr/`, rename Immix→LXR,
+**Progress (this construction):**
+- **P3.5 DONE** (`84d266b139`): LXR plan = Immix clone, `MMTK_PLAN=LXR` wired. **VALIDATED** — world.opt
+  green against lxr-p3, `MMTK_PLAN=LXR` runs, `par_binarytrees`=355319636 (identical to Immix/GenImmix).
+- **P3.6 DONE** (`859f82644e`): added the `rc: RefCountHelper<VM>` field (RC foundation; allow(dead_code)).
+- **P3.7+ (next — the connected RC heart, NOT byte-identical-decomposable):** the field barrier needs
+  `LXRFieldBarrierSemantics` whose `flush` enqueues to `ProcessIncs`/`ProcessDecs`, which need the
+  ImmixSpace RC methods (`rc.promote`, `scan_nursery_object`, `add_to_possibly_dead_mature_blocks`,
+  `rc_sweep_mature`) + the `Block` RC methods (`rc_dead`, `init`/`deinit`) + `block_allocation.rs` +
+  `rc_work.rs` — so the barrier, `rc.rs`, and the policy RC machinery come in as one cargo-fixed batch,
+  after which `rc_enabled`/`needs_field_log_bit`/`BarrierSelector::FieldBarrier` flip on in LXR_CONSTRAINTS.
+
+**Original P3.5 plan (now done):**
+- **P3.5:** clone `plan/immix/{global,mutator,gc_work,mod}.rs` → `plan/lxr/`, rename Immix→LXR,
   `IMMIX_CONSTRAINTS`→`LXR_CONSTRAINTS` with **`rc_enabled=false`** initially (so the P2
   `debug_assert(!rc_enabled)` guards in immixspace prepare/release don't trip), add `PlanSelector::LXR`
   + the `create_plan`/`create_mutator` arms + options parsing. Result: `MMTK_PLAN=LXR` exists and **runs
