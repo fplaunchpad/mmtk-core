@@ -131,12 +131,12 @@ impl Block {
     /// Per-block GC phase-epoch table (side) — LXR only.
     pub const PHASE_EPOCH: SideMetadataSpec =
         crate::util::metadata::side_metadata::spec_defs::PHASE_EPOCH;
-    /// Per-block spin-lock "in use" bit (side) — LXR only. Guards the RC mature block sweep.
-    pub const BLOCK_IN_USE: SideMetadataSpec =
-        crate::util::metadata::side_metadata::spec_defs::BLOCK_IN_USE;
-    /// Per-block owner word (side) — LXR only.
-    pub const BLOCK_OWNER: SideMetadataSpec =
-        crate::util::metadata::side_metadata::spec_defs::BLOCK_OWNER;
+    // NOTE: the LXR fork also has per-block `BLOCK_IN_USE` (sweep spin-lock) and `BLOCK_OWNER`
+    // (copying-GC owner) side-metadata. Our minimal in-place STW cut needs NEITHER (the mature
+    // sweep is uncontended STW, and we never set/read an owner), and crucially neither is mapped
+    // in `ImmixSpace::side_metadata_specs` — so touching them read UNMAPPED metadata (the BLOCK_OWNER
+    // and BLOCK_IN_USE atomic-load SIGSEGVs). They are intentionally not used; their `spec_defs`
+    // entries stay (unmapped, defined-but-unused) only to preserve the offsets of later specs.
 
     /// Get the chunk containing the block.
     pub fn chunk(&self) -> Chunk {
@@ -494,34 +494,27 @@ impl Block {
         Self::NURSERY_PROMOTION_STATE_TABLE.store_atomic(self.start(), 0u8, Ordering::Relaxed);
     }
 
-    // ── RC block spin-lock (guards the mature sweep vs mutator reuse) ───────────
+    // ── RC mature-sweep block guard (in-place STW cut) ─────────────────────────
+    // The reference guards the mature sweep against a CONCURRENT mutator reusing a block with a
+    // per-block spin-lock in the `BLOCK_IN_USE` side-metadata table. Our minimal cut runs the
+    // decrement + mature sweep STOP-THE-WORLD (in `STWRCDecsAndSweep` + the post-decs epilogue,
+    // mutators stopped), so the lock is ALWAYS uncontended and serves no purpose — and, like the
+    // deleted `BLOCK_OWNER` clear, `BLOCK_IN_USE` is NOT registered in `side_metadata_specs`, so
+    // touching it reads UNMAPPED side-metadata → the atomic-load SIGSEGV the mature sweep hit.
+    // So the lock is a no-op: `lock_skip_reusing_or_unallocated` keeps only the SKIP check (don't
+    // sweep an unallocated or actively-reused block), and `unlock` does nothing.
 
-    fn try_lock(&self) -> bool {
-        let result = Self::BLOCK_IN_USE.fetch_update_atomic::<u8, _>(
-            self.start(),
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |b| if b == 1 { None } else { Some(1) },
-        );
-        result == Ok(0)
-    }
-
+    /// Returns true iff the block may be swept now (not unallocated, not a mutator-reused block this
+    /// phase). No actual locking (STW: uncontended).
     fn lock_skip_reusing_or_unallocated(&self) -> bool {
-        loop {
-            std::hint::spin_loop();
-            let state = self.get_state();
-            if state == BlockState::Unallocated || (Self::in_mutatar_phase() && self.is_reusing()) {
-                return false;
-            }
-            if self.try_lock() {
-                return true;
-            }
+        let state = self.get_state();
+        if state == BlockState::Unallocated || (Self::in_mutatar_phase() && self.is_reusing()) {
+            return false;
         }
+        true
     }
 
-    pub fn unlock(&self) {
-        Self::BLOCK_IN_USE.store_atomic::<u8>(self.start(), 0u8, Ordering::Relaxed);
-    }
+    pub fn unlock(&self) {}
 
     /// Set block mark state via a fetch-update closure. (Reference: `Block::fetch_update_state`.)
     pub fn fetch_update_state(
