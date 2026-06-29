@@ -99,6 +99,13 @@ impl<VM: VMBinding> SFT for ImmixSpace<VM> {
     }
 
     fn is_live(&self, object: ObjectReference) -> bool {
+        // lxr P2.1: under RC, liveness is "ref-count > 0 (or already forwarded)", not the
+        // mark bit. (The end-of-SATB / full-GC refinement that also consults marks +
+        // defrag-source arrives with the concurrent-marking sub-phase.) Gated, so every
+        // non-RC plan keeps the mark-bit semantics below byte-for-byte.
+        if self.rc_enabled {
+            return self.rc.count(object) > 0 || object_forwarding::is_forwarded::<VM>(object);
+        }
         // If the mark bit is set, it is live.
         if self.is_marked(object) {
             return true;
