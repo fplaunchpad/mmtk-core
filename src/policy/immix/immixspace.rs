@@ -57,6 +57,10 @@ pub struct ImmixSpace<VM: VMBinding> {
     scheduler: Arc<GCWorkScheduler<VM>>,
     /// Some settings for this space
     space_args: ImmixSpaceArgs,
+    /// lxr: does this Immix space run the RC overlays? (= `constraints.rc_enabled`,
+    /// captured at construction). `false` for every non-RC plan, so the overlays
+    /// stay inert and the space is byte-identical to upstream Immix.
+    pub rc_enabled: bool,
 }
 
 /// Some arguments for Immix Space.
@@ -285,8 +289,8 @@ impl<VM: VMBinding> ImmixSpace<VM> {
     const MARKED_STATE: u8 = 1;
 
     /// Get side metadata specs
-    fn side_metadata_specs() -> Vec<SideMetadataSpec> {
-        metadata::extract_side_metadata(&if super::BLOCK_ONLY {
+    fn side_metadata_specs(rc_enabled: bool) -> Vec<SideMetadataSpec> {
+        let mut meta = if super::BLOCK_ONLY {
             vec![
                 MetadataSpec::OnSide(Block::DEFRAG_STATE_TABLE),
                 MetadataSpec::OnSide(Block::MARK_TABLE),
@@ -307,7 +311,16 @@ impl<VM: VMBinding> ImmixSpace<VM> {
                 #[cfg(feature = "object_pinning")]
                 *VM::VMObjectModel::LOCAL_PINNING_BIT_SPEC,
             ]
-        })
+        };
+        // lxr P2.0: gated RC straddle-line table. The non-RC list above is left
+        // byte-identical; the further RC block tables (LOG_TABLE /
+        // NURSERY_PROMOTION_STATE_TABLE / PHASE_EPOCH / IX_LINE_REUSE_COUNT)
+        // register as later sub-phases vendor them. No plan sets rc_enabled until
+        // the P3 LXR plan, so this branch is inert today.
+        if rc_enabled {
+            meta.push(MetadataSpec::OnSide(crate::util::rc::RC_STRADDLE_LINES));
+        }
+        metadata::extract_side_metadata(&meta)
     }
 
     pub fn new(
@@ -347,10 +360,15 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         vo_bit::helper::validate_config::<VM>();
         let vm_map = args.vm_map;
         let scheduler = args.scheduler.clone();
-        let common =
-            CommonSpace::new(args.into_policy_args(true, false, Self::side_metadata_specs()));
+        let rc_enabled = args.constraints.rc_enabled;
+        let common = CommonSpace::new(args.into_policy_args(
+            true,
+            false,
+            Self::side_metadata_specs(rc_enabled),
+        ));
         let space_index = common.descriptor.get_index();
         ImmixSpace {
+            rc_enabled,
             pr: if common.vmrequest.is_discontiguous() {
                 BlockPageResource::new_discontiguous(
                     Block::LOG_PAGES,
