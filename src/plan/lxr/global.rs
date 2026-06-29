@@ -126,6 +126,13 @@ impl<VM: VMBinding> Plan for LXR<VM> {
     fn schedule_collection(&'static self, scheduler: &GCWorkScheduler<VM>) {
         // Lazily wire `block_allocation`'s self-reference (idempotent).
         self.ensure_block_allocation_initialized();
+        // Bump the global phase epoch at the START of the pause (the mutator→GC transition), the
+        // partner of the bump at the END of `release` (GC→mutator). The two-bumps-per-GC scheme is
+        // what makes the phase-epoch parity meaningful: odd = mutator phase, even = GC phase, and a
+        // block's `is_nursery_or_reusing()` correctly identifies blocks allocated in the just-ended
+        // mutator phase. (The reference bumps in `gc_pause_start`; our base has no such hook, so we
+        // do it here — before any incs read block nursery state.)
+        Block::update_global_phase_epoch(&self.immix_space);
         // Minimal RC cut: the only pause kind is RefCount (no CM, no emergency full GC, no defrag).
         let pause = self.select_collection_kind();
         self.current_pause.store(Some(pause), Ordering::SeqCst);
@@ -167,6 +174,7 @@ impl<VM: VMBinding> Plan for LXR<VM> {
     }
 
     fn end_of_gc(&mut self, tls: VMWorkerThread) {
+        self.dump_rc_stats();
         self.previous_pause
             .store(self.current_pause(), Ordering::SeqCst);
         self.current_pause.store(None, Ordering::SeqCst);
@@ -397,6 +405,37 @@ impl<VM: VMBinding> LXR<VM> {
     /// root scan flows through `RCImmixCollectRootEdges` → `ProcessIncs<ROOT>`), (4) `FastRCPrepare`
     /// (runs `prepare_rc`) in `RCProcessIncs`, (5) `Release` in `Release`. CM/mature-evac packets are
     /// omitted (deferred).
+    /// Dump per-pause RC reclamation stats + reset them (MMTK_RC_DEBUG). Lets the reclamation
+    /// balance be tracked across GCs: incs vs decs, objects promoted vs reaching 0, blocks freed,
+    /// and the prev/curr root-set sizes (the root-dec balance).
+    fn dump_rc_stats(&self) {
+        use super::rc::{
+            rc_debug_on, RC_DECS_TOTAL, RC_DECS_TO_ZERO, RC_INCS_PROMOTED, RC_INCS_TOTAL,
+        };
+        if !rc_debug_on() {
+            return;
+        }
+        let load = |c: &std::sync::atomic::AtomicUsize| c.swap(0, Ordering::Relaxed);
+        let incs = load(&RC_INCS_TOTAL);
+        let promoted = load(&RC_INCS_PROMOTED);
+        let decs = load(&RC_DECS_TOTAL);
+        let dead = load(&RC_DECS_TO_ZERO);
+        let young = self
+            .immix_space
+            .num_clean_blocks_released_young
+            .swap(0, Ordering::Relaxed);
+        let mature = self
+            .immix_space
+            .num_clean_blocks_released_mature
+            .swap(0, Ordering::Relaxed);
+        let prev_roots = self.prev_roots.read().unwrap().len();
+        let curr_roots = self.curr_roots.read().unwrap().len();
+        eprintln!(
+            "[RC-STATS] incs={incs} (promoted={promoted}) decs={decs} (dead={dead}) \
+             blocks_freed: young={young} mature={mature}  root-packets: prev={prev_roots} curr={curr_roots}"
+        );
+    }
+
     fn schedule_rc_collection(&'static self, scheduler: &GCWorkScheduler<VM>) {
         self.disable_unnecessary_buckets(scheduler, Pause::RefCount);
         self.process_prev_roots(scheduler);
@@ -409,5 +448,12 @@ impl<VM: VMBinding> LXR<VM> {
         scheduler.work_buckets[WorkBucketStage::RCProcessIncs].add(FastRCPrepare);
         scheduler.work_buckets[WorkBucketStage::Release]
             .add(Release::<LXRRCWorkContext<UnsupportedProcessEdges<VM>>>::new(self));
+        // After ALL decrements (incl. the recursive cascade) drain, sweep the now-dead MATURE
+        // blocks that the decs queued into `possibly_dead_mature_blocks`. A bucket sentinel runs
+        // exactly once the bucket has emptied (the STW equivalent of the reference's
+        // `LazySweepingJobsCounter::end_of_decs` Drop callback, which we deferred). Without this,
+        // dead mature blocks are queued but never returned to the free list → the reclamation leak.
+        scheduler.work_buckets[WorkBucketStage::STWRCDecsAndSweep]
+            .set_sentinel(Box::new(super::gc_work::RCBlockSweepEpilogue));
     }
 }

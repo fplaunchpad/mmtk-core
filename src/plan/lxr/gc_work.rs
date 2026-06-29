@@ -37,3 +37,22 @@ impl<VM: VMBinding> GCWork<VM> for FastRCPrepare {
         lxr.prepare(worker.tls)
     }
 }
+
+/// Sentinel for the `STWRCDecsAndSweep` bucket: runs once that bucket has fully drained (all
+/// `ProcessDecs` — including the recursively-spawned cascade in `Unconstrained` — are done, so
+/// `possibly_dead_mature_blocks` is fully populated). It drains that queue into
+/// `SweepBlocksAfterDecs` packets, which actually free the now-dead MATURE immix blocks back to the
+/// page-resource free list.
+///
+/// In the reference LXR this is driven by the `LazySweepingJobsCounter`'s `end_of_decs` Drop
+/// callback (the global lazy-sweeping registry we deferred). For the minimal STW cut a bucket
+/// sentinel is the equivalent "after all decs" hook, and avoids re-introducing that registry.
+pub(super) struct RCBlockSweepEpilogue;
+
+impl<VM: VMBinding> GCWork<VM> for RCBlockSweepEpilogue {
+    fn do_work(&mut self, _worker: &mut GCWorker<VM>, mmtk: &'static MMTK<VM>) {
+        let lxr = mmtk.get_plan().downcast_ref::<LXR<VM>>().unwrap();
+        lxr.immix_space
+            .schedule_rc_block_sweeping_tasks(crate::LazySweepingJobsCounter::new_decs());
+    }
+}

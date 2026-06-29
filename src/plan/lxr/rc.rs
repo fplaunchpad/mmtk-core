@@ -55,6 +55,38 @@ use crate::vm::*;
 use crate::LazySweepingJobsCounter;
 use crate::MMTK;
 
+// ── RC reclamation instrumentation (MMTK_RC_DEBUG) ────────────────────────────────────────────
+// Per-pause counters, dumped by `LXR::dump_rc_stats` at end_of_gc when MMTK_RC_DEBUG is set, so the
+// reclamation balance can be tracked across GCs. Cheap relaxed atomics; reset each pause.
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+pub static RC_INCS_PROMOTED: AtomicUsize = AtomicUsize::new(0); // objects whose RC went 0->1 (promoted)
+pub static RC_INCS_TOTAL: AtomicUsize = AtomicUsize::new(0); // total inc() calls
+pub static RC_DECS_TOTAL: AtomicUsize = AtomicUsize::new(0); // total dec attempts processed
+pub static RC_DECS_TO_ZERO: AtomicUsize = AtomicUsize::new(0); // objects whose RC reached 0 (dead)
+
+#[inline(always)]
+pub(super) fn rc_stat_inc(counter: &AtomicUsize) {
+    if cfg!(debug_assertions) || crate::plan::lxr::rc::rc_debug_on() {
+        counter.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+}
+
+/// Cached `MMTK_RC_DEBUG` flag (env read once).
+pub(super) fn rc_debug_on() -> bool {
+    use std::sync::atomic::AtomicU8;
+    static STATE: AtomicU8 = AtomicU8::new(0); // 0=unknown, 1=off, 2=on
+    match STATE.load(AtomicOrdering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = std::env::var_os("MMTK_RC_DEBUG").is_some();
+            STATE.store(if on { 2 } else { 1 }, AtomicOrdering::Relaxed);
+            on
+        }
+    }
+}
+
 /// The classification of an increment's source slot.
 pub type EdgeKind = u8;
 /// A root slot (scanned from the stack/registers). Roots are never written back. (Used by
@@ -141,7 +173,12 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
 
     /// Increment `o`'s RC. Returns true iff this call promoted it (0 → 1).
     fn inc(&self, o: ObjectReference) -> bool {
-        self.rc.inc(o) == Ok(0)
+        rc_stat_inc(&RC_INCS_TOTAL);
+        let promoted = self.rc.inc(o) == Ok(0);
+        if promoted {
+            rc_stat_inc(&RC_INCS_PROMOTED);
+        }
+        promoted
     }
 
     /// Promote a freshly-incremented object to mature: mark its block as in-place-promoted (if it
@@ -373,6 +410,7 @@ impl<VM: VMBinding> ProcessDecs<VM> {
     fn process_decs(&mut self, decs: &[ObjectReference], lxr: &LXR<VM>) {
         for o in decs {
             let o = *o;
+            rc_stat_inc(&RC_DECS_TOTAL);
             // Manual decrement: our `RefCountHelper::fetch_update` bounds its closure `+ Copy`,
             // which a `&mut self`-capturing closure (needed to call `process_dead_object`) is not.
             // So we read → maybe-kill → store, with a small CAS retry to stay atomic-ish. (Inert in
@@ -384,6 +422,7 @@ impl<VM: VMBinding> ProcessDecs<VM> {
             if c == 1 {
                 // Last reference — the object dies. Recurse into its fields *before* zeroing its RC
                 // (its fields are still readable), then set RC to 0.
+                rc_stat_inc(&RC_DECS_TO_ZERO);
                 self.process_dead_object(o, lxr);
                 self.rc.set(o, 0);
             } else {
