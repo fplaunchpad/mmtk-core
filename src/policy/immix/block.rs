@@ -13,7 +13,13 @@ use crate::util::metadata::MetadataSpec;
 use crate::util::object_enum::BlockMayHaveObjects;
 use crate::util::Address;
 use crate::vm::*;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU8, Ordering};
+
+/// LXR/RC: the global phase-epoch counter — bumped at the end of every mutator and GC
+/// phase. A block whose per-block `PHASE_EPOCH` matches is "nursery/reusing" for the
+/// current phase. Vendored from lxr-v0.32.0 block.rs; read only by RC paths (inert
+/// otherwise, so the shipping plans are unaffected).
+static GLOBAL_PHASE_EPOCH: AtomicU8 = AtomicU8::new(1);
 
 /// The block allocation state.
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -209,6 +215,53 @@ impl Block {
             .as_spec()
             .extract_side_spec()
             .bzero_metadata(self.start(), Block::BYTES);
+    }
+
+    // ── LXR / RC phase-epoch nursery identification (P3.4) ─────────────────────
+    // A block is "nursery/reusing" for the current phase iff its per-block PHASE_EPOCH
+    // (P2 spec) matches GLOBAL_PHASE_EPOCH (odd = mutator phase, even = GC phase).
+    // Vendored from lxr-v0.32.0 block.rs; read by ProcessIncs to spot fresh nursery
+    // objects. update_global_phase_epoch is deferred (needs the page-resource RC API).
+
+    /// The global phase-epoch (bumped at the end of every mutator and GC phase).
+    pub fn global_phase_epoch() -> u8 {
+        GLOBAL_PHASE_EPOCH.load(Ordering::Relaxed)
+    }
+
+    /// This block's phase epoch — the last phase it was used for object allocation.
+    pub fn phase_epoch(&self) -> u8 {
+        Self::PHASE_EPOCH.load_atomic::<u8>(self.start(), Ordering::Relaxed)
+    }
+
+    /// Stamp this block's phase epoch with the current global epoch.
+    pub fn update_phase_epoch(&self) {
+        Self::PHASE_EPOCH.store_atomic::<u8>(
+            self.start(),
+            Self::global_phase_epoch(),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// True iff this block was allocated (clean) or reused (partially free) in the
+    /// current phase.
+    pub fn is_nursery_or_reusing(&self) -> bool {
+        let ge = Self::global_phase_epoch();
+        let e = self.phase_epoch();
+        if (ge & 1) == 1 {
+            e == ge
+        } else {
+            e == ge - 1
+        }
+    }
+
+    /// True iff this is a fresh (unallocated) nursery block this phase.
+    pub fn is_nursery(&self) -> bool {
+        self.get_state() == BlockState::Unallocated && self.is_nursery_or_reusing()
+    }
+
+    /// True iff this is a partially-free block being reused this phase.
+    pub fn is_reusing(&self) -> bool {
+        self.get_state() != BlockState::Unallocated && self.is_nursery_or_reusing()
     }
 
     /// Record the number of holes in the block.
