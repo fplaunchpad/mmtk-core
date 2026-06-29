@@ -122,6 +122,22 @@ define_side_metadata_specs!(
     // Local (per-policy) and per-line. Appended LAST in the local list so pre-existing local
     // specs keep their offsets.
     RC_STRADDLE_LINES = (global: false, log_num_of_bits: 3, log_bytes_in_region: crate::policy::immix::line::Line::LOG_BYTES),
+    // ---- LXR (P2, additive) ----
+    // Further LXR-only RC side-metadata, all appended AFTER RC_STRADDLE_LINES so every
+    // pre-existing local spec (including RC_STRADDLE_LINES) keeps its offset. These are
+    // registered into a space's side_metadata_specs only inside an `if rc_enabled` branch,
+    // so for all non-LXR plans they are defined-but-not-mapped (byte-identical layout).
+    //
+    // Per-block "logged" bit (LXR's Block::LOG_TABLE) — 1 bit per immix block.
+    IX_BLOCK_LOG   = (global: false, log_num_of_bits: 0, log_bytes_in_region: crate::policy::immix::block::Block::LOG_BYTES),
+    // Per-block nursery-promotion state (Block::NURSERY_PROMOTION_STATE_TABLE).
+    NURSERY_PROMOTION_STATE   = (global: false, log_num_of_bits: 3, log_bytes_in_region: crate::policy::immix::block::Block::LOG_BYTES),
+    // Per-block GC phase epoch (Block::PHASE_EPOCH).
+    PHASE_EPOCH   = (global: false, log_num_of_bits: 3, log_bytes_in_region: crate::policy::immix::block::Block::LOG_BYTES),
+    // Per-line reuse counter (Line::IX_LINE_REUSE_COUNT).
+    IX_LINE_REUSE_COUNT   = (global: false, log_num_of_bits: 3, log_bytes_in_region: crate::policy::immix::line::Line::LOG_BYTES),
+    // Per-page reuse counter for the large object space (LOS_PAGE_REUSE_COUNT).
+    LOS_PAGE_REUSE_COUNT   = (global: false, log_num_of_bits: 3, log_bytes_in_region: LOG_BYTES_IN_PAGE as usize),
 );
 
 #[cfg(test)]
