@@ -26,6 +26,7 @@ use crate::util::heap::gc_trigger::SpaceStats;
 use crate::util::heap::VMRequest;
 use crate::util::metadata::side_metadata::SideMetadataContext;
 use crate::util::rc::RefCountHelper;
+use crate::vm::ObjectModel;
 use crate::vm::VMBinding;
 use crate::util::ObjectReference;
 use crate::{policy::immix::ImmixSpace, util::opaque_pointer::VMWorkerThread};
@@ -201,10 +202,17 @@ impl<VM: VMBinding> Plan for LXR<VM> {
 
 impl<VM: VMBinding> LXR<VM> {
     pub fn new(args: CreateGeneralPlanArgs<VM>) -> Self {
+        // P4: map the VM-side global log bit (needs_log_bit) + the per-field unlog bit
+        // (needs_field_log_bit) the coalescing field barrier uses. The binding lays the
+        // field-unlog spec `side_after` the log bit, so they occupy disjoint regions.
+        let spec = crate::util::metadata::extract_side_metadata(&[
+            *VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC,
+            *VM::VMObjectModel::GLOBAL_FIELD_UNLOG_BIT_SPEC,
+        ]);
         let mut plan_args = CreateSpecificPlanArgs {
             global_args: args,
             constraints: &LXR_CONSTRAINTS,
-            global_side_metadata_specs: SideMetadataContext::new_global_specs(&[]),
+            global_side_metadata_specs: SideMetadataContext::new_global_specs(&spec),
         };
         let lxr = LXR {
             immix_space: ImmixSpace::new(
