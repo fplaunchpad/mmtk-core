@@ -19,9 +19,8 @@ use atomic::Ordering;
 
 use crate::{
     scheduler::{GCWork, GCWorker, WorkBucketStage},
-    util::heap::PageResource,
     vm::VMBinding,
-    LazySweepingJobsCounter, Plan, MMTK,
+    LazySweepingJobsCounter, MMTK,
 };
 
 use super::block::Block;

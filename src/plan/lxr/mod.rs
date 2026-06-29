@@ -7,6 +7,7 @@
 pub(super) mod gc_work;
 pub(super) mod global;
 pub(super) mod mutator;
+pub(crate) mod rc;
 
 pub use self::global::LXR;
 pub use self::global::LXR_CONSTRAINTS;

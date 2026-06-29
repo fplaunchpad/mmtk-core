@@ -75,6 +75,13 @@ impl<T> VectorQueue<T> {
     pub fn clear(&mut self) {
         self.buffer.clear()
     }
+
+    /// Swap this queue's backing vector with `other`, leaving this queue holding `other`'s previous
+    /// contents (and `other` holding this queue's). Used by the LXR RC trace to drain its
+    /// recursively-generated buffer into a scratch vector without reallocating. (LXR additive.)
+    pub fn swap(&mut self, other: &mut Vec<T>) {
+        std::mem::swap(&mut self.buffer, other)
+    }
 }
 
 impl<T> Default for VectorQueue<T> {
