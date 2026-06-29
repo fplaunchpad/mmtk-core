@@ -376,3 +376,80 @@ impl<S: BarrierSemantics> Barrier<S::VM> for SATBBarrier<S> {
         unimplemented!()
     }
 }
+
+/// LXR field-logging write barrier (P3). A pre-write barrier that delegates every store
+/// to the semantics' slow path; the coalescing "log a field at most once per epoch"
+/// decision lives in the *semantics* (via the per-field unlog bit), so — unlike
+/// `ObjectBarrier`/`SATBBarrier` — this wrapper does NOT gate on the per-object log bit.
+/// Vendored (and trimmed to our base `Barrier`/`BarrierSemantics` signatures) from
+/// wenyuzhao/mmtk-core `lxr-v0.32.0`. Inert until the (P3) LXR plan installs it; no plan
+/// selects `BarrierSelector::FieldBarrier` yet, so the shipping plans stay byte-identical.
+pub struct FieldBarrier<S: BarrierSemantics> {
+    semantics: S,
+}
+
+impl<S: BarrierSemantics> FieldBarrier<S> {
+    /// Create a new FieldBarrier with the given semantics.
+    pub fn new(semantics: S) -> Self {
+        Self { semantics }
+    }
+}
+
+impl<S: BarrierSemantics> Barrier<S::VM> for FieldBarrier<S> {
+    fn flush(&mut self) {
+        self.semantics.flush();
+    }
+
+    fn load_weak_reference(&mut self, o: ObjectReference) {
+        self.semantics.load_weak_reference(o)
+    }
+
+    fn object_probable_write(&mut self, obj: ObjectReference) {
+        self.semantics.object_probable_write_slow(obj);
+    }
+
+    fn object_reference_write_pre(
+        &mut self,
+        src: ObjectReference,
+        slot: <S::VM as VMBinding>::VMSlot,
+        target: Option<ObjectReference>,
+    ) {
+        self.semantics
+            .object_reference_write_slow(src, slot, target);
+    }
+
+    fn object_reference_write_post(
+        &mut self,
+        _src: ObjectReference,
+        _slot: <S::VM as VMBinding>::VMSlot,
+        _target: Option<ObjectReference>,
+    ) {
+        unimplemented!()
+    }
+
+    fn object_reference_write_slow(
+        &mut self,
+        src: ObjectReference,
+        slot: <S::VM as VMBinding>::VMSlot,
+        target: Option<ObjectReference>,
+    ) {
+        self.semantics
+            .object_reference_write_slow(src, slot, target);
+    }
+
+    fn memory_region_copy_pre(
+        &mut self,
+        src: <S::VM as VMBinding>::VMMemorySlice,
+        dst: <S::VM as VMBinding>::VMMemorySlice,
+    ) {
+        self.semantics.memory_region_copy_slow(src, dst);
+    }
+
+    fn memory_region_copy_post(
+        &mut self,
+        _src: <S::VM as VMBinding>::VMMemorySlice,
+        _dst: <S::VM as VMBinding>::VMMemorySlice,
+    ) {
+        unimplemented!()
+    }
+}
