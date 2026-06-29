@@ -37,6 +37,14 @@ impl Line {
     pub const MARK_TABLE: SideMetadataSpec =
         crate::util::metadata::side_metadata::spec_defs::IX_LINE_MARK;
 
+    // ---- LXR (P2, additive) ----
+    // Const alias naming the LXR-only per-line reuse-count spec. Registered into the
+    // ImmixSpace metadata vec only inside the `if rc_enabled` branch, so non-LXR plans
+    // never map it. No behaviour.
+    /// Per-line reuse counter table (side) — LXR only.
+    pub const IX_LINE_REUSE_COUNT: SideMetadataSpec =
+        crate::util::metadata::side_metadata::spec_defs::IX_LINE_REUSE_COUNT;
+
     /// Get the block containing the line.
     pub fn block(&self) -> Block {
         debug_assert!(!super::BLOCK_ONLY);

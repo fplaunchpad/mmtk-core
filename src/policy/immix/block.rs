@@ -111,6 +111,21 @@ impl Block {
     pub const MARK_TABLE: SideMetadataSpec =
         crate::util::metadata::side_metadata::spec_defs::IX_BLOCK_MARK;
 
+    // ---- LXR (P2, additive) ----
+    // Const aliases naming the LXR-only per-block RC side-metadata specs. These only
+    // name a defined spec; they are registered into the ImmixSpace metadata vec solely
+    // inside the `if rc_enabled` branch of `ImmixSpace::side_metadata_specs`, so for all
+    // non-LXR plans they are defined-but-not-mapped. No behaviour.
+    /// Per-block "logged" bit table (side) — LXR only.
+    pub const LOG_TABLE: SideMetadataSpec =
+        crate::util::metadata::side_metadata::spec_defs::IX_BLOCK_LOG;
+    /// Per-block nursery-promotion state table (side) — LXR only.
+    pub const NURSERY_PROMOTION_STATE_TABLE: SideMetadataSpec =
+        crate::util::metadata::side_metadata::spec_defs::NURSERY_PROMOTION_STATE;
+    /// Per-block GC phase-epoch table (side) — LXR only.
+    pub const PHASE_EPOCH: SideMetadataSpec =
+        crate::util::metadata::side_metadata::spec_defs::PHASE_EPOCH;
+
     /// Get the chunk containing the block.
     pub fn chunk(&self) -> Chunk {
         Chunk::from_unaligned_address(self.0)
