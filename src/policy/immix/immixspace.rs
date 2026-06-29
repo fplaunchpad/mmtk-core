@@ -802,6 +802,11 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         if self.rc_enabled {
             // RC: route through block_allocation so the new block gets its RC tables (mark / field
             // unlog), nursery-block accounting, and `init_rc`. `cm_enabled = false` (CM deferred).
+            // Ensure block_allocation's `&ImmixSpace` back-pointer is set: the plan-level lazy init
+            // only runs at the first GC, but clean-block allocation happens earlier (mutator startup),
+            // and `initialize_new_clean_block`/`self.space()` would deref a NULL space. `self` here is
+            // the stable (post-boxing) space address; `init` just (idempotently) stores it.
+            self.block_allocation.init(self);
             self.block_allocation
                 .initialize_new_clean_block(block, copy, false);
         } else {

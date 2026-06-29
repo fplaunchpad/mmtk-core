@@ -395,9 +395,11 @@ impl<VM: VMBinding> LXR<VM> {
         self.disable_unnecessary_buckets(scheduler, Pause::RefCount);
         self.process_prev_roots(scheduler);
         type RootEdges<VM> = RCImmixCollectRootEdges<VM>;
-        scheduler.work_buckets[WorkBucketStage::Unconstrained].add_prioritized(Box::new(
-            StopMutators::<LXRRCWorkContext<RootEdges<VM>>>::new(),
-        ));
+        // Plain `add` (not `add_prioritized`): our base's `Unconstrained` bucket has no
+        // prioritized queue (the reference's does), and the base schedules StopMutators the
+        // same way (scheduler.rs). The prioritization was only a latency optimisation.
+        scheduler.work_buckets[WorkBucketStage::Unconstrained]
+            .add(StopMutators::<LXRRCWorkContext<RootEdges<VM>>>::new());
         scheduler.work_buckets[WorkBucketStage::RCProcessIncs].add(FastRCPrepare);
         scheduler.work_buckets[WorkBucketStage::Release]
             .add(Release::<LXRRCWorkContext<UnsupportedProcessEdges<VM>>>::new(self));

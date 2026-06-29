@@ -89,8 +89,13 @@ impl<VM: VMBinding> BlockAllocation<VM> {
     pub fn notify_mutator_phase_end(&self) {}
 
     pub fn cm_in_progress_or_final_mark(&self) -> bool {
-        let lxr = self.lxr.unwrap();
-        lxr.cm_in_progress() || lxr.current_pause() == Some(Pause::FinalMark)
+        // `lxr` is wired lazily at the first GC, but clean-block allocation (which reaches here
+        // via initialize_new_clean_block) happens earlier at mutator startup. CM is deferred
+        // (cm_in_progress is always false), so treat the not-yet-wired state as "no CM".
+        match self.lxr {
+            Some(lxr) => lxr.cm_in_progress() || lxr.current_pause() == Some(Pause::FinalMark),
+            None => false,
+        }
     }
 
     pub(super) fn initialize_new_clean_block(&self, block: Block, copy: bool, cm_enabled: bool) {
