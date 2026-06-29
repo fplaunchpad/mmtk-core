@@ -439,12 +439,25 @@ impl<VM: VMBinding> GCWorkScheduler<VM> {
             WorkerGoal::Gc => {
                 // We are in the progress of GC.
 
-                // In stop-the-world GC, mutators cannot request for GC while GC is in progress.
-                // When we support concurrent GC, we should remove this assertion.
-                assert!(
-                    !goals.debug_is_requested(WorkerGoal::Gc),
-                    "GC request sent to WorkerMonitor while GC is still in progress."
-                );
+                // NO assertion here (GH#14 + GH#6).  The upstream assert was
+                //   assert!(!goals.debug_is_requested(WorkerGoal::Gc),
+                //           "GC request sent to WorkerMonitor while GC is still in progress.")
+                // whose premise — "in stop-the-world GC, mutators cannot request a GC while a GC is
+                // in progress" — is FALSE for a *multi-mutator* binding like OCaml, regardless of
+                // plan.  ANY number of domains can request the next GC while one is in progress:
+                //   * concurrent plan — a domain re-requests during the concurrent-marking window
+                //     (the flag is re-armed at InitialMark, `notify_mutators_paused`);
+                //   * STW plan (e.g. GenImmix) at high domain count — a second domain hits its
+                //     allocation poll, or a domain being *created* refills its initial TLAB
+                //     (`caml_mmtk_domain_init` -> `Space::acquire`), and requests a GC before it is
+                //     stopped/poisoned.
+                // The original (concurrent-only) gate left this assert live for STW plans, where it
+                // fired at >=8 domains, panicked the GC worker, poisoned the WorkerMonitor mutex,
+                // killed all workers, and deadlocked every domain in `park_until_resumed` (gc_active
+                // stuck true).  The request is harmless: it is coalesced in `goals.requests[Gc]`
+                // (an idempotent bit) and serviced by the next `respond_to_requests` after this GC
+                // completes — it survives `on_current_goal_completed`, which only clears `current`.
+                // Confirmed via rr: par_binarytrees d8 GenImmix panicked here. See GH#14 / GH#6.
 
                 // We are in the middle of GC, and the last GC worker parked.
                 trace!("The last worker parked during GC.  Try to find more work to do...");
@@ -645,7 +658,22 @@ impl<VM: VMBinding> GCWorkScheduler<VM> {
         // Reset the triggering information.
         mmtk.state.reset_collection_trigger();
 
-        let concurrent_work_scheduled = self.schedule_concurrent_packets();
+        // GH#14: while concurrent marking is in progress the SATB barrier can feed
+        // the Concurrent bucket lock-free from a resumed mutator AFTER this point.
+        // Pass that state down so we never disable+close a bucket that a late SATB
+        // add() could still target (which would orphan the packet: a disabled bucket
+        // is skipped by notify_one_worker, find_more_work_for_workers and poll, and
+        // reports is_drained()==true though physically non-empty -> lost wakeup -> the
+        // GC never reaches FinalMark and gc_active stays stuck). `end_of_gc` has just
+        // set this true for an InitialMark pause, so we read it here. Non-concurrent
+        // plans return None -> false -> behaviour is byte-identical.
+        let concurrent_marking_active = worker
+            .mmtk
+            .get_plan()
+            .concurrent()
+            .is_some_and(|c| c.concurrent_work_in_progress());
+        let concurrent_work_scheduled =
+            self.schedule_concurrent_packets(concurrent_marking_active);
         self.debug_assert_all_stw_buckets_closed();
 
         // Set to NotInGC after everything, and right before resuming mutators.
@@ -686,12 +714,22 @@ impl<VM: VMBinding> GCWorkScheduler<VM> {
         self.worker_monitor.notify_work_available(true);
     }
 
-    pub(super) fn schedule_concurrent_packets(&self) -> bool {
+    pub(super) fn schedule_concurrent_packets(&self, concurrent_marking_active: bool) -> bool {
         let concurrent_bucket = &self.work_buckets[WorkBucketStage::Concurrent];
-        if !concurrent_bucket.is_empty() {
+        // Keep the Concurrent bucket enabled+open if it has packets now, OR if
+        // concurrent marking is still in progress (GH#14): in the latter case a
+        // resumed mutator's SATB barrier can still add() a ProcessModBufSATB into this
+        // bucket after we return, and a disabled/closed bucket would orphan it (no
+        // worker notified, packet invisible to the work-finding loop, is_drained()
+        // short-circuits to true) -> the lost-wakeup deadlock. Leaving it enabled+open
+        // means the late add() notifies a worker and the packet is polled normally.
+        if !concurrent_bucket.is_empty() || concurrent_marking_active {
             concurrent_bucket.set_enabled(true);
             concurrent_bucket.open();
-            true
+            // We must return true (so on_last_parked wakes workers for concurrent work)
+            // only when there is actually work; an empty-but-kept-open bucket schedules
+            // nothing yet but stays ready for the late SATB feed.
+            !concurrent_bucket.is_empty()
         } else {
             concurrent_bucket.set_enabled(false);
             concurrent_bucket.close();
