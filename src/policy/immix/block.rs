@@ -131,6 +131,12 @@ impl Block {
     /// Per-block GC phase-epoch table (side) — LXR only.
     pub const PHASE_EPOCH: SideMetadataSpec =
         crate::util::metadata::side_metadata::spec_defs::PHASE_EPOCH;
+    /// Per-block spin-lock "in use" bit (side) — LXR only. Guards the RC mature block sweep.
+    pub const BLOCK_IN_USE: SideMetadataSpec =
+        crate::util::metadata::side_metadata::spec_defs::BLOCK_IN_USE;
+    /// Per-block owner word (side) — LXR only.
+    pub const BLOCK_OWNER: SideMetadataSpec =
+        crate::util::metadata::side_metadata::spec_defs::BLOCK_OWNER;
 
     /// Get the chunk containing the block.
     pub fn chunk(&self) -> Chunk {
@@ -289,6 +295,281 @@ impl Block {
     /// Deinitalize a block before releasing.
     pub fn deinit(&self) {
         self.set_state(BlockState::Unallocated);
+    }
+
+    // ── LXR / RC block lifecycle + sweep (P3.5, additive) ──────────────────────
+    // Vendored and adapted from lxr-v0.32.0 block.rs. Inert until the LXR plan runs
+    // (`rc_enabled` stays false), so the existing `init`/`deinit` above (used by the 10
+    // shipping plans) are kept byte-identical and these RC variants are added alongside.
+    //
+    // ADAPTATION: the reference *replaced* `Block::init`/`deinit` with `init<VM>(copy, reuse,
+    // &ImmixSpace)` / `deinit<VM>(&ImmixSpace)`. We instead add `init_rc`/`deinit_rc` so the
+    // non-RC callers (`ImmixSpace::get_clean_block` etc.) keep calling the original 1-/0-arg
+    // versions unchanged. `init_rc`'s `!rc_enabled` arm matches the original `init` exactly.
+
+    /// RC-aware clean/reused block initialisation. (Reference: `Block::init(copy, reuse, space)`.)
+    pub fn init_rc<VM: VMBinding>(&self, copy: bool, reuse: bool, space: &ImmixSpace<VM>) {
+        self.update_phase_epoch();
+        if space.rc_enabled {
+            if !reuse {
+                debug_assert_eq!(self.get_state(), BlockState::Unallocated);
+            }
+            self.clear_in_place_promoted();
+            if copy {
+                debug_assert!((self.phase_epoch() & 1) == 0);
+            } else {
+                debug_assert!((self.phase_epoch() & 1) != 0);
+            }
+            if copy {
+                if reuse {
+                    debug_assert!(!self.is_defrag_source());
+                }
+                self.set_state(BlockState::Unmarked);
+                self.set_as_defrag_source(false);
+            } else if reuse {
+                debug_assert!(!self.is_defrag_source());
+            } else {
+                debug_assert_eq!(self.get_state(), BlockState::Unallocated);
+                self.set_as_defrag_source(false);
+            }
+        } else {
+            self.set_state(if copy {
+                BlockState::Marked
+            } else {
+                BlockState::Unmarked
+            });
+            if !reuse {
+                Self::DEFRAG_STATE_TABLE.store_atomic::<u8>(self.start(), 0, Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// RC-aware deinit before release. (Reference: `Block::deinit(space)`.)
+    pub fn deinit_rc<VM: VMBinding>(&self, space: &ImmixSpace<VM>) {
+        self.set_state(BlockState::Unallocated);
+        if space.rc_enabled {
+            self.clear_in_place_promoted();
+            Self::BLOCK_OWNER.store_atomic(self.start(), 0usize, Ordering::Relaxed);
+            self.set_as_defrag_source(false);
+        }
+    }
+
+    /// True during a mutator (odd) phase epoch.
+    fn in_mutatar_phase() -> bool {
+        (Self::global_phase_epoch() & 1) == 1
+    }
+
+    /// Update the global phase epoch (bumped at the end of every mutator and GC phase). On the
+    /// 8-bit wrap (254→1) the reference also bulk-zeroes the per-block PHASE_EPOCH metadata via
+    /// `space.pr.reset_nursery_state()` — see the note on `BlockPageResource::reset_nursery_state`
+    /// (deferred no-op in our free-list page resource).
+    pub fn update_global_phase_epoch<VM: VMBinding>(space: &ImmixSpace<VM>) {
+        let old = GLOBAL_PHASE_EPOCH.load(Ordering::SeqCst);
+        if old == 254 {
+            GLOBAL_PHASE_EPOCH.store(1, Ordering::SeqCst);
+            space.block_page_resource().reset_nursery_state();
+        } else {
+            GLOBAL_PHASE_EPOCH.store(old + 1, Ordering::SeqCst);
+        }
+    }
+
+    // ── RC per-block side-table operations ─────────────────────────────────────
+
+    pub fn clear_rc_table<VM: VMBinding>(&self) {
+        crate::util::rc::RC_TABLE.bzero_metadata(self.start(), Block::BYTES);
+    }
+
+    pub fn clear_striddle_table<VM: VMBinding>(&self) {
+        crate::util::rc::RC_STRADDLE_LINES.bzero_metadata(self.start(), Block::BYTES);
+    }
+
+    pub(super) fn clear_mark_table<VM: VMBinding>(&self) {
+        VM::VMObjectModel::LOCAL_MARK_BIT_SPEC
+            .extract_side_spec()
+            .bzero_metadata(self.start(), Self::BYTES);
+    }
+
+    pub(super) fn initialize_mark_table_as_marked<VM: VMBinding>(&self) {
+        let meta = VM::VMObjectModel::LOCAL_MARK_BIT_SPEC.extract_side_spec();
+        let start: *mut u8 =
+            crate::util::metadata::side_metadata::address_to_meta_address(meta, self.start())
+                .to_mut_ptr();
+        let limit: *mut u8 =
+            crate::util::metadata::side_metadata::address_to_meta_address(meta, self.end())
+                .to_mut_ptr();
+        unsafe {
+            let bytes = limit.offset_from(start) as usize;
+            std::ptr::write_bytes(start, 0xffu8, bytes);
+        }
+    }
+
+    pub fn initialize_field_unlog_table_as_unlogged<VM: VMBinding>(&self) {
+        let meta = *VM::VMObjectModel::GLOBAL_FIELD_UNLOG_BIT_SPEC
+            .as_spec()
+            .extract_side_spec();
+        let start: *mut u8 =
+            crate::util::metadata::side_metadata::address_to_meta_address(&meta, self.start())
+                .to_mut_ptr();
+        let limit: *mut u8 =
+            crate::util::metadata::side_metadata::address_to_meta_address(&meta, self.end())
+                .to_mut_ptr();
+        unsafe {
+            let bytes = limit.offset_from(start) as usize;
+            std::ptr::write_bytes(start, 0xffu8, bytes);
+        }
+    }
+
+    /// True iff every RC entry covering this block is zero (the whole block is dead).
+    pub fn rc_dead(&self) -> bool {
+        type UInt = u128;
+        const LOG_BITS_IN_UINT: usize =
+            (std::mem::size_of::<UInt>() << 3).trailing_zeros() as usize;
+        debug_assert!(
+            Self::LOG_BYTES - crate::util::rc::LOG_MIN_OBJECT_SIZE
+                + crate::util::rc::LOG_REF_COUNT_BITS
+                >= LOG_BITS_IN_UINT
+        );
+        let start = crate::util::metadata::side_metadata::address_to_meta_address(
+            &crate::util::rc::RC_TABLE,
+            self.start(),
+        )
+        .to_ptr::<UInt>();
+        let limit = crate::util::metadata::side_metadata::address_to_meta_address(
+            &crate::util::rc::RC_TABLE,
+            self.end(),
+        )
+        .to_ptr::<UInt>();
+        let rc_table = unsafe { std::slice::from_raw_parts(start, limit.offset_from(start) as _) };
+        for x in rc_table {
+            if *x != 0 {
+                return false;
+            }
+        }
+        true
+    }
+
+    // ── RC in-place nursery promotion state ────────────────────────────────────
+
+    pub fn set_as_in_place_promoted<VM: VMBinding>(&self, space: &ImmixSpace<VM>) {
+        if self.is_in_place_promoted() {
+            return;
+        }
+        loop {
+            let old_value: u8 =
+                Self::NURSERY_PROMOTION_STATE_TABLE.load_atomic(self.start(), Ordering::Relaxed);
+            if old_value == 1 {
+                return;
+            }
+            if Self::NURSERY_PROMOTION_STATE_TABLE
+                .compare_exchange_atomic(self.start(), 0u8, 1u8, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                space
+                    .block_allocation
+                    .in_place_promoted_nursery_blocks
+                    .fetch_add(1, Ordering::Relaxed);
+                self.set_state(BlockState::Unmarked);
+                self.update_phase_epoch();
+                return;
+            }
+        }
+    }
+
+    pub fn is_in_place_promoted(&self) -> bool {
+        Self::NURSERY_PROMOTION_STATE_TABLE.load_atomic::<u8>(self.start(), Ordering::Relaxed) != 0
+    }
+
+    fn clear_in_place_promoted(&self) {
+        Self::NURSERY_PROMOTION_STATE_TABLE.store_atomic(self.start(), 0u8, Ordering::Relaxed);
+    }
+
+    // ── RC block spin-lock (guards the mature sweep vs mutator reuse) ───────────
+
+    fn try_lock(&self) -> bool {
+        let result = Self::BLOCK_IN_USE.fetch_update_atomic::<u8, _>(
+            self.start(),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |b| if b == 1 { None } else { Some(1) },
+        );
+        result == Ok(0)
+    }
+
+    fn lock_skip_reusing_or_unallocated(&self) -> bool {
+        loop {
+            std::hint::spin_loop();
+            let state = self.get_state();
+            if state == BlockState::Unallocated || (Self::in_mutatar_phase() && self.is_reusing()) {
+                return false;
+            }
+            if self.try_lock() {
+                return true;
+            }
+        }
+    }
+
+    pub fn unlock(&self) {
+        Self::BLOCK_IN_USE.store_atomic::<u8>(self.start(), 0u8, Ordering::Relaxed);
+    }
+
+    /// Set block mark state via a fetch-update closure. (Reference: `Block::fetch_update_state`.)
+    pub fn fetch_update_state(
+        &self,
+        mut f: impl FnMut(BlockState) -> Option<BlockState> + Copy,
+    ) -> Result<BlockState, BlockState> {
+        // The inner closure must be `Copy` (the side-metadata `fetch_update_atomic` bound). Capture
+        // `f` by value with `move` so the inner closure owns a `Copy` of it (a non-`move` closure
+        // would capture `f` by `&mut`, which is not `Copy`).
+        Self::MARK_TABLE
+            .fetch_update_atomic::<u8, _>(
+                self.start(),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+                move |s| f(s.into()).map(u8::from),
+            )
+            .map(|x| (x).into())
+            .map_err(|x| (x).into())
+    }
+
+    /// Try to atomically transition the block to Unallocated, refusing if a mutator is still
+    /// reusing it. Returns true iff the block was deallocated.
+    fn attempt_dealloc(&self) -> bool {
+        self.fetch_update_state(|s| {
+            if (Self::in_mutatar_phase() && self.is_reusing()) || s == BlockState::Unallocated {
+                None
+            } else {
+                Some(BlockState::Unallocated)
+            }
+        })
+        .is_ok()
+    }
+
+    /// Sweep a (possibly) dead mature block. Returns true iff the block was freed (the caller
+    /// then bulk-releases its pages). `defrag` forces the dealloc (mature evac, deferred); `rc_dead`
+    /// lets the caller assert deadness without re-scanning the RC table.
+    pub fn rc_sweep_mature<VM: VMBinding>(
+        &self,
+        space: &ImmixSpace<VM>,
+        defrag: bool,
+        rc_dead: bool,
+    ) -> bool {
+        if self.get_state() == BlockState::Unallocated {
+            return false;
+        }
+        if defrag || rc_dead || self.rc_dead() {
+            if !self.lock_skip_reusing_or_unallocated() {
+                return false;
+            }
+            let dead = if defrag || self.attempt_dealloc() {
+                self.deinit_rc(space);
+                true
+            } else {
+                false
+            };
+            self.unlock();
+            return dead;
+        }
+        false
     }
 
     pub fn start_line(&self) -> Line {

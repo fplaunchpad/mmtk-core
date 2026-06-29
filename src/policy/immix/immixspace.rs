@@ -72,6 +72,24 @@ pub struct ImmixSpace<VM: VMBinding> {
     /// lxr P2.D: count of nursery blocks promoted in place this GC. Written only by
     /// the P3 nursery-promotion gc_work; init-only / inert today.
     pub in_place_promoted_nursery_blocks: AtomicUsize,
+    // ── LXR (P3, additive) — RC block-allocation + lazy mature-sweep bookkeeping ──
+    // All inert until the LXR plan runs (`rc_enabled` stays false). Vendored/adapted from
+    // lxr-v0.32.0 immixspace.rs.
+    /// Per-mutator-phase clean/reusable nursery block tracking + nursery sweep.
+    pub block_allocation: crate::policy::immix::block_allocation::BlockAllocation<VM>,
+    /// Mature blocks that *may* have gone fully dead after a batch of decrements (deduplicated by
+    /// the per-block log bit). Drained into `SweepBlocksAfterDecs` packets by
+    /// `schedule_rc_block_sweeping_tasks`.
+    possibly_dead_mature_blocks: crossbeam::queue::SegQueue<(Block, bool)>,
+    /// Clean blocks released this GC, by source (young / mature / lazily). Stats only.
+    pub num_clean_blocks_released_young: AtomicUsize,
+    pub num_clean_blocks_released_mature: AtomicUsize,
+    pub num_clean_blocks_released_lazy: AtomicUsize,
+    /// Bytes the RC copy-allocator handed out this GC (mature evac, deferred). Stats only.
+    pub copy_alloc_bytes: AtomicUsize,
+    /// Lines consumed by mutators reusing partially-free (recycled) blocks this phase. Drives
+    /// `get_mutator_recycled_lines_in_pages`. Written by the reuse allocator path (deferred); 0 today.
+    reused_lines_consumed: AtomicUsize,
 }
 
 /// Some arguments for Immix Space.
@@ -428,6 +446,13 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             rc: crate::util::rc::RefCountHelper::NEW,
             is_end_of_satb_or_full_gc: false,
             in_place_promoted_nursery_blocks: AtomicUsize::new(0),
+            block_allocation: crate::policy::immix::block_allocation::BlockAllocation::new(),
+            possibly_dead_mature_blocks: crossbeam::queue::SegQueue::new(),
+            num_clean_blocks_released_young: AtomicUsize::new(0),
+            num_clean_blocks_released_mature: AtomicUsize::new(0),
+            num_clean_blocks_released_lazy: AtomicUsize::new(0),
+            copy_alloc_bytes: AtomicUsize::new(0),
+            reused_lines_consumed: AtomicUsize::new(0),
             pr: if common.vmrequest.is_discontiguous() {
                 BlockPageResource::new_discontiguous(
                     Block::LOG_PAGES,
@@ -462,6 +487,73 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         self.reusable_blocks.flush_all();
         #[cfg(target_pointer_width = "64")]
         self.pr.flush_all()
+    }
+
+    // ── LXR (P3, additive) — RC block-allocation + lazy mature-sweep support ──────
+    // Inert until the LXR plan runs (`rc_enabled` stays false). Vendored/adapted from
+    // lxr-v0.32.0 immixspace.rs. `block_allocation.rs` (a sibling module) reaches the private
+    // `pr`/`defrag` fields through these `pub(super)`/`pub(crate)` accessors.
+
+    /// The block page resource (private field). Exposed to the `block_allocation` sibling module
+    /// for the bulk nursery release / reset.
+    pub(super) fn block_page_resource(&self) -> &BlockPageResource<VM, Block> {
+        &self.pr
+    }
+
+    /// Notify the defrag bookkeeping that a fresh clean block was handed out. Exposed for the
+    /// `block_allocation` sibling module (the `defrag` field is `pub(super)`).
+    pub(super) fn notify_new_clean_block(&self, copy: bool) {
+        self.defrag.notify_new_clean_block(copy);
+    }
+
+    /// Pages worth of lines mutators consumed by reusing partially-free blocks this phase. Used by
+    /// `block_allocation::total_young_allocation_in_bytes`. Currently 0 (the reuse-allocator path
+    /// that bumps `reused_lines_consumed` is deferred).
+    pub(crate) fn get_mutator_recycled_lines_in_pages(&self) -> usize {
+        debug_assert!(self.rc_enabled);
+        self.reused_lines_consumed.load(Ordering::Relaxed)
+            >> (LOG_BYTES_IN_PAGE - Line::LOG_BYTES as u8)
+    }
+
+    /// Record a mature block that may have died after a batch of decrements. Deduplicated by the
+    /// per-block log bit so a block is only swept once per epoch. Drained by
+    /// `schedule_rc_block_sweeping_tasks`.
+    pub fn add_to_possibly_dead_mature_blocks(&self, block: Block, is_defrag_source: bool) {
+        if block.log() {
+            self.possibly_dead_mature_blocks
+                .push((block, is_defrag_source));
+        }
+    }
+
+    /// Drain `possibly_dead_mature_blocks` into per-worker `SweepBlocksAfterDecs` packets,
+    /// prioritised into the always-open `Unconstrained` bucket. Vendored from lxr-v0.32.0.
+    pub fn schedule_rc_block_sweeping_tasks(&self, counter: crate::LazySweepingJobsCounter) {
+        let size = self.possibly_dead_mature_blocks.len();
+        let num_bins = self.scheduler().num_workers();
+        let bin_cap = size / num_bins + if size % num_bins == 0 { 0 } else { 1 };
+        let mut bins = (0..num_bins)
+            .map(|_| Vec::with_capacity(bin_cap))
+            .collect::<Vec<Vec<(Block, bool)>>>();
+        'out: for bin in bins.iter_mut() {
+            for _ in 0..bin_cap {
+                if let Some(block) = self.possibly_dead_mature_blocks.pop() {
+                    bin.push(block);
+                } else {
+                    break 'out;
+                }
+            }
+        }
+        let packets: Vec<Box<dyn GCWork<VM>>> = bins
+            .into_iter()
+            .map(|blocks| {
+                Box::new(super::rc_work::SweepBlocksAfterDecs::new(
+                    blocks,
+                    counter.clone(),
+                )) as Box<dyn GCWork<VM>>
+            })
+            .collect();
+        self.scheduler().work_buckets[WorkBucketStage::Unconstrained]
+            .bulk_add_prioritized(packets);
     }
 
     /// Get the number of defrag headroom pages.

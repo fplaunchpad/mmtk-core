@@ -1,7 +1,9 @@
 pub mod block;
+pub(crate) mod block_allocation;
 pub mod defrag;
 pub mod immixspace;
 pub mod line;
+pub(crate) mod rc_work;
 
 pub use immixspace::*;
 
