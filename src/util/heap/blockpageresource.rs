@@ -173,6 +173,39 @@ impl<VM: VMBinding, B: Region> BlockPageResource<VM, B> {
         self.block_queue.push(block)
     }
 
+    // ── LXR / RC additive page-resource API (P3) ──────────────────────────────
+    // Vendored (and adapted) from the LXR fork's `blockpageresource_nosweep.rs`. The reference's
+    // LXR uses a *bump-cursor* nosweep page resource; our base is the standard free-list
+    // `BlockPageResource`, so these are reimplemented against the free-list design. Inert until
+    // the LXR plan runs (`rc_enabled` stays false), so the shipping plans are unaffected.
+
+    /// Bulk-account the release of `count` blocks without pushing them onto the free list.
+    /// The RC block sweep (`SweepBlocksAfterDecs` / `rc_sweep_mature`) deinits + `release_block`s
+    /// each dead block individually (which both accounts *and* recycles it); this is the LXR
+    /// fast-path that releases only the page *accounting* in bulk. Matches the nosweep semantics
+    /// (`accounting.release(count << LOG_PAGES)`).
+    pub fn bulk_release_blocks(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let pages = count << Self::LOG_PAGES;
+        debug_assert!(pages <= self.common().accounting.get_committed_pages());
+        self.common().accounting.release(pages as _);
+    }
+
+    /// Reset per-GC allocation cursors. The nosweep resource resets bump cursors here; our
+    /// free-list resource has no cursor state to reset, so this is a no-op kept for API parity
+    /// with the LXR `block_allocation::sweep_nursery_blocks` call site.
+    pub fn reset(&self) {}
+
+    /// Zero the per-block phase-epoch metadata across the whole space. The reference calls this
+    /// from `Block::update_global_phase_epoch` only when the 8-bit global epoch is about to wrap
+    /// (every 254 phases). DEFERRED: our generic `BlockPageResource<VM, B>` is not specialised to
+    /// `Block`, so it cannot name `Block::PHASE_EPOCH` here. The wrap is an extreme edge case
+    /// (254 GC phases) and irrelevant while the machinery is inert; wire the bulk-zero (over the
+    /// committed chunks) when RC is turned on. Currently a no-op.
+    pub fn reset_nursery_state(&self) {}
+
     pub fn flush_all(&self) {
         self.block_queue.flush_all()
         // TODO: For 32-bit space, we may want to free some contiguous chunks.
