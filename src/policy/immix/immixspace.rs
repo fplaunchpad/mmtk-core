@@ -50,12 +50,19 @@ fn rc_debug_track_free(site: &str, block: Block) {
         return;
     }
     let addr = block.start().as_usize();
+    let end = addr + crate::policy::immix::block::Block::BYTES;
+    // Log the freed block's [start, end) range so a later heap-address SIGSEGV can be matched
+    // against the blocks this pause freed (if the faulting address falls in a freed block's range,
+    // the sweep freed the crashing block -> confirms the UAF + names the block + free site).
+    if std::env::var_os("MMTK_RC_LOG_FREES").is_some() {
+        eprintln!("[RC-FREE] {site}: block [{addr:#x}, {end:#x})");
+    }
     let mut g = RC_FREE_BLOCKS.lock().unwrap();
     let set = g.get_or_insert_with(std::collections::HashSet::new);
     if !set.insert(addr) {
         panic!(
             "[RC-DOUBLE-FREE] {site}: block {:#x} freed while already on the free list \
-             (double-free -> aliasing). This is the regression.",
+             (double-free -> aliasing).",
             addr
         );
     }
