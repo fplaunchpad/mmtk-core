@@ -94,6 +94,15 @@ pub trait SFT {
     ///     `Mutator::post_alloc` will call this method after allocation.
     fn initialize_object_metadata(&self, object: ObjectReference);
 
+    /// LXR / reference-counting variant of [`Self::initialize_object_metadata`] that also
+    /// receives the object's size in bytes. ImmixSpace (resets copy-alloc-bytes) and LOS (RC
+    /// nursery bookkeeping) override this for the RC (LXR) plan; every other space inherits the
+    /// default below, which simply forwards to the size-less `initialize_object_metadata`, so the
+    /// non-RC plans stay byte-identical. The allocation post-path calls this `_bytes` variant.
+    fn initialize_object_metadata_bytes(&self, object: ObjectReference, _bytes: usize) {
+        self.initialize_object_metadata(object)
+    }
+
     /// Trace objects through SFT. This along with [`SFTProcessEdges`](mmtk/scheduler/gc_work/SFTProcessEdges)
     /// provides an easy way for most plans to trace objects without the need to implement any plan-specific
     /// code. However, tracing objects for some policies are more complicated, and they do not provide an
