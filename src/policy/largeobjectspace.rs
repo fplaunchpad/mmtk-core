@@ -32,6 +32,15 @@ pub struct LargeObjectSpace<VM: VMBinding> {
     in_nursery_gc: bool,
     treadmill: TreadMill,
     clear_log_bit_on_sweep: bool,
+    /// lxr P2.I: does this LOS run the RC read-side overlays? (= constraints.rc_enabled,
+    /// captured at construction). `false` for every non-RC plan, so the overlays stay inert
+    /// and the LOS is byte-identical to upstream.
+    pub rc_enabled: bool,
+    /// lxr P2.I: LXR reference-counting helper (zero-sized; consulted only when rc_enabled).
+    pub rc: crate::util::rc::RefCountHelper<VM>,
+    /// lxr P2.I: end-of-SATB / full-GC discriminator (see ImmixSpace). Driven by the P3 LXR
+    /// plan; always `false` under the gate.
+    pub is_end_of_satb_or_full_gc: bool,
 }
 
 impl<VM: VMBinding> SFT for LargeObjectSpace<VM> {
@@ -39,7 +48,25 @@ impl<VM: VMBinding> SFT for LargeObjectSpace<VM> {
         self.get_name()
     }
     fn is_live(&self, object: ObjectReference) -> bool {
+        // lxr P2.I: under RC, LOS liveness is ref-count > 0; at the end of a SATB cycle / full
+        // GC it is refined to also require the mark bit. Gated; non-RC falls through to the
+        // upstream mark-bit test byte-for-byte (rc_enabled always false until the P3 LXR plan).
+        if self.rc_enabled {
+            if self.is_end_of_satb_or_full_gc {
+                return self.is_marked(object) && self.rc.count(object) > 0;
+            }
+            return self.rc.count(object) > 0;
+        }
         self.test_mark_bit(object, self.mark_state)
+    }
+    fn is_reachable(&self, object: ObjectReference) -> bool {
+        // lxr P2.I: under RC, reachability requires both the mark bit and a positive ref-count;
+        // non-RC delegates to is_live (= the SFT default), preserving upstream behaviour.
+        if self.rc_enabled {
+            self.test_mark_bit(object, self.mark_state) && self.rc.count(object) > 0
+        } else {
+            self.is_live(object)
+        }
     }
     #[cfg(feature = "object_pinning")]
     fn pin_object(&self, _object: ObjectReference) -> bool {
@@ -281,10 +308,19 @@ impl<VM: VMBinding> LargeObjectSpace<VM> {
     ) -> Self {
         let is_discontiguous = args.vmrequest.is_discontiguous();
         let vm_map = args.vm_map;
+        // lxr P2.I: capture rc_enabled before `args` is consumed; register the per-page RC reuse
+        // counter only in the gated branch so non-RC plans keep the exact upstream spec list.
+        let rc_enabled = args.constraints.rc_enabled;
+        let mut los_specs = vec![*VM::VMObjectModel::LOCAL_LOS_MARK_NURSERY_SPEC];
+        if rc_enabled {
+            los_specs.push(crate::util::metadata::MetadataSpec::OnSide(
+                crate::util::metadata::side_metadata::spec_defs::LOS_PAGE_REUSE_COUNT,
+            ));
+        }
         let common = CommonSpace::new(args.into_policy_args(
             false,
             false,
-            metadata::extract_side_metadata(&[*VM::VMObjectModel::LOCAL_LOS_MARK_NURSERY_SPEC]),
+            metadata::extract_side_metadata(&los_specs),
         ));
         let mut pr = if is_discontiguous {
             FreeListPageResource::new_discontiguous(vm_map)
@@ -303,6 +339,9 @@ impl<VM: VMBinding> LargeObjectSpace<VM> {
             in_nursery_gc: false,
             treadmill: TreadMill::new(),
             clear_log_bit_on_sweep,
+            rc_enabled,
+            rc: crate::util::rc::RefCountHelper::NEW,
+            is_end_of_satb_or_full_gc: false,
         }
     }
 
