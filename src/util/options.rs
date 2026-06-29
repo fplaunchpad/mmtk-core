@@ -52,6 +52,9 @@ pub enum PlanSelector {
     StickyImmix,
     /// Concurrent non-moving immix using SATB
     ConcurrentImmix,
+    /// LXR: reference counting on a hierarchical Immix heap (P3 — currently a structural
+    /// clone of Immix with `rc_enabled = false`; RC behaviour layered on incrementally).
+    LXR,
 }
 
 /// MMTk option for perf events

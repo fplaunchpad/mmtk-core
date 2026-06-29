@@ -4,6 +4,13 @@
 //! behind the LXR plan (`rc_enabled`/`needs_field_log_bit`); no other plan reaches it, so
 //! the 10 shipping plans stay byte-identical until `MMTK_PLAN=LXR` is wired (P3.8).
 
+pub(super) mod gc_work;
+pub(super) mod global;
+pub(super) mod mutator;
+
+pub use self::global::LXR;
+pub use self::global::LXR_CONSTRAINTS;
+
 use bytemuck::NoUninit;
 
 /// LXR collection-pause kind. Distinct from [`crate::plan::concurrent::Pause`] so the
