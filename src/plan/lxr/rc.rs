@@ -380,6 +380,7 @@ impl<VM: VMBinding> ProcessEdgesWork for RCImmixCollectRootEdges<VM> {
     type ScanObjectsWorkType = ScanObjects<Self>;
     const OVERWRITE_REFERENCE: bool = false;
     const SCAN_OBJECTS_IMMEDIATELY: bool = true;
+    const RC_ROOTS: bool = true;
 
     fn new(
         slots: Vec<SlotOf<Self>>,

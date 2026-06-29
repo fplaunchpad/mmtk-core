@@ -556,6 +556,43 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             .bulk_add_prioritized(packets);
     }
 
+    /// RC-pause prepare. Minimal cut: only the `Pause::RefCount` path is implemented (reset the
+    /// per-GC block-release / copy counters). The `Pause::Full`/`InitialMark` branches (mature-evac
+    /// selection, mark-state setup) are DEFERRED — they are never reached because the minimal LXR
+    /// plan only ever schedules a `RefCount` pause. Vendored/adapted from lxr-v0.32.0 immixspace.rs.
+    pub fn prepare_rc(&mut self, pause: crate::plan::lxr::Pause) {
+        debug_assert_eq!(
+            pause,
+            crate::plan::lxr::Pause::RefCount,
+            "minimal LXR cut only schedules RefCount pauses; Full/InitialMark prepare_rc deferred"
+        );
+        self.num_clean_blocks_released_young
+            .store(0, Ordering::SeqCst);
+        self.num_clean_blocks_released_mature
+            .store(0, Ordering::SeqCst);
+        self.num_clean_blocks_released_lazy
+            .store(0, Ordering::SeqCst);
+        self.copy_alloc_bytes.store(0, Ordering::SeqCst);
+    }
+
+    /// RC-pause release. Minimal cut (`Pause::RefCount`): sweep the unpromoted clean nursery blocks,
+    /// flush the page resource, reset the inc buffer + the reused-line counter. The post-SATB mature
+    /// sweeping and the lazy-decrement draining are DEFERRED (Full/FinalMark only / lazy-dec
+    /// machinery). Vendored/adapted from lxr-v0.32.0 immixspace.rs.
+    pub fn release_rc(&mut self, pause: crate::plan::lxr::Pause) {
+        debug_assert_eq!(
+            pause,
+            crate::plan::lxr::Pause::RefCount,
+            "minimal LXR cut only schedules RefCount pauses; Full/FinalMark release_rc deferred"
+        );
+        self.block_allocation
+            .sweep_nursery_blocks(&self.scheduler, pause);
+        self.flush_page_resource();
+        self.rc.reset_inc_buffer_size();
+        self.is_end_of_satb_or_full_gc = false;
+        self.reused_lines_consumed.store(0, Ordering::Relaxed);
+    }
+
     /// Get the number of defrag headroom pages.
     pub fn defrag_headroom_pages(&self) -> usize {
         self.defrag.defrag_headroom_pages(self)
@@ -741,7 +778,12 @@ impl<VM: VMBinding> ImmixSpace<VM> {
 
     /// Release a block.
     pub fn release_block(&self, block: Block) {
-        block.deinit();
+        // RC: `deinit_rc` also clears the in-place-promoted / owner / defrag-source per-block state.
+        if self.rc_enabled {
+            block.deinit_rc(self);
+        } else {
+            block.deinit();
+        }
         self.pr.release_block(block);
     }
 
@@ -756,9 +798,16 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         if block_address.is_zero() {
             return None;
         }
-        self.defrag.notify_new_clean_block(copy);
         let block = Block::from_aligned_address(block_address);
-        block.init(copy);
+        if self.rc_enabled {
+            // RC: route through block_allocation so the new block gets its RC tables (mark / field
+            // unlog), nursery-block accounting, and `init_rc`. `cm_enabled = false` (CM deferred).
+            self.block_allocation
+                .initialize_new_clean_block(block, copy, false);
+        } else {
+            self.defrag.notify_new_clean_block(copy);
+            block.init(copy);
+        }
         self.chunk_map.set_allocated(block.chunk(), true);
         self.lines_consumed
             .fetch_add(Block::LINES, Ordering::SeqCst);
@@ -768,6 +817,15 @@ impl<VM: VMBinding> ImmixSpace<VM> {
     /// Pop a reusable block from the reusable block list.
     pub fn get_reusable_block(&self, copy: bool) -> Option<Block> {
         if super::BLOCK_ONLY {
+            return None;
+        }
+        // Minimal RC cut: DISABLE partial-block (recycled-line) reuse — always allocate fresh clean
+        // blocks. The RC reuse path (`init_rc(copy, reuse=true)` + `reused_lines_consumed` tracking +
+        // the per-line RC reuse counter) is the most fragile part of the LXR allocator (phase-epoch
+        // asserts, straddle-line bookkeeping on partially-live blocks); deferring it keeps the first
+        // RC bring-up correct. Throughput cost only. Reusable blocks are still populated by the
+        // standard sweep but never handed back out under RC.
+        if self.rc_enabled {
             return None;
         }
         loop {

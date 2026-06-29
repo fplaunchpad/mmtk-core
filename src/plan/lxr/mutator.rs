@@ -1,4 +1,6 @@
+use super::barrier::LXRFieldBarrierSemantics;
 use super::LXR;
+use crate::plan::barriers::FieldBarrier;
 use crate::plan::mutator_context::common_prepare_func;
 use crate::plan::mutator_context::common_release_func;
 use crate::plan::mutator_context::create_allocator_mapping;
@@ -59,6 +61,12 @@ pub fn create_lxr_mutator<VM: VMBinding>(
         release_func: &lxr_mutator_release,
     };
 
-    let builder = MutatorBuilder::new(mutator_tls, mmtk, config);
-    builder.build()
+    // Install the LXR coalescing field-logging write barrier (per-field unlog bit + inc/dec
+    // buffering). Mirrors how GenImmix/ConcurrentImmix install theirs. `LXR_CONSTRAINTS.barrier`
+    // = `FieldBarrier`, so the framework drives the barrier on `object_reference_write`.
+    MutatorBuilder::new(mutator_tls, mmtk, config)
+        .barrier(Box::new(FieldBarrier::new(LXRFieldBarrierSemantics::new(
+            mmtk,
+        ))))
+        .build()
 }
