@@ -66,6 +66,22 @@ cycle-collection pauses — deferred (`lxr_no_cm`).
       RQ1 crux: do NOT log `caml_initialize` (initializing writes) as mutations** — OCaml's
       heap is initializing-write-dominated, which is exactly why the barrier is nearly free.
 
+## P3.4 connected-core structure (corrected against lxr-v0.32.0, 2026-06-29)
+
+The version-matched reference is laid out differently than the initial map (which mixed in
+`lxr/lxr` file names). Verified locations at `lxr/lxr-v0.32.0`:
+- **`reset_nursery_state` + the RC nursery page-resource API live in `src/util/heap/blockpageresource_nosweep.rs`** — a *separate* "no-sweep" BlockPageResource variant that LXR's ImmixSpace uses. Our base ImmixSpace `pr` is the standard `BlockPageResource` (415 lines; the nosweep variant is 349). **Decision needed:** add the RC/nursery methods (`reset_nursery_state`, nursery-block tracking) to our `BlockPageResource` **additively/gated** (keep other plans byte-identical) rather than swap the `pr` type per-plan (ImmixSpace `pr` is shared across plans). This is the heaviest sub-piece.
+- **`block_allocation.rs` is `src/policy/immix/block_allocation.rs`** (a *policy*-level file), not `plan/lxr/`. Holds `BlockAllocation` + the nursery-block list + `sweep_nursery_blocks`.
+- `nursery_blocks`/sweep also touched in `src/args.rs` (consts) + `src/plan/lxr/global.rs`.
+
+So the connected P3.4 batch order is: (1) additive RC/nursery methods on `BlockPageResource` +
+`src/policy/immix/block_allocation.rs`; (2) `ImmixSpace` RC fields (`possibly_dead_mature_blocks`,
+`block_allocation`, `copy_alloc_bytes`) + methods (`add_to_possibly_dead_mature_blocks`,
+`schedule_rc_block_sweeping_tasks`, `prepare_rc`/`release_rc`/`rc_eager_prepare`, `update_global_phase_epoch`);
+(3) `src/policy/immix/rc_work.rs` (`SweepBlocksAfterDecs`) + `Block::{init,deinit,rc_sweep_mature,
+set_as_in_place_promoted,rc_dead}`; (4) `plan/lxr/rc.rs` (`ProcessIncs`/`ProcessDecs`). Each step
+cargo-builds against the prior; the batch is not byte-identical-decomposable below this granularity.
+
 ## P4 contract (good news: the runtime already has the shape)
 `runtime/memory.c`'s `caml_modify` already issues a **pre-store, slot-granular** barrier
 (`caml_mmtk_satb_barrier(Op_val(obj)+field, 1)` → `memory_region_copy_pre` →
