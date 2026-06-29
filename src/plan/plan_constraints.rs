@@ -47,6 +47,11 @@ pub struct PlanConstraints {
     pub needs_prepare_mutator: bool,
     /// Is this plan generational?
     pub generational: bool,
+    /// LXR / reference counting: does this plan use the RC side metadata (RC_TABLE,
+    /// straddle/line-reuse counts) and the RC trace/sweep overlays in Immix + LOS?
+    /// `false` for every non-RC plan, so the gated RC overlays stay inert and those
+    /// plans remain byte-identical. Only the (P3) LXR plan sets this true.
+    pub rc_enabled: bool,
 }
 
 impl PlanConstraints {
@@ -70,6 +75,7 @@ impl PlanConstraints {
             // If we use mark sweep as non moving space, we need to prepare mutator. See [`common_prepare_func`].
             needs_prepare_mutator: cfg!(feature = "marksweep_as_nonmoving"),
             generational: false,
+            rc_enabled: false,
         }
     }
 }
