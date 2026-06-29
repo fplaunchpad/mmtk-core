@@ -31,9 +31,10 @@ cycle-collection pauses — deferred (`lxr_no_cm`).
 - [x] **P3.1** — vendor `Address::{is_field_logged,attempt_log_field,log_field,unlog_field,
       unlog_field_relaxed}` (the per-field unlog-bit primitives). `88afa7d997`
 - [x] **P3.2** — vendor `FieldBarrier<S>` (the pre-write delegating wrapper). `a3cc3f02a3`
-- [ ] **P3.3 (R)** — `Pause` enum (in a new `plan/lxr/` module, NOT `immix/mod.rs`, to
-      avoid colliding with the base concurrent `Pause`).
-- [ ] **P3.4 (R)** — port the immix RC machinery absent from base (**highest risk** — the
+- [x] **P3.3** — `plan/lxr` module + `Pause` enum (distinct from `concurrent::Pause`). `c3dfa801d9`
+- [~] **P3.4 (R)** — port the immix RC machinery absent from base (**highest risk** — the
+      connected core; comes in as a chunk + cargo-fixes, not isolated commits). **P3.4a done**
+      (`Line::{of,containing}`, `ce093eefb5`). Remaining is the connected bulk below:
       moving/sweep core; lean on the `sanity` feature at small heap): new
       `policy/immix/rc_work.rs` (`SweepBlocksAfterDecs`, `SweepDeadCycles`); a trimmed
       `policy/immix/block_allocation.rs` (`BlockAllocation`, nursery block list,
