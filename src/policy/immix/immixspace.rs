@@ -552,8 +552,10 @@ impl<VM: VMBinding> ImmixSpace<VM> {
                 )) as Box<dyn GCWork<VM>>
             })
             .collect();
+        // Plain bulk_add (not bulk_add_prioritized): our base's Unconstrained bucket has no
+        // prioritized queue (the reference's does) — bulk_add_prioritized unwraps None and aborts.
         self.scheduler().work_buckets[WorkBucketStage::Unconstrained]
-            .bulk_add_prioritized(packets);
+            .bulk_add(packets);
     }
 
     /// RC-pause prepare. Minimal cut: only the `Pause::RefCount` path is implemented (reset the
