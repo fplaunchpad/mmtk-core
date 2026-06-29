@@ -40,3 +40,11 @@ pub enum Pause {
     /// SATB cycle collection: the final pause after concurrent marking (deferred).
     FinalMark,
 }
+
+// Allow `Atomic<Option<Pause>>` (the plan stores its current/previous pause kind that way, as the
+// ConcurrentImmix plan does). `bytemuck` only auto-derives `NoUninit` for the bare enum; storing
+// it in an `Option` inside an `Atomic` additionally requires these two niche-optimisation marker
+// impls (a `#[repr(u8)]` fieldless enum with no discriminant 0 leaves the all-zero bit pattern free
+// for `None`, which both traits attest is sound).
+unsafe impl bytemuck::ZeroableInOption for Pause {}
+unsafe impl bytemuck::PodInOption for Pause {}

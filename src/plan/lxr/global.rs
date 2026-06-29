@@ -19,9 +19,12 @@ use crate::util::metadata::log_bit::UnlogBitsOperation;
 use crate::util::metadata::side_metadata::SideMetadataContext;
 use crate::util::rc::RefCountHelper;
 use crate::vm::VMBinding;
+use crate::util::ObjectReference;
 use crate::{policy::immix::ImmixSpace, util::opaque_pointer::VMWorkerThread};
 use std::sync::atomic::AtomicBool;
 
+use super::Pause;
+use atomic::Atomic;
 use atomic::Ordering;
 use enum_map::EnumMap;
 
@@ -51,6 +54,15 @@ pub struct LXR<VM: VMBinding> {
     /// and `rc_enabled` is flipped on; present now as the foundation those steps build on.
     #[allow(dead_code)] // read by the RC trace (ProcessIncs/ProcessDecs), wired in a later P3 step
     pub rc: RefCountHelper<VM>,
+    /// The kind of the in-progress GC pause (`None` outside a pause). Set by `schedule_collection`
+    /// when the RC-pause scheduling is wired (deferred); until then it stays `None` because the RC
+    /// trace that reads it is never scheduled (`rc_enabled == false`). Mirrors the same field on
+    /// the ConcurrentImmix plan.
+    #[allow(dead_code)]
+    current_pause: Atomic<Option<Pause>>,
+    /// The kind of the previous GC pause. Deferred / always `None` in the minimal RC cut.
+    #[allow(dead_code)]
+    previous_pause: Atomic<Option<Pause>>,
 }
 
 /// The plan constraints for the LXR plan. Currently identical to the Immix
@@ -182,10 +194,77 @@ impl<VM: VMBinding> LXR<VM> {
             common: CommonPlan::new(plan_args),
             last_gc_was_defrag: AtomicBool::new(false),
             rc: RefCountHelper::NEW,
+            current_pause: Atomic::new(None),
+            previous_pause: Atomic::new(None),
         };
 
         lxr.verify_side_metadata_sanity();
 
         lxr
+    }
+}
+
+// ── LXR RC-trace support (P3, additive) ───────────────────────────────────────────────────────
+// The reference-counting work packets (`ProcessIncs`/`ProcessDecs`/`RCImmixCollectRootEdges`),
+// the field barrier, and `block_allocation.rs` query the plan through this small surface. In the
+// minimal single-domain RC cut almost all of it is *stubbed* — concurrent marking (CM/SATB),
+// mature evacuation, and lazy decrements are deferred, so the CM/defrag-flavoured queries are hard
+// `false`/`None`. The machinery is present + compiling but INERT (`rc_enabled` stays false), so
+// these are never actually called at runtime yet; they exist so the RC packets type-check.
+#[allow(dead_code)]
+impl<VM: VMBinding> LXR<VM> {
+    /// The large-object space (RC dec'd objects that overflow immix live here). Returns the shared
+    /// CommonPlan LOS — note the *RC-aware* LOS nursery tracking / `rc_free` is deferred, so this is
+    /// the standard mark-swept LOS for now.
+    pub fn los(&self) -> &crate::policy::largeobjectspace::LargeObjectSpace<VM> {
+        self.common.get_los()
+    }
+
+    /// Is a concurrent-marking (SATB) cycle in progress? Deferred under `lxr_no_cm` → always false.
+    pub fn cm_in_progress(&self) -> bool {
+        false
+    }
+
+    /// Is concurrent marking enabled at all? Deferred (`lxr_no_cm`) → always false.
+    pub fn cm_enabled(&self) -> bool {
+        false
+    }
+
+    /// Convenience used by the reference's `block_allocation` cm-gate. Deferred → false.
+    pub fn cm_in_progress_or_final_mark(&self) -> bool {
+        self.cm_in_progress() || self.current_pause() == Some(Pause::FinalMark)
+    }
+
+    /// The kind of the in-progress pause, or `None` outside a pause. Stays `None` until RC-pause
+    /// scheduling is wired (the RC trace that consumes it is not scheduled while `rc_enabled` is
+    /// false), so the machinery is inert.
+    pub fn current_pause(&self) -> Option<Pause> {
+        self.current_pause.load(Ordering::Relaxed)
+    }
+
+    /// The kind of the previous pause. Deferred / always `None` in the minimal RC cut.
+    pub fn previous_pause(&self) -> Option<Pause> {
+        self.previous_pause.load(Ordering::Relaxed)
+    }
+
+    /// Is `object` marked (live) by the mark bit? Forwarded to the immix space's RC read-side.
+    pub fn is_marked(&self, object: ObjectReference) -> bool {
+        self.immix_space.is_marked(object)
+    }
+
+    /// Atomically mark `object` (0→1); returns true iff this call did the marking. Only used by the
+    /// CM/SATB dec path (deferred), so inert in the minimal cut.
+    pub fn mark(&self, object: ObjectReference) -> bool {
+        self.immix_space.attempt_mark_rc(object)
+    }
+
+    /// Is `object` in a block selected for mature defrag-evacuation? Deferred (no mature evac) → false.
+    pub fn in_defrag(&self, _object: ObjectReference) -> bool {
+        false
+    }
+
+    /// Is `addr` in a defrag-source block? Deferred (no mature evac) → false.
+    pub fn address_in_defrag(&self, _addr: crate::util::Address) -> bool {
+        false
     }
 }
