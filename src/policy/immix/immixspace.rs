@@ -611,19 +611,32 @@ impl<VM: VMBinding> ImmixSpace<VM> {
     /// object has an all-zero RC table and is reclaimed here.
     fn rc_sweep_nursery_blocks(&self) {
         let mut released = 0usize;
+        let mut nursery_seen = 0usize;
         for chunk in self.chunk_map.all_chunks() {
             for block in chunk.iter_region::<Block>() {
-                let state = block.get_state();
-                if state == BlockState::Unallocated {
+                // RC convention (the key insight the previous version got WRONG): a CLEAN nursery
+                // block stays in `BlockState::Unallocated` — `init_rc` does NOT flip it to
+                // `Unmarked` for the clean-nursery case. What marks a block "allocated this phase"
+                // is its per-block PHASE_EPOCH matching the global one (`is_nursery_or_reusing`),
+                // NOT its block state. A nursery block whose object(s) SURVIVED was flipped to
+                // `Unmarked` (mature) by `set_as_in_place_promoted`.
+                //
+                // So a live nursery block (in use, holding objects) has state == Unallocated. The
+                // old code `continue`d on `state == Unallocated`, which therefore SKIPPED EVERY
+                // nursery block — so nothing was ever reclaimed (`young=0`, the reclamation leak).
+                //
+                //   - `is_nursery()` (Unallocated + epoch matches) = a fresh nursery block that
+                //     received NO surviving object -> all dead -> reclaim.
+                //   - `is_reusing()` (allocated state + epoch matches) = a reused block this phase.
+                //   - a promoted block is now `Unmarked` (state != Unallocated, NOT nursery) ->
+                //     skipped (swept lazily later if it dies).
+                //   - a truly-free block is `Unallocated` with a STALE epoch (is_nursery false).
+                if !block.is_nursery() && !block.is_reusing() {
                     continue;
                 }
-                // Only consider blocks touched in the current phase (clean nursery or reused). Mature
-                // blocks from prior phases are swept lazily via SweepBlocksAfterDecs, not here.
-                if !block.is_nursery_or_reusing() {
-                    continue;
-                }
-                // A promoted nursery block has at least one live (rc>0) object; an unpromoted one is
-                // all-zero and dead. `rc_dead()` scans the block's RC table.
+                nursery_seen += 1;
+                // Confirm the whole block is dead (an unpromoted nursery block is all-RC-zero; a
+                // partially-reused block could still hold live objects).
                 if block.rc_dead() {
                     self.release_block(block);
                     released += 1;
@@ -633,6 +646,11 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         if released != 0 {
             self.num_clean_blocks_released_young
                 .fetch_add(released, Ordering::Relaxed);
+        }
+        if crate::plan::lxr::rc::rc_debug_on() {
+            eprintln!(
+                "[RC-SWEEP] nursery: {nursery_seen} nursery/reused blocks scanned, {released} freed"
+            );
         }
     }
 

@@ -126,13 +126,12 @@ impl<VM: VMBinding> Plan for LXR<VM> {
     fn schedule_collection(&'static self, scheduler: &GCWorkScheduler<VM>) {
         // Lazily wire `block_allocation`'s self-reference (idempotent).
         self.ensure_block_allocation_initialized();
-        // Bump the global phase epoch at the START of the pause (the mutator→GC transition), the
-        // partner of the bump at the END of `release` (GC→mutator). The two-bumps-per-GC scheme is
-        // what makes the phase-epoch parity meaningful: odd = mutator phase, even = GC phase, and a
-        // block's `is_nursery_or_reusing()` correctly identifies blocks allocated in the just-ended
-        // mutator phase. (The reference bumps in `gc_pause_start`; our base has no such hook, so we
-        // do it here — before any incs read block nursery state.)
-        Block::update_global_phase_epoch(&self.immix_space);
+        // NOTE: the pause-START phase-epoch bump is done in `notify_mutators_paused` (after all
+        // mutators are stopped), NOT here — `schedule_collection` runs while mutators are still
+        // allocating, and bumping to the even (GC-phase) epoch here would let a still-running
+        // mutator stamp a freshly-allocated block with an EVEN epoch, violating the odd=mutator
+        // invariant (`init_rc` asserts it) and mis-classifying that live block as non-nursery →
+        // the nursery sweep could then free a LIVE block (SIGSEGV).
         // Minimal RC cut: the only pause kind is RefCount (no CM, no emergency full GC, no defrag).
         let pause = self.select_collection_kind();
         self.current_pause.store(Some(pause), Ordering::SeqCst);
@@ -141,6 +140,17 @@ impl<VM: VMBinding> Plan for LXR<VM> {
             // The minimal cut never schedules these (select_collection_kind only returns RefCount).
             _ => unreachable!("minimal LXR cut only schedules RefCount pauses, got {:?}", pause),
         }
+    }
+
+    fn notify_mutators_paused(&self, _scheduler: &GCWorkScheduler<VM>) {
+        // Pause-START phase-epoch bump (mutator→GC transition), the partner of the bump at the END
+        // of `release` (GC→mutator). Two bumps per GC make the parity meaningful: odd = mutator
+        // phase, even = GC phase, so `is_nursery_or_reusing()` correctly identifies blocks allocated
+        // in the just-ended mutator phase. This hook runs AFTER all mutators have stopped (called by
+        // `StopMutators`), so no mutator can stamp a block with the new even epoch — the analogue of
+        // the reference's `gc_pause_start` (which our base lacks). It runs before the Prepare bucket
+        // opens, hence before any RC inc reads block nursery state.
+        Block::update_global_phase_epoch(&self.immix_space);
     }
 
     fn get_allocator_mapping(&self) -> &'static EnumMap<AllocationSemantics, AllocatorSelector> {
@@ -384,6 +394,12 @@ impl<VM: VMBinding> LXR<VM> {
     /// are deferred). Always schedules at least one (possibly empty) packet so the bucket opens.
     fn process_prev_roots(&self, scheduler: &GCWorkScheduler<VM>) {
         let prev_roots = self.prev_roots.write().unwrap();
+        if super::rc::rc_debug_on() {
+            let n_pkts = prev_roots.len();
+            // SegQueue::len is O(1); count total root targets across packets non-destructively is
+            // not cheap, so just report packet count (matches the [RC-STATS] prev/curr).
+            eprintln!("[RC-PREV-ROOTS] process_prev_roots: prev_root_packets={n_pkts}");
+        }
         let mut work_packets: Vec<Box<dyn GCWork<VM>>> = Vec::with_capacity(prev_roots.len());
         while let Some(decs) = prev_roots.pop() {
             work_packets.push(Box::new(ProcessDecs::new(

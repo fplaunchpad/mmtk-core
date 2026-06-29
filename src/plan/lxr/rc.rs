@@ -73,7 +73,7 @@ pub(super) fn rc_stat_inc(counter: &AtomicUsize) {
 }
 
 /// Cached `MMTK_RC_DEBUG` flag (env read once).
-pub(super) fn rc_debug_on() -> bool {
+pub(crate) fn rc_debug_on() -> bool {
     use std::sync::atomic::AtomicU8;
     static STATE: AtomicU8 = AtomicU8::new(0); // 0=unknown, 1=off, 2=on
     match STATE.load(AtomicOrdering::Relaxed) {
