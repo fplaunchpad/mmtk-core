@@ -57,7 +57,9 @@ use crate::MMTK;
 
 /// The classification of an increment's source slot.
 pub type EdgeKind = u8;
-/// A root slot (scanned from the stack/registers). Roots are never written back.
+/// A root slot (scanned from the stack/registers). Roots are never written back. (Used by
+/// `RCImmixCollectRootEdges` once the RC root scan is wired — main loop.)
+#[allow(dead_code)]
 pub const EDGE_KIND_ROOT: u8 = 0;
 /// A slot of a freshly-promoted nursery object (recursive increment).
 pub const EDGE_KIND_NURSERY: u8 = 1;
@@ -366,7 +368,9 @@ impl<VM: VMBinding> GCWork<VM> for ProcessDecs<VM> {
 /// Converts a root-edge buffer into a root-increment packet. This is a `ProcessEdgesWork` purely so
 /// the existing root-scanning machinery (which produces `ProcessEdgesWork` packets) can drive the RC
 /// roots: its `process_slots` turns the root slots into a `ProcessIncs<_, EDGE_KIND_ROOT>` and runs
-/// it inline. `trace_object`/`create_scan_work` are unreachable — it never traces.
+/// it inline. `trace_object`/`create_scan_work` are unreachable — it never traces. (Wired into the
+/// RC root scan when `rc_enabled` is flipped — main loop.)
+#[allow(dead_code)]
 pub struct RCImmixCollectRootEdges<VM: VMBinding> {
     base: ProcessEdgesBase<VM>,
 }
