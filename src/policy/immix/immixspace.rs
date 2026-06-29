@@ -107,11 +107,32 @@ impl<VM: VMBinding> SFT for ImmixSpace<VM> {
     }
 
     fn is_live(&self, object: ObjectReference) -> bool {
-        // lxr P2.1: under RC, liveness is "ref-count > 0 (or already forwarded)", not the
-        // mark bit. (The end-of-SATB / full-GC refinement that also consults marks +
-        // defrag-source arrives with the concurrent-marking sub-phase.) Gated, so every
-        // non-RC plan keeps the mark-bit semantics below byte-for-byte.
+        // lxr P2.1/P2.E: under RC, liveness is "ref-count > 0 (or already forwarded)", not the
+        // mark bit. At the end of a SATB cycle or a full GC, the read-side is refined to also
+        // consult the mark bit + defrag-source + forwarding (the end-of-SATB/full-GC branch).
+        // Gated, so every non-RC plan keeps the mark-bit semantics below byte-for-byte; and
+        // is_end_of_satb_or_full_gc is always false until the P3 LXR plan drives it.
         if self.rc_enabled {
+            if self.is_end_of_satb_or_full_gc {
+                if self.is_marked(object) {
+                    let block = Block::from_unaligned_address(object.to_raw_address());
+                    if block.is_defrag_source() {
+                        if object_forwarding::is_forwarded::<VM>(object) {
+                            let forwarded =
+                                object_forwarding::read_forwarding_pointer::<VM>(object);
+                            return self.is_marked(forwarded) && self.rc.count(forwarded) > 0;
+                        } else {
+                            return false;
+                        }
+                    }
+                    return self.rc.count(object) > 0;
+                } else if object_forwarding::is_forwarded::<VM>(object) {
+                    let forwarded = object_forwarding::read_forwarding_pointer::<VM>(object);
+                    return self.is_marked(forwarded) && self.rc.count(forwarded) > 0;
+                } else {
+                    return false;
+                }
+            }
             return self.rc.count(object) > 0 || object_forwarding::is_forwarded::<VM>(object);
         }
         // If the mark bit is set, it is live.
@@ -126,6 +147,20 @@ impl<VM: VMBinding> SFT for ImmixSpace<VM> {
 
         // If the object is forwarded, it is live, too.
         object_forwarding::is_forwarded::<VM>(object)
+    }
+
+    fn is_reachable(&self, object: ObjectReference) -> bool {
+        // lxr P2.E: under RC, reachability follows forwarding then requires both the mark bit
+        // and a positive ref-count. Gated; for every non-RC plan we fall through to the SFT
+        // default (delegate to is_live), preserving upstream behaviour byte-for-byte.
+        if self.rc_enabled {
+            if object_forwarding::is_forwarded::<VM>(object) {
+                let forwarded = object_forwarding::read_forwarding_pointer::<VM>(object);
+                return self.is_marked(forwarded) && self.rc.count(forwarded) > 0;
+            }
+            return self.is_marked(object) && self.rc.count(object) > 0;
+        }
+        self.is_live(object)
     }
     #[cfg(feature = "object_pinning")]
     fn pin_object(&self, object: ObjectReference) -> bool {
