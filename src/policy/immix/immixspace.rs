@@ -920,6 +920,39 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         self.is_marked_with(object, self.mark_state)
     }
 
+    // ── LXR / RC mark helpers (P3.4) ──────────────────────────────────────────
+    // The additive parallel of attempt_mark/unmark for the RC plan: LXR fixes the
+    // mark state to 1 (0->1 / 1->0 fetch_update) rather than CAS-ing against a passed
+    // mark_state, so the other plans keep the existing 2-arg `attempt_mark(object,
+    // mark_state)` unchanged (byte-identical). Vendored from lxr-v0.32.0 immixspace.rs.
+    // Used by the RC trace + cm.rs; `allow(dead_code)` until the LXR plan lands (P3.6).
+
+    /// Atomically mark an object (0 -> 1). Returns true iff this call did the marking.
+    #[allow(dead_code)]
+    pub(crate) fn attempt_mark_rc(&self, object: ObjectReference) -> bool {
+        VM::VMObjectModel::LOCAL_MARK_BIT_SPEC
+            .fetch_update_metadata::<VM, u8, _>(
+                object,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |v| if v != 0 { None } else { Some(1) },
+            )
+            .is_ok()
+    }
+
+    /// Atomically unmark an object (1 -> 0). Returns true iff this call did the unmarking.
+    #[allow(dead_code)]
+    pub(crate) fn unmark_rc(&self, object: ObjectReference) -> bool {
+        VM::VMObjectModel::LOCAL_MARK_BIT_SPEC
+            .fetch_update_metadata::<VM, u8, _>(
+                object,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |v| if v != 1 { None } else { Some(0) },
+            )
+            .is_ok()
+    }
+
     /// Check if an object is pinned.
     fn is_pinned(&self, _object: ObjectReference) -> bool {
         #[cfg(feature = "object_pinning")]
