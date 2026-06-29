@@ -36,6 +36,42 @@ use std::sync::{atomic::AtomicU8, atomic::AtomicUsize, Arc};
 pub(crate) const TRACE_KIND_FAST: TraceKind = 0;
 pub(crate) const TRACE_KIND_DEFRAG: TraceKind = 1;
 
+// ── RC double-free / use-after-free block tracker (MMTK_RC_DEBUG) ──────────────────────────────
+// Tracks the set of blocks currently believed to be on the free list. Freeing a block already in
+// the set is a DOUBLE-FREE (the freelist would hand it out twice -> aliasing -> heap-address
+// SIGSEGV under reallocation pressure, which is exactly the freeing-on / tight-heap crash class).
+// Panics loudly with the block address so the offending sweep is pinpointed. Active only under
+// MMTK_RC_DEBUG; zero cost otherwise.
+static RC_FREE_BLOCKS: std::sync::Mutex<Option<std::collections::HashSet<usize>>> =
+    std::sync::Mutex::new(None);
+
+fn rc_debug_track_free(site: &str, block: Block) {
+    if !crate::plan::lxr::rc::rc_debug_on() {
+        return;
+    }
+    let addr = block.start().as_usize();
+    let mut g = RC_FREE_BLOCKS.lock().unwrap();
+    let set = g.get_or_insert_with(std::collections::HashSet::new);
+    if !set.insert(addr) {
+        panic!(
+            "[RC-DOUBLE-FREE] {site}: block {:#x} freed while already on the free list \
+             (double-free -> aliasing). This is the regression.",
+            addr
+        );
+    }
+}
+
+fn rc_debug_track_alloc(block: Block) {
+    if !crate::plan::lxr::rc::rc_debug_on() {
+        return;
+    }
+    let addr = block.start().as_usize();
+    let mut g = RC_FREE_BLOCKS.lock().unwrap();
+    if let Some(set) = g.as_mut() {
+        set.remove(&addr);
+    }
+}
+
 pub struct ImmixSpace<VM: VMBinding> {
     common: CommonSpace<VM>,
     pr: BlockPageResource<VM, Block>,
@@ -619,7 +655,8 @@ impl<VM: VMBinding> ImmixSpace<VM> {
     /// AND has any non-zero RC entry. A clean block handed out this phase that received no surviving
     /// object has an all-zero RC table and is reclaimed here.
     pub(crate) fn rc_sweep_nursery_blocks(&self) {
-        let no_nursery_sweep = std::env::var_os("MMTK_RC_NO_NURSERY_SWEEP").is_some();
+        let no_nursery_sweep = std::env::var_os("MMTK_RC_NO_NURSERY_SWEEP").is_some()
+            || std::env::var_os("MMTK_RC_NO_FREE").is_some();
         let mut released = 0usize;
         let mut nursery_seen = 0usize;
         for chunk in self.chunk_map.all_chunks() {
@@ -864,6 +901,7 @@ impl<VM: VMBinding> ImmixSpace<VM> {
 
     /// Release a block.
     pub fn release_block(&self, block: Block) {
+        rc_debug_track_free("release_block", block);
         // RC: `deinit_rc` also clears the in-place-promoted / owner / defrag-source per-block state.
         if self.rc_enabled {
             block.deinit_rc(self);
@@ -877,6 +915,7 @@ impl<VM: VMBinding> ImmixSpace<VM> {
     /// freelist). Used by the RC mature sweep (`Block::rc_sweep_mature`), which has already run
     /// `deinit_rc` under the per-block lock, so we must NOT deinit again here.
     pub(crate) fn release_block_to_free_list(&self, block: Block) {
+        rc_debug_track_free("release_block_to_free_list", block);
         self.pr.release_block(block);
     }
 
@@ -892,6 +931,7 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             return None;
         }
         let block = Block::from_aligned_address(block_address);
+        rc_debug_track_alloc(block);
         if self.rc_enabled {
             // RC: route through block_allocation so the new block gets its RC tables (mark / field
             // unlog), nursery-block accounting, and `init_rc`. `cm_enabled = false` (CM deferred).

@@ -52,6 +52,12 @@ pub(super) struct RCBlockSweepEpilogue;
 impl<VM: VMBinding> GCWork<VM> for RCBlockSweepEpilogue {
     fn do_work(&mut self, _worker: &mut GCWorker<VM>, mmtk: &'static MMTK<VM>) {
         let lxr = mmtk.get_plan().downcast_ref::<LXR<VM>>().unwrap();
+        // Bisect knobs (default = full reclamation):
+        //   MMTK_RC_NO_FREE        — disable BOTH sweeps (free NOTHING; reproduces the pre-leak-fix
+        //                            `1711b5e48f` behavior so the pause can be confirmed clean).
+        //   MMTK_RC_NO_NURSERY_SWEEP — disable only the nursery sweep (handled inside it).
+        //   MMTK_RC_NO_MATURE_SWEEP  — disable only the mature sweep.
+        let no_free = std::env::var_os("MMTK_RC_NO_FREE").is_some();
         // Sweep the unpromoted NURSERY blocks here — AFTER all decrements have drained — not in
         // `release_rc`. A field-barrier dec carries the OLD overwritten value, which can be a YOUNG
         // object; freeing its nursery block before the decs run would make that dec dereference a
@@ -60,8 +66,10 @@ impl<VM: VMBinding> GCWork<VM> for RCBlockSweepEpilogue {
         // freed underneath it.
         lxr.immix_space.rc_sweep_nursery_blocks();
         // Then sweep the now-dead MATURE blocks the decs queued into possibly_dead_mature_blocks.
-        lxr.immix_space
-            .schedule_rc_block_sweeping_tasks(crate::LazySweepingJobsCounter::new_decs());
+        if !no_free && std::env::var_os("MMTK_RC_NO_MATURE_SWEEP").is_none() {
+            lxr.immix_space
+                .schedule_rc_block_sweeping_tasks(crate::LazySweepingJobsCounter::new_decs());
+        }
         // Release-end phase-epoch bump (GC→mutator), done HERE (after the nursery sweep classified
         // blocks by the GC-phase epoch) rather than in `Plan::release` (which runs before the decs
         // and this sweep). Partner of the pause-start bump in `notify_mutators_paused`.

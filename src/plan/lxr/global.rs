@@ -144,13 +144,18 @@ impl<VM: VMBinding> Plan for LXR<VM> {
 
     fn notify_mutators_paused(&self, _scheduler: &GCWorkScheduler<VM>) {
         // Pause-START phase-epoch bump (mutator→GC transition), the partner of the bump at the END
-        // of `release` (GC→mutator). Two bumps per GC make the parity meaningful: odd = mutator
+        // of the epilogue (GC→mutator). Two bumps per GC make the parity meaningful: odd = mutator
         // phase, even = GC phase, so `is_nursery_or_reusing()` correctly identifies blocks allocated
         // in the just-ended mutator phase. This hook runs AFTER all mutators have stopped (called by
         // `StopMutators`), so no mutator can stamp a block with the new even epoch — the analogue of
         // the reference's `gc_pause_start` (which our base lacks). It runs before the Prepare bucket
         // opens, hence before any RC inc reads block nursery state.
-        Block::update_global_phase_epoch(&self.immix_space);
+        //
+        // Bisect knob MMTK_RC_SINGLE_BUMP reverts to the pre-leak-fix single-bump scheme (bump only
+        // at release end) to confirm whether the double-bump regressed the previously-clean pause.
+        if std::env::var_os("MMTK_RC_SINGLE_BUMP").is_none() {
+            Block::update_global_phase_epoch(&self.immix_space);
+        }
     }
 
     fn get_allocator_mapping(&self) -> &'static EnumMap<AllocationSemantics, AllocatorSelector> {
