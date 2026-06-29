@@ -72,6 +72,29 @@ fn fake_tls() -> VMThread {
     VMThread::UNINITIALIZED
 }
 
+/// MMTK_RC_DEBUG diagnostic: before doing RC metadata work on `o`, verify it is a real, mapped,
+/// in-space heap object. If not, print the bogus reference + the call site and abort cleanly
+/// (instead of a raw SIGSEGV deep in `atomic_load`), so the offending path is pinpointed.
+#[inline(always)]
+fn debug_rc_validate<VM: VMBinding>(site: &str, o: ObjectReference) {
+    if !cfg!(debug_assertions) && std::env::var_os("MMTK_RC_DEBUG").is_none() {
+        return;
+    }
+    let a = o.to_raw_address();
+    let ok = a.is_mapped() && crate::memory_manager::is_in_mmtk_spaces(o);
+    if !ok {
+        eprintln!(
+            "[RC-BOGUS] {site}: object {:?} (addr {:#x}) is NOT a valid in-space mapped object \
+             (is_mapped={}, in_spaces={})",
+            o,
+            a.as_usize(),
+            a.is_mapped(),
+            crate::memory_manager::is_in_mmtk_spaces(o),
+        );
+        std::process::abort();
+    }
+}
+
 // ───────────────────────────────────── ProcessIncs ──────────────────────────────────────────────
 
 /// Process a buffer of reference-count increments. `KIND` distinguishes root / nursery / mature
@@ -124,23 +147,30 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
     /// Promote a freshly-incremented object to mature: mark its block as in-place-promoted (if it
     /// is a fresh nursery block), set its straddle-line metadata, and scan it to set field unlog
     /// bits + generate recursive increments. No copying (in-place-only cut).
-    fn promote(&mut self, o: ObjectReference, los: bool) {
+    ///
+    /// `in_immix` = the object is in the immix space. The per-block / straddle-line bookkeeping
+    /// (`is_nursery`, `set_as_in_place_promoted`, `promote_with_size`) reads LOCAL side metadata
+    /// that is mapped ONLY for the immix space's chunks, so it must be skipped for objects in the
+    /// LOS / immortal / non-moving spaces (whose addresses index unmapped immix-block metadata →
+    /// SIGSEGV). RC_TABLE is global (whole-heap mapped), so the inc itself is always safe.
+    fn promote(&mut self, o: ObjectReference, in_immix: bool) {
         let size = VM::VMObjectModel::get_current_size(o);
-        if !los {
+        if in_immix {
             let block = Block::containing(o);
             if block.is_nursery() {
                 block.set_as_in_place_promoted(&self.lxr.immix_space);
             }
             self.rc.promote_with_size(o, size);
         }
-        self.scan_nursery_object(o, los);
+        self.scan_nursery_object(o, in_immix);
     }
 
     /// Scan a freshly-promoted object: set its per-field unlog bits (so the field write barrier
     /// won't re-log them — they are now mature) and generate a recursive increment for each pointer
-    /// field, bumping already-live children directly.
-    fn scan_nursery_object(&mut self, o: ObjectReference, los: bool) {
-        if los {
+    /// field, bumping already-live children directly. `in_immix` distinguishes the immix path from
+    /// the LOS/immortal/non-moving path (the latter unlogs the header, not the per-field bulk path).
+    fn scan_nursery_object(&mut self, o: ObjectReference, in_immix: bool) {
+        if !in_immix {
             o.to_raw_address().unlog_field_relaxed::<VM>();
         }
         SlotIterator::<VM>::iterate_fields(o, fake_tls(), |slot| {
@@ -149,6 +179,7 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
             let Some(target) = slot.load() else {
                 return;
             };
+            debug_rc_validate::<VM>("scan_nursery_object.field", target);
             let rc = self.rc.count(target);
             if rc == 0 {
                 // Fresh nursery child — defer a recursive increment (it will itself promote).
@@ -166,9 +197,12 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
 
     /// The minimal in-place-promotion inc: increment, and promote on the 0 → 1 transition.
     fn process_inc(&mut self, o: ObjectReference) {
-        let los = self.lxr.los().in_space(o);
+        debug_rc_validate::<VM>("process_inc", o);
+        // Immix membership gates the per-block / straddle-line metadata in `promote` (LOS /
+        // immortal / non-moving objects index unmapped immix-block side metadata otherwise).
+        let in_immix = self.lxr.immix_space.in_space(o);
         if self.inc(o) {
-            self.promote(o, los);
+            self.promote(o, in_immix);
         }
     }
 
@@ -304,16 +338,18 @@ impl<VM: VMBinding> ProcessDecs<VM> {
     #[cold]
     fn process_dead_object(&mut self, o: ObjectReference, lxr: &LXR<VM>) {
         let in_ix_space = lxr.immix_space.in_space(o);
-        // Recursively decrement the dead object's pointer fields.
+        // Recursively decrement the dead object's pointer fields. Symmetric with the inc side
+        // (`scan_nursery_object` increments EVERY traced child, immix or not, since RC_TABLE is
+        // global), so we decrement every traced child here too — otherwise non-immix children
+        // (LOS / immortal / non-moving) would be inc'd but never dec'd (RC leak / never reclaimed).
+        // The per-block bookkeeping in the recursively-scheduled `process_dead_object` is itself
+        // gated on immix membership, so decrementing a non-immix child is safe.
         if !cfg!(feature = "lxr_no_recursive_dec") {
             SlotIterator::<VM>::iterate_fields(o, fake_tls(), |slot| {
                 if let Some(x) = slot.load() {
-                    let out_of_heap = !lxr.immix_space.in_space(x);
-                    if !out_of_heap {
-                        let rc = self.rc.count(x);
-                        if rc != MAX_REF_COUNT && rc != 0 {
-                            self.recursive_dec(x);
-                        }
+                    let rc = self.rc.count(x);
+                    if rc != MAX_REF_COUNT && rc != 0 {
+                        self.recursive_dec(x);
                     }
                 }
             });
