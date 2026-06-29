@@ -704,6 +704,15 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         vo_bit::helper::on_trace_object::<VM>(object);
 
         if self.attempt_mark(object, self.mark_state) {
+            // lxr P2.F: under RC, a straddle continuation line carries no RC entry of its own,
+            // so a marked straddle object is short-circuited before line/block marking. Gated;
+            // dead for all non-RC plans (rc_enabled always false until the P3 LXR plan).
+            if self.rc_enabled {
+                let line = Line::from_aligned_address(Line::align(object.to_raw_address()));
+                if self.rc.is_straddle_line(line) {
+                    return object;
+                }
+            }
             // Mark block and lines
             if !super::BLOCK_ONLY {
                 if !super::MARK_LINE_AT_SCAN_TIME {
@@ -851,6 +860,11 @@ impl<VM: VMBinding> ImmixSpace<VM> {
     #[allow(clippy::assertions_on_constants)]
     pub fn mark_lines(&self, object: ObjectReference) {
         debug_assert!(!super::BLOCK_ONLY);
+        // lxr P2.F: RC does not use the line mark-state sweep (lines are reclaimed by ref-count,
+        // not tracing), so line marking is a no-op under RC. Gated; dead for all non-RC plans.
+        if self.rc_enabled {
+            return;
+        }
         Line::mark_lines_for_object::<VM>(object, self.line_mark_state.load(Ordering::Acquire));
     }
 
@@ -963,6 +977,12 @@ impl<VM: VMBinding> ImmixSpace<VM> {
 
     /// Post copy routine for Immix copy contexts
     fn post_copy(&self, object: ObjectReference, _bytes: usize) {
+        // lxr P2.F: under RC, RC metadata travels with the copy in the trace path (P2.3) and
+        // the mark-bit / line-mark post-copy fixups below do not apply, so this is a no-op.
+        // Gated; dead for all non-RC plans (rc_enabled always false until the P3 LXR plan).
+        if self.rc_enabled {
+            return;
+        }
         // Mark the object
         VM::VMObjectModel::LOCAL_MARK_BIT_SPEC.store_atomic::<VM, u8>(
             object,
