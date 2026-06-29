@@ -17,6 +17,7 @@ use crate::util::heap::gc_trigger::SpaceStats;
 use crate::util::heap::VMRequest;
 use crate::util::metadata::log_bit::UnlogBitsOperation;
 use crate::util::metadata::side_metadata::SideMetadataContext;
+use crate::util::rc::RefCountHelper;
 use crate::vm::VMBinding;
 use crate::{policy::immix::ImmixSpace, util::opaque_pointer::VMWorkerThread};
 use std::sync::atomic::AtomicBool;
@@ -45,6 +46,11 @@ pub struct LXR<VM: VMBinding> {
     #[parent]
     pub common: CommonPlan<VM>,
     last_gc_was_defrag: AtomicBool,
+    /// Reference-counting helper (RC_TABLE access + promote/dead bookkeeping). Inert
+    /// until the RC trace (`ProcessIncs`/`ProcessDecs`) and the field barrier are wired
+    /// and `rc_enabled` is flipped on; present now as the foundation those steps build on.
+    #[allow(dead_code)] // read by the RC trace (ProcessIncs/ProcessDecs), wired in a later P3 step
+    pub rc: RefCountHelper<VM>,
 }
 
 /// The plan constraints for the LXR plan. Currently identical to the Immix
@@ -175,6 +181,7 @@ impl<VM: VMBinding> LXR<VM> {
             ),
             common: CommonPlan::new(plan_args),
             last_gc_was_defrag: AtomicBool::new(false),
+            rc: RefCountHelper::NEW,
         };
 
         lxr.verify_side_metadata_sanity();
