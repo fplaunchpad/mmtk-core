@@ -322,13 +322,16 @@ impl<VM: VMBinding> ImmixSpace<VM> {
                 *VM::VMObjectModel::LOCAL_PINNING_BIT_SPEC,
             ]
         };
-        // lxr P2.0: gated RC straddle-line table. The non-RC list above is left
-        // byte-identical; the further RC block tables (LOG_TABLE /
-        // NURSERY_PROMOTION_STATE_TABLE / PHASE_EPOCH / IX_LINE_REUSE_COUNT)
-        // register as later sub-phases vendor them. No plan sets rc_enabled until
-        // the P3 LXR plan, so this branch is inert today.
+        // lxr P2.0/P2.C: gated RC tables. The non-RC list above is left byte-identical;
+        // the RC straddle-line table plus the per-block/per-line RC tables register only
+        // inside this branch. No plan sets rc_enabled until the P3 LXR plan, so this
+        // branch is inert today (defined-but-not-mapped for all non-LXR plans).
         if rc_enabled {
             meta.push(MetadataSpec::OnSide(crate::util::rc::RC_STRADDLE_LINES));
+            meta.push(MetadataSpec::OnSide(Block::LOG_TABLE));
+            meta.push(MetadataSpec::OnSide(Block::NURSERY_PROMOTION_STATE_TABLE));
+            meta.push(MetadataSpec::OnSide(Block::PHASE_EPOCH));
+            meta.push(MetadataSpec::OnSide(Line::IX_LINE_REUSE_COUNT));
         }
         metadata::extract_side_metadata(&meta)
     }
