@@ -492,6 +492,7 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             self.reusable_blocks.len() == 0,
             full_heap_system_gc,
             *self.common.options.immix_always_defrag,
+            self.rc_enabled,
         );
         self.defrag.in_defrag()
     }

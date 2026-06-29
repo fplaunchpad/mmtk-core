@@ -73,8 +73,13 @@ impl Defrag {
         exhausted_reusable_space: bool,
         full_heap_system_gc: bool,
         stress_defrag: bool,
+        rc_enabled: bool,
     ) {
+        // lxr P2.H: RC plans never STW-defrag (mature reuse is RC-driven, not copy-defrag).
+        // `&& !rc_enabled` is inert for all current plans (every caller passes rc_enabled=false),
+        // so the computed in_defrag is unchanged until the P3 LXR plan.
         let in_defrag = defrag_enabled
+            && !rc_enabled
             && (emergency_collection
                 || (collection_attempts > 1)
                 || !exhausted_reusable_space
