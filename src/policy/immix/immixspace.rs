@@ -586,10 +586,19 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             crate::plan::lxr::Pause::RefCount,
             "minimal LXR cut only schedules RefCount pauses; Full/FinalMark release_rc deferred"
         );
-        self.rc_sweep_nursery_blocks();
-        // Reset the per-phase nursery-block bookkeeping (the counters, not the freelist — the actual
-        // blocks were released individually above).
-        self.block_allocation.reset_nursery_counters();
+        if crate::plan::lxr::rc::rc_debug_on() {
+            eprintln!(
+                "[RC-PHASE] release_rc start: incs_total={} promoted={}",
+                crate::plan::lxr::rc::RC_INCS_TOTAL.load(Ordering::Relaxed),
+                crate::plan::lxr::rc::RC_INCS_PROMOTED.load(Ordering::Relaxed),
+            );
+        }
+        // NOTE: the nursery sweep is NOT done here. It is deferred to the post-decrement epilogue
+        // (`RCBlockSweepEpilogue`, after `STWRCDecsAndSweep` drains) so that NO decrement — neither
+        // the prev-root decs nor the field-barrier decs (old overwritten values, which can point at
+        // YOUNG objects) — can read an object whose nursery block we already freed. Freeing nursery
+        // blocks here (in Release, before the decs) was a use-after-free: a dec would dereference a
+        // dangling young object -> SIGSEGV at a heap address.
         self.flush_page_resource();
         self.rc.reset_inc_buffer_size();
         self.is_end_of_satb_or_full_gc = false;
@@ -609,7 +618,8 @@ impl<VM: VMBinding> ImmixSpace<VM> {
     /// A block is "promoted" (kept) iff it is in a live block state (`Unmarked`/`Marked`/`Reusable`)
     /// AND has any non-zero RC entry. A clean block handed out this phase that received no surviving
     /// object has an all-zero RC table and is reclaimed here.
-    fn rc_sweep_nursery_blocks(&self) {
+    pub(crate) fn rc_sweep_nursery_blocks(&self) {
+        let no_nursery_sweep = std::env::var_os("MMTK_RC_NO_NURSERY_SWEEP").is_some();
         let mut released = 0usize;
         let mut nursery_seen = 0usize;
         for chunk in self.chunk_map.all_chunks() {
@@ -631,27 +641,42 @@ impl<VM: VMBinding> ImmixSpace<VM> {
                 //   - a promoted block is now `Unmarked` (state != Unallocated, NOT nursery) ->
                 //     skipped (swept lazily later if it dies).
                 //   - a truly-free block is `Unallocated` with a STALE epoch (is_nursery false).
-                if !block.is_nursery() && !block.is_reusing() {
+                // Conservative: only reclaim *fresh* nursery blocks (Unallocated state + epoch
+                // match) that received no surviving object. Skip `is_reusing()` blocks for now —
+                // reuse is disabled under RC anyway, so that arm should be dead; excluding it
+                // narrows the sweep to the provably-safe case.
+                if !block.is_nursery() {
                     continue;
                 }
                 nursery_seen += 1;
-                // Confirm the whole block is dead (an unpromoted nursery block is all-RC-zero; a
-                // partially-reused block could still hold live objects).
+                // Confirm the whole block is dead (an unpromoted nursery block is all-RC-zero).
                 if block.rc_dead() {
-                    self.release_block(block);
+                    // Diagnostic bisect knob: MMTK_RC_NO_NURSERY_SWEEP counts but does NOT free, so
+                    // we can confirm whether the crash is the sweep freeing a live block.
+                    if !no_nursery_sweep {
+                        self.release_block(block);
+                    }
                     released += 1;
                 }
             }
         }
-        if released != 0 {
+        if released != 0 && !no_nursery_sweep {
             self.num_clean_blocks_released_young
                 .fetch_add(released, Ordering::Relaxed);
         }
         if crate::plan::lxr::rc::rc_debug_on() {
             eprintln!(
-                "[RC-SWEEP] nursery: {nursery_seen} nursery/reused blocks scanned, {released} freed"
+                "[RC-SWEEP] nursery: {nursery_seen} nursery blocks scanned, {released} dead{}",
+                if no_nursery_sweep {
+                    " (NOT freed: MMTK_RC_NO_NURSERY_SWEEP)"
+                } else {
+                    " freed"
+                }
             );
         }
+        // Reset the per-phase nursery-block bookkeeping (the counters; the blocks themselves were
+        // released individually above).
+        self.block_allocation.reset_nursery_counters();
     }
 
     /// Get the number of defrag headroom pages.

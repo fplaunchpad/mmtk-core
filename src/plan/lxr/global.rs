@@ -179,8 +179,12 @@ impl<VM: VMBinding> Plan for LXR<VM> {
             std::mem::swap::<SegQueue<_>>(&mut prev_roots, &mut curr_roots);
             debug_assert!(curr_roots.is_empty());
         }
-        // Bump the global phase epoch at the end of the pause.
-        Block::update_global_phase_epoch(&self.immix_space);
+        // NOTE: the release-end phase-epoch bump (GC→mutator) is done at the END of
+        // `RCBlockSweepEpilogue`, NOT here. `release` runs in the `Release` bucket, which is BEFORE
+        // `STWRCDecsAndSweep` (the decs) and the epilogue (the nursery sweep). The nursery sweep
+        // classifies blocks by the GC-phase (even) epoch, so the epoch must stay un-bumped until
+        // after that sweep runs; bumping here (to the next odd mutator epoch) would make the
+        // epilogue's `is_nursery()` mis-classify every block.
     }
 
     fn end_of_gc(&mut self, tls: VMWorkerThread) {

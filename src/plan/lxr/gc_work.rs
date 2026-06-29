@@ -52,7 +52,19 @@ pub(super) struct RCBlockSweepEpilogue;
 impl<VM: VMBinding> GCWork<VM> for RCBlockSweepEpilogue {
     fn do_work(&mut self, _worker: &mut GCWorker<VM>, mmtk: &'static MMTK<VM>) {
         let lxr = mmtk.get_plan().downcast_ref::<LXR<VM>>().unwrap();
+        // Sweep the unpromoted NURSERY blocks here — AFTER all decrements have drained — not in
+        // `release_rc`. A field-barrier dec carries the OLD overwritten value, which can be a YOUNG
+        // object; freeing its nursery block before the decs run would make that dec dereference a
+        // dangling object (heap-address SIGSEGV). By the time this epilogue runs, every inc AND dec
+        // (incl. the recursive cascades) is done, so no about-to-be-decremented object's block is
+        // freed underneath it.
+        lxr.immix_space.rc_sweep_nursery_blocks();
+        // Then sweep the now-dead MATURE blocks the decs queued into possibly_dead_mature_blocks.
         lxr.immix_space
             .schedule_rc_block_sweeping_tasks(crate::LazySweepingJobsCounter::new_decs());
+        // Release-end phase-epoch bump (GC→mutator), done HERE (after the nursery sweep classified
+        // blocks by the GC-phase epoch) rather than in `Plan::release` (which runs before the decs
+        // and this sweep). Partner of the pause-start bump in `notify_mutators_paused`.
+        crate::policy::immix::block::Block::update_global_phase_epoch(&lxr.immix_space);
     }
 }
