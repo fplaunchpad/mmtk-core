@@ -26,6 +26,7 @@ use crate::{policy::space::Space, vm::*};
 use atomic::Ordering;
 use std::cell::UnsafeCell;
 use std::sync::atomic::AtomicUsize;
+use std::sync::Mutex;
 
 #[allow(dead_code)]
 pub struct BlockAllocation<VM: VMBinding> {
@@ -33,6 +34,12 @@ pub struct BlockAllocation<VM: VMBinding> {
     pub(crate) lxr: Option<&'static LXR<VM>>,
     num_nursery_blocks: AtomicUsize,
     pub(crate) in_place_promoted_nursery_blocks: AtomicUsize,
+    /// The CLEAN nursery blocks actually handed out this mutator phase (one `push` per
+    /// `initialize_new_clean_block(copy=false)`). The RC nursery sweep frees ONLY blocks from this
+    /// list — never a chunk-scan — so it can never touch a block that was not explicitly handed out
+    /// as a nursery allocation (a block still in the page-resource free queue, or a not-yet-mapped /
+    /// not-yet-stopped allocator block), which is what caused the chunk-scan sweep to fault.
+    nursery_blocks: Mutex<Vec<Block>>,
 }
 
 // Safety: matches the reference; the `*const ImmixSpace` is only set once at init and read
@@ -47,6 +54,7 @@ impl<VM: VMBinding> BlockAllocation<VM> {
             lxr: None,
             num_nursery_blocks: AtomicUsize::new(0),
             in_place_promoted_nursery_blocks: Default::default(),
+            nursery_blocks: Mutex::new(Vec::new()),
         }
     }
 
@@ -71,11 +79,43 @@ impl<VM: VMBinding> BlockAllocation<VM> {
         unsafe { *self.space.get() = space as *const ImmixSpace<VM> }
     }
 
-    /// Reset the per-phase nursery-block counters at the end of an RC pause. The actual freeing of
-    /// unpromoted nursery blocks is done by `ImmixSpace::rc_sweep_nursery_blocks` (which
-    /// `release_block`s each dead block to the free list — the standard `BlockPageResource` cannot
-    /// recycle blocks via a bulk accounting release the way the reference's nosweep PR does).
+    /// Sweep the clean nursery blocks handed out this phase: free (to the page-resource free list)
+    /// every block from `nursery_blocks` that was NOT promoted in place (`is_nursery()` is still
+    /// true — i.e. it was not flipped to `Unmarked` by `set_as_in_place_promoted`) and whose RC
+    /// table is all-zero (`rc_dead()`). Drains the list each phase.
+    ///
+    /// This REPLACES the `ImmixSpace::rc_sweep_nursery_blocks` chunk-scan, which faulted by touching
+    /// blocks never handed out as nursery allocations (free-queue blocks, mid-spawn allocator blocks
+    /// whose per-block metadata is not in a sweepable state). By iterating only the explicit list,
+    /// every block here is provably a real, mapped, this-phase nursery allocation. Returns the
+    /// number of blocks freed.
+    pub fn sweep_nursery_blocks(&self) -> usize {
+        use super::block::BlockState;
+        let blocks = std::mem::take(&mut *self.nursery_blocks.lock().unwrap());
+        let mut released = 0usize;
+        for block in blocks {
+            // Every block here was handed out as a clean nursery block this phase. The promote path
+            // (`set_as_in_place_promoted`) flips a block that received a SURVIVING object to
+            // `Unmarked`. So an UNPROMOTED nursery block is still in `BlockState::Unallocated` (the
+            // clean-nursery state `init_rc` left it in) and, having received no survivor, is
+            // all-RC-zero. We key on the STATE (Unallocated = unpromoted) — NOT `is_nursery()`,
+            // whose epoch comparison is unreliable under the single-bump scheme — and use `rc_dead()`
+            // as the authoritative safety guard (never free a block with a live object).
+            if block.get_state() == BlockState::Unallocated && block.rc_dead() {
+                self.space().release_block(block);
+                released += 1;
+            }
+        }
+        self.num_nursery_blocks.store(0, Ordering::SeqCst);
+        self.in_place_promoted_nursery_blocks
+            .store(0, Ordering::SeqCst);
+        released
+    }
+
+    /// Drain the nursery-block list + reset the counters WITHOUT freeing anything (the
+    /// `MMTK_RC_NO_FREE` / `MMTK_RC_NO_NURSERY_SWEEP` bisect path).
     pub fn reset_nursery_counters(&self) {
+        self.nursery_blocks.lock().unwrap().clear();
         self.num_nursery_blocks.store(0, Ordering::SeqCst);
         self.in_place_promoted_nursery_blocks
             .store(0, Ordering::SeqCst);
@@ -121,6 +161,11 @@ impl<VM: VMBinding> BlockAllocation<VM> {
             if !copy {
                 self.num_nursery_blocks.fetch_add(1, Ordering::Relaxed);
                 block.clear_field_unlog_table::<VM>();
+                // Record the block as a clean nursery block handed out this phase. The RC nursery
+                // sweep frees only blocks from this list, so it never touches a block that was not
+                // explicitly allocated as a nursery block (free-queue blocks, mid-spawn allocator
+                // blocks) — the source of the chunk-scan sweep's fault.
+                self.nursery_blocks.lock().unwrap().push(block);
             }
         }
         block.init_rc(copy, false, self.space());

@@ -657,79 +657,39 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         self.reused_lines_consumed.store(0, Ordering::Relaxed);
     }
 
-    /// Sweep the unpromoted nursery blocks: any block allocated (clean) in THIS mutator phase that
-    /// did NOT get an object promoted into it (i.e. it is still in the `Unallocated`/nursery state,
-    /// or its whole RC table is zero) is dead and is released back to the page resource free list.
+    /// Sweep the unpromoted nursery blocks handed out this phase. Frees only blocks from the
+    /// `block_allocation` per-phase list (NOT a chunk scan): each was explicitly recorded in
+    /// `initialize_new_clean_block`, so it is provably a real, mapped, this-phase nursery
+    /// allocation. The previous chunk-scan version faulted by touching blocks never handed out as
+    /// nursery allocations (page-resource free-queue blocks, a mid-spawn domain's freshly-acquired
+    /// allocator block whose per-block metadata is not in a sweepable state).
     ///
-    /// This replaces the reference LXR's `block_allocation::sweep_nursery_blocks`, which relies on
-    /// its bump-cursor *nosweep* page resource (where a bulk accounting release + cursor reset
-    /// recycles the address range). Our base uses the standard free-list `BlockPageResource`, so we
-    /// must `release_block` each dead block individually (deinit + push to the free list) for it to
-    /// actually be reusable — otherwise the swept nursery blocks leak (heap grows unbounded).
-    ///
-    /// A block is "promoted" (kept) iff it is in a live block state (`Unmarked`/`Marked`/`Reusable`)
-    /// AND has any non-zero RC entry. A clean block handed out this phase that received no surviving
-    /// object has an all-zero RC table and is reclaimed here.
+    /// `MMTK_RC_NO_NURSERY_SWEEP` / `MMTK_RC_NO_FREE` keep the list-drain accounting but skip the
+    /// actual freeing (bisect knobs).
     pub(crate) fn rc_sweep_nursery_blocks(&self) {
-        let no_nursery_sweep = std::env::var_os("MMTK_RC_NO_NURSERY_SWEEP").is_some()
+        let no_free = std::env::var_os("MMTK_RC_NO_NURSERY_SWEEP").is_some()
             || std::env::var_os("MMTK_RC_NO_FREE").is_some();
-        let mut released = 0usize;
-        let mut nursery_seen = 0usize;
-        for chunk in self.chunk_map.all_chunks() {
-            for block in chunk.iter_region::<Block>() {
-                // RC convention (the key insight the previous version got WRONG): a CLEAN nursery
-                // block stays in `BlockState::Unallocated` — `init_rc` does NOT flip it to
-                // `Unmarked` for the clean-nursery case. What marks a block "allocated this phase"
-                // is its per-block PHASE_EPOCH matching the global one (`is_nursery_or_reusing`),
-                // NOT its block state. A nursery block whose object(s) SURVIVED was flipped to
-                // `Unmarked` (mature) by `set_as_in_place_promoted`.
-                //
-                // So a live nursery block (in use, holding objects) has state == Unallocated. The
-                // old code `continue`d on `state == Unallocated`, which therefore SKIPPED EVERY
-                // nursery block — so nothing was ever reclaimed (`young=0`, the reclamation leak).
-                //
-                //   - `is_nursery()` (Unallocated + epoch matches) = a fresh nursery block that
-                //     received NO surviving object -> all dead -> reclaim.
-                //   - `is_reusing()` (allocated state + epoch matches) = a reused block this phase.
-                //   - a promoted block is now `Unmarked` (state != Unallocated, NOT nursery) ->
-                //     skipped (swept lazily later if it dies).
-                //   - a truly-free block is `Unallocated` with a STALE epoch (is_nursery false).
-                // Conservative: only reclaim *fresh* nursery blocks (Unallocated state + epoch
-                // match) that received no surviving object. Skip `is_reusing()` blocks for now —
-                // reuse is disabled under RC anyway, so that arm should be dead; excluding it
-                // narrows the sweep to the provably-safe case.
-                if !block.is_nursery() {
-                    continue;
-                }
-                nursery_seen += 1;
-                // Confirm the whole block is dead (an unpromoted nursery block is all-RC-zero).
-                if block.rc_dead() {
-                    // Diagnostic bisect knob: MMTK_RC_NO_NURSERY_SWEEP counts but does NOT free, so
-                    // we can confirm whether the crash is the sweep freeing a live block.
-                    if !no_nursery_sweep {
-                        self.release_block(block);
-                    }
-                    released += 1;
-                }
-            }
-        }
-        if released != 0 && !no_nursery_sweep {
+        let released = if no_free {
+            // Drain + reset the list/counters but do not free (so the bisect still measures).
+            self.block_allocation.reset_nursery_counters();
+            0
+        } else {
+            self.block_allocation.sweep_nursery_blocks()
+        };
+        if released != 0 {
             self.num_clean_blocks_released_young
                 .fetch_add(released, Ordering::Relaxed);
         }
         if crate::plan::lxr::rc::rc_debug_on() {
             eprintln!(
-                "[RC-SWEEP] nursery: {nursery_seen} nursery blocks scanned, {released} dead{}",
-                if no_nursery_sweep {
-                    " (NOT freed: MMTK_RC_NO_NURSERY_SWEEP)"
+                "[RC-SWEEP] nursery: {released} unpromoted nursery blocks freed{}",
+                if no_free {
+                    " SKIPPED (MMTK_RC_NO_NURSERY_SWEEP/NO_FREE)"
                 } else {
-                    " freed"
+                    ""
                 }
             );
         }
-        // Reset the per-phase nursery-block bookkeeping (the counters; the blocks themselves were
-        // released individually above).
-        self.block_allocation.reset_nursery_counters();
     }
 
     /// Get the number of defrag headroom pages.

@@ -70,9 +70,10 @@ impl<VM: VMBinding> GCWork<VM> for RCBlockSweepEpilogue {
             lxr.immix_space
                 .schedule_rc_block_sweeping_tasks(crate::LazySweepingJobsCounter::new_decs());
         }
-        // Release-end phase-epoch bump (GC→mutator), done HERE (after the nursery sweep classified
-        // blocks by the GC-phase epoch) rather than in `Plan::release` (which runs before the decs
-        // and this sweep). Partner of the pause-start bump in `notify_mutators_paused`.
+        // The SINGLE per-GC phase-epoch bump (GC→mutator), done HERE rather than in `Plan::release`
+        // (which runs before the decs/this sweep). The nursery sweep now keys on block STATE
+        // (Unallocated = unpromoted), so it is epoch-independent. There is NO pause-start bump — that
+        // double-bump scheme corrupted block state during the inc phase (the step-1 regression).
         crate::policy::immix::block::Block::update_global_phase_epoch(&lxr.immix_space);
     }
 }
