@@ -64,6 +64,14 @@ pub struct ImmixSpace<VM: VMBinding> {
     /// LXR reference-counting helper (typed `RC_TABLE` accessor). Zero-sized
     /// (`PhantomData`); the read/trace overlays consult it only when `rc_enabled`.
     pub rc: crate::util::rc::RefCountHelper<VM>,
+    /// lxr P2.D: true only at the end of a SATB cycle or a full GC, when the RC
+    /// read-side (is_live / is_reachable) must additionally consult the mark bit +
+    /// defrag-source + forwarding. The P3 LXR plan drives this flag from its
+    /// scheduler; under the gate it is always `false` so the refinement never fires.
+    pub is_end_of_satb_or_full_gc: bool,
+    /// lxr P2.D: count of nursery blocks promoted in place this GC. Written only by
+    /// the P3 nursery-promotion gc_work; init-only / inert today.
+    pub in_place_promoted_nursery_blocks: AtomicUsize,
 }
 
 /// Some arguments for Immix Space.
@@ -383,6 +391,8 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         ImmixSpace {
             rc_enabled,
             rc: crate::util::rc::RefCountHelper::NEW,
+            is_end_of_satb_or_full_gc: false,
+            in_place_promoted_nursery_blocks: AtomicUsize::new(0),
             pr: if common.vmrequest.is_discontiguous() {
                 BlockPageResource::new_discontiguous(
                     Block::LOG_PAGES,
