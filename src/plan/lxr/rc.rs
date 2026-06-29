@@ -194,7 +194,13 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
         let size = VM::VMObjectModel::get_current_size(o);
         if in_immix {
             let block = Block::containing(o);
-            if block.is_nursery() {
+            // Flip a not-yet-promoted nursery block to mature (Unmarked). Key on the block STATE
+            // (`Unallocated` = a clean nursery block this phase that hasn't been promoted yet), NOT
+            // `is_nursery()` — under the single-bump scheme `is_nursery()`'s epoch comparison
+            // mis-classifies blocks from the 2nd mutator phase onward, which would leave surviving
+            // blocks stuck in `Unallocated` and untracked (a leak). `set_as_in_place_promoted` is
+            // idempotent (its own `is_in_place_promoted` guard), so re-entry is harmless.
+            if block.get_state() == crate::policy::immix::block::BlockState::Unallocated {
                 block.set_as_in_place_promoted(&self.lxr.immix_space);
             }
             self.rc.promote_with_size(o, size);

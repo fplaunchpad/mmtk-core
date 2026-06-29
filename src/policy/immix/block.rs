@@ -315,11 +315,11 @@ impl Block {
                 debug_assert_eq!(self.get_state(), BlockState::Unallocated);
             }
             self.clear_in_place_promoted();
-            if copy {
-                debug_assert!((self.phase_epoch() & 1) == 0);
-            } else {
-                debug_assert!((self.phase_epoch() & 1) != 0);
-            }
+            // NOTE: the reference asserted the per-block phase-epoch parity here (odd in a mutator
+            // phase, even in a GC phase). We use the SINGLE-bump scheme (one bump per GC), under
+            // which a mutator phase's parity alternates each GC, so those asserts do not hold — and
+            // the parity is no longer load-bearing (the RC sweeps key on block STATE, not epoch).
+            // Asserts dropped.
             if copy {
                 if reuse {
                     debug_assert!(!self.is_defrag_source());
