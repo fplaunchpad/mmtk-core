@@ -82,6 +82,27 @@ So the connected P3.4 batch order is: (1) additive RC/nursery methods on `BlockP
 set_as_in_place_promoted,rc_dead}`; (4) `plan/lxr/rc.rs` (`ProcessIncs`/`ProcessDecs`). Each step
 cargo-builds against the prior; the batch is not byte-identical-decomposable below this granularity.
 
+## Strategy refinement: build LXR UP from our base Immix plan, not DOWN from the reference (2026-06-29)
+
+The reference `plan/lxr/global.rs` is **1268 lines / 49 Plan methods / 26 struct fields**, laden with
+deferred machinery (cycle collection, mature evac, defrag, unloading, survival predictors) and forward
+deps. Porting it wholesale is a non-starter. **Our base `plan/immix/` is only 318 lines** (global.rs 233 /
+15 Plan methods, mutator.rs 62, gc_work.rs 17, mod.rs 6) — a clean, working, minimal Immix Plan impl.
+
+**So construct LXR incrementally from the working Immix plan:**
+- **P3.5 (next):** clone `plan/immix/{global,mutator,gc_work,mod}.rs` → `plan/lxr/`, rename Immix→LXR,
+  `IMMIX_CONSTRAINTS`→`LXR_CONSTRAINTS` with **`rc_enabled=false`** initially (so the P2
+  `debug_assert(!rc_enabled)` guards in immixspace prepare/release don't trip), add `PlanSelector::LXR`
+  + the `create_plan`/`create_mutator` arms + options parsing. Result: `MMTK_PLAN=LXR` exists and **runs
+  identically to Immix** — compiles, committable, byte-identical to the other plans (nothing else selects it).
+- **P3.6+:** layer RC on incrementally, each step built+tested: install `BarrierSelector::FieldBarrier`
+  (P3.2) on the LXR mutator; add the `RefCountHelper` field; wire `Pause::RefCount` into
+  `schedule_collection`; bring in `ProcessIncs`/`ProcessDecs` (rc.rs) + the sweep machinery; only flip
+  `rc_enabled=true` once the RC behavior the asserts guard is actually in place. This keeps `lxr-p3`
+  green at every step instead of a big-bang non-compiling batch.
+
+This supersedes the "vendor the reference plan/lxr wholesale" framing of P3.6 above.
+
 ## P4 contract (good news: the runtime already has the shape)
 `runtime/memory.c`'s `caml_modify` already issues a **pre-store, slot-granular** barrier
 (`caml_mmtk_satb_barrier(Op_val(obj)+field, 1)` → `memory_region_copy_pre` →
