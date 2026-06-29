@@ -168,6 +168,49 @@ impl Block {
         Self::DEFRAG_STATE_TABLE.store_atomic::<u8>(self.start(), byte, Ordering::SeqCst);
     }
 
+    // ── LXR / RC per-block log + field-unlog (P3.4) ───────────────────────────
+    // Vendored from the LXR fork (lxr-v0.32.0 block.rs). Operate on the per-block
+    // LOG_TABLE (added in P2) + the VM-side field-unlog table; inert until the RC
+    // (LXR) plan runs, so the shipping plans stay byte-identical.
+
+    /// Atomically set this block's per-block log bit. Returns true iff it was previously
+    /// unlogged (so the caller performs the once-per-epoch block bookkeeping).
+    pub fn log(&self) -> bool {
+        loop {
+            let old_value: u8 = Self::LOG_TABLE.load_atomic::<u8>(self.start(), Ordering::Relaxed);
+            if old_value == 1 {
+                return false;
+            }
+            if Self::LOG_TABLE
+                .compare_exchange_atomic::<u8>(
+                    self.start(),
+                    0u8,
+                    1u8,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+
+    /// Clear this block's per-block log bit.
+    pub fn unlog(&self) {
+        Self::LOG_TABLE.store_atomic::<u8>(self.start(), 0u8, Ordering::Relaxed);
+    }
+
+    /// Zero this block's slice of the per-field unlog table (a fresh block has no logged
+    /// fields). Uses the VM-side `GLOBAL_FIELD_UNLOG_BIT_SPEC`.
+    pub fn clear_field_unlog_table<VM: VMBinding>(&self) {
+        use crate::vm::ObjectModel;
+        VM::VMObjectModel::GLOBAL_FIELD_UNLOG_BIT_SPEC
+            .as_spec()
+            .extract_side_spec()
+            .bzero_metadata(self.start(), Block::BYTES);
+    }
+
     /// Record the number of holes in the block.
     pub fn set_holes(&self, holes: usize) {
         Self::DEFRAG_STATE_TABLE.store_atomic::<u8>(self.start(), holes as u8, Ordering::SeqCst);
