@@ -61,6 +61,9 @@ pub struct ImmixSpace<VM: VMBinding> {
     /// captured at construction). `false` for every non-RC plan, so the overlays
     /// stay inert and the space is byte-identical to upstream Immix.
     pub rc_enabled: bool,
+    /// LXR reference-counting helper (typed `RC_TABLE` accessor). Zero-sized
+    /// (`PhantomData`); the read/trace overlays consult it only when `rc_enabled`.
+    pub rc: crate::util::rc::RefCountHelper<VM>,
 }
 
 /// Some arguments for Immix Space.
@@ -369,6 +372,7 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         let space_index = common.descriptor.get_index();
         ImmixSpace {
             rc_enabled,
+            rc: crate::util::rc::RefCountHelper::NEW,
             pr: if common.vmrequest.is_discontiguous() {
                 BlockPageResource::new_discontiguous(
                     Block::LOG_PAGES,
