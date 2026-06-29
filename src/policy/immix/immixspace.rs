@@ -561,7 +561,16 @@ impl<VM: VMBinding> ImmixSpace<VM> {
     /// Record a mature block that may have died after a batch of decrements. Deduplicated by the
     /// per-block log bit so a block is only swept once per epoch. Drained by
     /// `schedule_rc_block_sweeping_tasks`.
+    ///
+    /// Only blocks in a live (allocated) state are recorded: a nursery block is in
+    /// `BlockState::Unallocated` (the RC nursery convention) and is reclaimed by the *nursery* sweep
+    /// (`rc_sweep_nursery_blocks`), which `rc_sweep_mature` would refuse anyway (it returns early on
+    /// `Unallocated`). Excluding nursery blocks here keeps the two sweeps' block sets disjoint, so a
+    /// block is never a candidate for both free paths in the same pause.
     pub fn add_to_possibly_dead_mature_blocks(&self, block: Block, is_defrag_source: bool) {
+        if block.get_state() == BlockState::Unallocated {
+            return;
+        }
         if block.log() {
             self.possibly_dead_mature_blocks
                 .push((block, is_defrag_source));
