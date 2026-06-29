@@ -351,6 +351,13 @@ impl Block {
             self.clear_in_place_promoted();
             Self::BLOCK_OWNER.store_atomic(self.start(), 0usize, Ordering::Relaxed);
             self.set_as_defrag_source(false);
+            // Clear the per-block "possibly-dead-mature" log bit so a freed block does NOT carry a
+            // stale `log() == 1` into its next life: otherwise `add_to_possibly_dead_mature_blocks`
+            // (which uses `log()` to dedup) would refuse to re-queue the reincarnated block when an
+            // object in it later dies -> that block would never be swept (silent leak). The nursery
+            // sweep frees via `release_block` (which does NOT call `unlog()`), so the clear must live
+            // here to cover both the nursery- and mature-sweep free paths.
+            self.unlog();
         }
     }
 
