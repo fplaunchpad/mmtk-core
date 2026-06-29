@@ -349,7 +349,11 @@ impl Block {
         self.set_state(BlockState::Unallocated);
         if space.rc_enabled {
             self.clear_in_place_promoted();
-            Self::BLOCK_OWNER.store_atomic(self.start(), 0usize, Ordering::Relaxed);
+            // NB: the reference clears `BLOCK_OWNER` here, but that field tracks the owning mutator
+            // for thread-local / copying GC — irrelevant to our in-place RC cut (`moves_objects =
+            // false`, no copy reservation). Its side-metadata is deliberately NOT registered in
+            // `ImmixSpace::side_metadata_specs`, so storing to it faults on unmapped metadata
+            // (the first free's UAF). We neither set nor read BLOCK_OWNER, so drop the clear.
             self.set_as_defrag_source(false);
             // Clear the per-block "possibly-dead-mature" log bit so a freed block does NOT carry a
             // stale `log() == 1` into its next life: otherwise `add_to_possibly_dead_mature_blocks`
