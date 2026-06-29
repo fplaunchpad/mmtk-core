@@ -87,6 +87,11 @@ pub struct ProcessIncs<VM: VMBinding, const KIND: EdgeKind> {
     /// The worker running this packet (captured at `do_work` start; null until then). Used to
     /// enqueue recursively-generated nursery-inc packets.
     worker: *mut GCWorker<VM>,
+    /// For `KIND == EDGE_KIND_ROOT` only: the root *targets* (the objects loaded from the root
+    /// slots). These get an extra "root" reference count this GC; they are stashed into
+    /// `lxr.curr_roots` so the NEXT GC decrements them (`process_prev_roots`). Without this the root
+    /// increment is never matched by a decrement and root-reachable objects leak forever.
+    root_targets: Vec<ObjectReference>,
 }
 
 unsafe impl<VM: VMBinding, const KIND: EdgeKind> Send for ProcessIncs<VM, KIND> {}
@@ -107,6 +112,7 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
             lxr,
             rc: RefCountHelper::NEW,
             worker: std::ptr::null_mut(),
+            root_targets: Vec::new(),
         }
     }
 
@@ -175,6 +181,11 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
         let Some(o) = s.load() else {
             return;
         };
+        // Root targets get an extra "root" reference count this GC; remember them so next GC's
+        // `process_prev_roots` decrements them (otherwise root-reachable objects never die).
+        if KIND == EDGE_KIND_ROOT {
+            self.root_targets.push(o);
+        }
         self.process_inc(o);
         // In-place cut: the object never moves, so the slot is never written back.
     }
@@ -203,6 +214,11 @@ impl<VM: VMBinding, const KIND: EdgeKind> GCWork<VM> for ProcessIncs<VM, KIND> {
         // Process the main buffer.
         let incs = std::mem::take(&mut self.incs);
         self.process_incs(&incs);
+        // Stash this packet's root targets for next GC's decrement (root edges only).
+        if KIND == EDGE_KIND_ROOT && !self.root_targets.is_empty() {
+            let roots = std::mem::take(&mut self.root_targets);
+            self.lxr.curr_roots.read().unwrap().push(roots);
+        }
         // Drain the recursively-generated buffer.
         let mut buf = vec![];
         while !self.new_incs.is_empty() {
