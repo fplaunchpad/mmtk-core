@@ -417,22 +417,23 @@ impl<VM: VMBinding> ProcessDecs<VM> {
         for o in decs {
             let o = *o;
             rc_stat_inc(&RC_DECS_TOTAL);
-            // Manual decrement: our `RefCountHelper::fetch_update` bounds its closure `+ Copy`,
-            // which a `&mut self`-capturing closure (needed to call `process_dead_object`) is not.
-            // So we read → maybe-kill → store, with a small CAS retry to stay atomic-ish. (Inert in
-            // the single-domain cut: the trace runs stop-the-world, so there is no contention.)
-            let c = self.rc.count(o);
-            if c == 0 || c == MAX_REF_COUNT {
-                continue; // dead or stuck (sticky)
-            }
-            if c == 1 {
-                // Last reference — the object dies. Recurse into its fields *before* zeroing its RC
-                // (its fields are still readable), then set RC to 0.
-                rc_stat_inc(&RC_DECS_TO_ZERO);
-                self.process_dead_object(o, lxr);
-                self.rc.set(o, 0);
-            } else {
-                let _ = self.rc.dec(o);
+            // ATOMIC decrement (item #1 fix). `RefCountHelper::dec` is a single CAS that goes
+            // x -> x-1 (and refuses on 0 / sticky-MAX). It returns `Ok(old)`. So `Ok(1)` means THIS
+            // caller is the unique thread that drove the count 1 -> 0 — the winner runs
+            // `process_dead_object` exactly once. A previous read-then-set(0) was a double-free hazard
+            // under PARALLEL GC workers: two could both read count==1 and both kill the object.
+            // (The object's fields are still readable here — its memory is not freed until the block
+            // sweep — so reading them after the atomic kill is safe.)
+            match self.rc.dec(o) {
+                Ok(1) => {
+                    // We won the 1 -> 0 kill.
+                    rc_stat_inc(&RC_DECS_TO_ZERO);
+                    self.process_dead_object(o, lxr);
+                }
+                _ => {
+                    // Either decremented to a still-positive count, or refused (already 0 / sticky).
+                    // Nothing more to do.
+                }
             }
         }
     }
