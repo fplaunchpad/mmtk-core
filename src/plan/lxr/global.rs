@@ -39,9 +39,23 @@ use enum_map::EnumMap;
 use mmtk_macros::{HasSpaces, PlanTraceObject};
 
 // ── Backup-trace (cycle collector) trigger state + knobs (P5) ──────────────────────────────────
-/// RC pauses since the last Full backup trace. When it reaches `MMTK_RC_BACKUP_EVERY`, the next
-/// pause is a Full (STW mark/sweep that reclaims cyclic garbage). Reset on each Full.
-static RC_PAUSES_SINCE_BACKUP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+//
+// The trigger is RC-EFFECTIVENESS-based, NOT occupancy-based. The key distinction: heap occupancy
+// at pause start cannot tell "full of RECLAIMABLE nursery garbage" (binarytrees — the imminent RC
+// pause will free it, no trace needed) from "full of UN-reclaimable cycles" (kb — RC frees little,
+// the trace IS needed); both look ">90% used". So instead we measure how much the RC pause's
+// nursery+mature sweeps ACTUALLY freed (in `end_of_gc`, after the sweeps) and only schedule the
+// NEXT pause as Full when an RC pause UNDER-reclaimed: it left the heap still near-full AND freed
+// little. For binarytrees the RC sweep frees ~1500 blocks → occupancy drops → no backup; for kb the
+// RC sweep frees little → occupancy stays high → backup. An absolute pressure backstop forces a
+// Full just before OOM so we never run out even if the heuristic is fooled.
+
+/// Set by `end_of_gc` when the just-finished RC pause under-reclaimed; consumed (→ Full) by the
+/// next `select_collection_kind`.
+static BACKUP_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// `get_used_pages()` captured at the START of the current pause (before the RC sweeps), so
+/// `end_of_gc` can compute how much the RC pause's nursery+mature sweeps freed.
+static USED_AT_PAUSE_START: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
@@ -54,13 +68,24 @@ fn backup_trace_disabled() -> bool {
     std::env::var_os("MMTK_RC_NO_CM").is_some()
         || std::env::var_os("MMTK_RC_NO_BACKUP_TRACE").is_some()
 }
-/// Run a Full backup trace every K RC pauses (`MMTK_RC_BACKUP_EVERY`, default 16).
-fn backup_every() -> usize {
-    env_usize("MMTK_RC_BACKUP_EVERY", 16).max(1)
+/// "Under-reclaim" low-water mark: only consider a backup when post-RC-sweep occupancy is still ≥
+/// this % of total (`MMTK_RC_BACKUP_LO_PCT`, default 80). Below this the heap has headroom; no trace.
+fn backup_lo_pct() -> usize {
+    env_usize("MMTK_RC_BACKUP_LO_PCT", 80)
 }
-/// Also force a Full when used pages ≥ this % of total (`MMTK_RC_BACKUP_PRESSURE_PCT`, default 90).
-fn backup_pressure_percent() -> usize {
-    env_usize("MMTK_RC_BACKUP_PRESSURE_PCT", 90)
+/// The RC pause counts as "effective" (→ no backup) iff its nursery+mature sweeps freed at least
+/// this % of total pages (`MMTK_RC_BACKUP_MIN_RECLAIM_PCT`, default 5). If it freed less AND the heap
+/// is still ≥ lo-water, the heap is filling with RC-unreclaimable garbage → schedule Full.
+fn backup_min_reclaim_pct() -> usize {
+    env_usize("MMTK_RC_BACKUP_MIN_RECLAIM_PCT", 5)
+}
+/// Absolute pressure backstop: force a Full at pause start when used ≥ this % of total
+/// (`MMTK_RC_BACKUP_HI_PCT`, default 98). Set high (last-resort only) so it does NOT fire on
+/// binarytrees, which runs at ~90-95% used on RECLAIMABLE nursery garbage that the imminent RC
+/// pause frees — the effectiveness signal (BACKUP_PENDING) is the primary trigger; this only catches
+/// a near-OOM heap of cycles that slipped past it. `0` disables the backstop.
+fn backup_hi_pct() -> usize {
+    env_usize("MMTK_RC_BACKUP_HI_PCT", 98)
 }
 
 // LXR (reference counting on a hierarchical Immix heap) — P3.5 skeleton.
@@ -156,6 +181,9 @@ impl<VM: VMBinding> Plan for LXR<VM> {
         // mutator stamp a freshly-allocated block with an EVEN epoch, violating the odd=mutator
         // invariant (`init_rc` asserts it) and mis-classifying that live block as non-nursery →
         // the nursery sweep could then free a LIVE block (SIGSEGV).
+        // Snapshot pre-sweep occupancy so `end_of_gc` can measure how much THIS pause's RC sweeps
+        // freed (the RC-effectiveness backup trigger).
+        USED_AT_PAUSE_START.store(self.get_used_pages(), Ordering::Relaxed);
         // RefCount = steady-state in-place RC. Full = the periodic STW backup mark/sweep that
         // reclaims cyclic garbage RC misses (no concurrent marking; the in-place STW cut).
         let pause = self.select_collection_kind();
@@ -216,6 +244,7 @@ impl<VM: VMBinding> Plan for LXR<VM> {
     }
 
     fn end_of_gc(&mut self, tls: VMWorkerThread) {
+        self.evaluate_rc_effectiveness();
         self.dump_rc_stats();
         self.previous_pause
             .store(self.current_pause(), Ordering::SeqCst);
@@ -396,12 +425,16 @@ impl<VM: VMBinding> LXR<VM> {
         if backup_trace_disabled() {
             return Pause::RefCount;
         }
-        let n = RC_PAUSES_SINCE_BACKUP.fetch_add(1, Ordering::Relaxed) + 1;
+        // (1) The RC-effectiveness signal: a previous RC pause under-reclaimed (see `end_of_gc`).
+        let pending = BACKUP_PENDING.swap(false, Ordering::Relaxed);
+        // (2) Absolute pressure backstop: never OOM — if the heap is critically full at pause start,
+        //     trace regardless (a heap that full of cycles must be collected now). `hi_pct == 0`
+        //     disables it (then only the effectiveness signal triggers).
+        let hi = backup_hi_pct();
         let used = self.get_used_pages();
         let total = self.get_total_pages();
-        let near_full = total > 0 && used * 100 >= total * backup_pressure_percent();
-        if n >= backup_every() || near_full {
-            RC_PAUSES_SINCE_BACKUP.store(0, Ordering::Relaxed);
+        let critical = hi > 0 && total > 0 && used * 100 >= total * hi;
+        if pending || critical {
             Pause::Full
         } else {
             Pause::RefCount
@@ -466,6 +499,38 @@ impl<VM: VMBinding> LXR<VM> {
     /// Dump per-pause RC reclamation stats + reset them (MMTK_RC_DEBUG). Lets the reclamation
     /// balance be tracked across GCs: incs vs decs, objects promoted vs reaching 0, blocks freed,
     /// and the prev/curr root-set sizes (the root-dec balance).
+    /// RC-effectiveness backup trigger (runs in `end_of_gc`, AFTER the RC sweeps). If the just-
+    /// finished RC pause UNDER-reclaimed — it freed < `MMTK_RC_BACKUP_MIN_RECLAIM_PCT`% of total
+    /// pages AND left the heap still ≥ `MMTK_RC_BACKUP_LO_PCT`% used — the heap is filling with
+    /// RC-unreclaimable garbage (cycles), so arm `BACKUP_PENDING` for the next pause. A Full pause is
+    /// NOT re-evaluated (it just traced; don't chain backups). For binarytrees the RC sweep frees a
+    /// large fraction → effective → never arms; for kb it frees little → arms → cycles get traced.
+    fn evaluate_rc_effectiveness(&self) {
+        if backup_trace_disabled() || self.current_pause() != Some(Pause::RefCount) {
+            return;
+        }
+        let total = self.get_total_pages();
+        if total == 0 {
+            return;
+        }
+        let used_after = self.get_used_pages();
+        let used_before = USED_AT_PAUSE_START.load(Ordering::Relaxed);
+        let freed = used_before.saturating_sub(used_after);
+        let still_full = used_after * 100 >= total * backup_lo_pct();
+        let under_reclaimed = freed * 100 < total * backup_min_reclaim_pct();
+        if still_full && under_reclaimed {
+            BACKUP_PENDING.store(true, Ordering::Relaxed);
+        }
+        if super::rc::rc_debug_on() {
+            eprintln!(
+                "[RC-EFFECT] used_before={used_before} used_after={used_after} freed={freed} \
+                 total={total} still_full={still_full} under_reclaimed={under_reclaimed} \
+                 backup_next={}",
+                still_full && under_reclaimed
+            );
+        }
+    }
+
     fn dump_rc_stats(&self) {
         use super::rc::{
             rc_debug_on, RC_DECS_TOTAL, RC_DECS_TO_ZERO, RC_INCS_PROMOTED, RC_INCS_TOTAL,
