@@ -79,11 +79,13 @@ fn backup_lo_pct() -> usize {
 fn backup_min_reclaim_pct() -> usize {
     env_usize("MMTK_RC_BACKUP_MIN_RECLAIM_PCT", 5)
 }
-/// Absolute pressure backstop: force a Full at pause start when used ≥ this % of total
-/// (`MMTK_RC_BACKUP_HI_PCT`, default 98). Set high (last-resort only) so it does NOT fire on
-/// binarytrees, which runs at ~90-95% used on RECLAIMABLE nursery garbage that the imminent RC
-/// pause frees — the effectiveness signal (BACKUP_PENDING) is the primary trigger; this only catches
-/// a near-OOM heap of cycles that slipped past it. `0` disables the backstop.
+/// Absolute pressure backstop: arm a backup when used ≥ this % of total AFTER the RC pause's
+/// sweeps complete (`MMTK_RC_BACKUP_HI_PCT`, default 98), evaluated POST-SWEEP in
+/// `evaluate_rc_effectiveness` — NOT at pause start. A GC fires because the heap filled, so
+/// pause-start occupancy is always ~total and a pause-start backstop fires every pause (the bug
+/// this replaces). Post-sweep, a still-critically-full heap genuinely means RC could not reclaim
+/// it (cycles), so trace. binarytrees drops to ~13% post-sweep → never fires; kb stays full → fires
+/// (and the rate signal usually fires first). `0` disables the backstop.
 fn backup_hi_pct() -> usize {
     env_usize("MMTK_RC_BACKUP_HI_PCT", 98)
 }
@@ -425,16 +427,12 @@ impl<VM: VMBinding> LXR<VM> {
         if backup_trace_disabled() {
             return Pause::RefCount;
         }
-        // (1) The RC-effectiveness signal: a previous RC pause under-reclaimed (see `end_of_gc`).
-        let pending = BACKUP_PENDING.swap(false, Ordering::Relaxed);
-        // (2) Absolute pressure backstop: never OOM — if the heap is critically full at pause start,
-        //     trace regardless (a heap that full of cycles must be collected now). `hi_pct == 0`
-        //     disables it (then only the effectiveness signal triggers).
-        let hi = backup_hi_pct();
-        let used = self.get_used_pages();
-        let total = self.get_total_pages();
-        let critical = hi > 0 && total > 0 && used * 100 >= total * hi;
-        if pending || critical {
+        // The RC-effectiveness signal (armed in `end_of_gc`, AFTER a pause's sweeps — including the
+        // post-sweep pressure backstop) is the SOLE trigger. We must NOT test pause-start occupancy
+        // here: a GC fires precisely because the heap filled, so `used` is always ~total at pause
+        // start, and a pause-start backstop would fire every pause and defeat the signal (the bug
+        // that made binarytrees trace on 115/115 pauses).
+        if BACKUP_PENDING.swap(false, Ordering::Relaxed) {
             Pause::Full
         } else {
             Pause::RefCount
@@ -518,7 +516,12 @@ impl<VM: VMBinding> LXR<VM> {
         let freed = used_before.saturating_sub(used_after);
         let still_full = used_after * 100 >= total * backup_lo_pct();
         let under_reclaimed = freed * 100 < total * backup_min_reclaim_pct();
-        if still_full && under_reclaimed {
+        // Post-sweep pressure backstop: even if the pause reclaimed a fair amount, a heap still
+        // critically full AFTER the RC sweep needs a trace (cycles that slipped past the rate
+        // signal). Checked here (post-sweep), where occupancy is meaningful — never at pause start.
+        let hi = backup_hi_pct();
+        let critical = hi > 0 && used_after * 100 >= total * hi;
+        if (still_full && under_reclaimed) || critical {
             BACKUP_PENDING.store(true, Ordering::Relaxed);
         }
         if super::rc::rc_debug_on() {
