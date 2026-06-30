@@ -162,6 +162,42 @@ impl<VM: VMBinding> LXRFieldBarrierSemantics<VM> {
             self.mmtk.scheduler.work_buckets[WorkBucketStage::STWRCDecsAndSweep].add(w);
         }
     }
+
+    /// SYNCHRONOUS drain for a TERMINATING domain (`Domain.join`), called OUTSIDE any collection /
+    /// GC-worker context. The normal `flush` enqueues `ProcessIncs`/`ProcessDecs` work packets — but
+    /// those need a running collection (open buckets, a worker, a sweep to drain them); enqueuing
+    /// them from the terminate path (no GC active) corrupts scheduler state and the packets carry raw
+    /// inc/dec slots into a domain that's about to be torn down → a GC worker later faults on freed
+    /// memory. So instead we apply the buffered work DIRECTLY here:
+    ///
+    /// - INCREMENTS (the load-bearing ones): for each buffered slot, load its current target and do
+    ///   a direct `rc.inc` into the global, whole-heap-mapped RC_TABLE. No GC context, no promotion,
+    ///   no tracing needed — just bump the count so the referent is NOT prematurely freed (a lost inc
+    ///   = refcount too low = premature free = the joining domain dereferences freed memory =
+    ///   `EXC_BAD_ACCESS` in `Domain.join`). The dying domain's initialising/mutating writes that the
+    ///   normal per-GC `mutator.flush()` would have inc'd are thus captured.
+    /// - DECREMENTS: DISCARDED. A dropped dec leaves a refcount too HIGH = a small, bounded LEAK,
+    ///   never a crash; running `process_dead_object`/freeing needs sweep context we don't have here.
+    ///   (`rc.dec` alone — without the kill/sweep — would also be sound, but discarding is strictly
+    ///   safer: no chance of driving a count to 0 and stranding a dead object whose block never gets
+    ///   swept.)
+    ///
+    /// Bounded over-retention: a bare `rc.inc` that promotes a NURSERY object (0→1) here does NOT
+    /// flip its block to mature / scan its fields (that needs the worker/closure context), so such an
+    /// object can linger as a low (rc>0) entry. This is bounded by the count of un-flushed mutations
+    /// at the dying domain (tiny for the functional/immutable workloads we target — binarytrees has
+    /// almost no field writes) and is a retention/leak, NEVER a crash. If it ever matters, promote
+    /// inline here mirroring `ProcessIncs::promote` (sans the recursive field scan).
+    fn drain_terminating(&mut self) {
+        let incs = self.incs.take();
+        for slot in incs {
+            if let Some(o) = slot.load() {
+                let _ = self.lxr.rc.inc(o);
+            }
+        }
+        // Discard the buffered decrements (bounded over-retention; never a crash).
+        let _dropped = self.decs.take();
+    }
 }
 
 impl<VM: VMBinding> BarrierSemantics for LXRFieldBarrierSemantics<VM> {
@@ -171,6 +207,13 @@ impl<VM: VMBinding> BarrierSemantics for LXRFieldBarrierSemantics<VM> {
     fn flush(&mut self) {
         self.flush_incs();
         self.flush_decs();
+    }
+
+    /// Terminating-domain drain (no GC context): apply incs directly to RC_TABLE, discard decs.
+    /// Overrides the default (which would call `flush` → enqueue work packets that can't run here).
+    #[cold]
+    fn flush_terminating(&mut self) {
+        self.drain_terminating();
     }
 
     fn object_reference_write_slow(

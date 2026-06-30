@@ -66,6 +66,13 @@ pub trait Barrier<VM: VMBinding>: 'static + Send + Downcast {
     /// Flush thread-local states like buffers or remembered sets.
     fn flush(&mut self) {}
 
+    /// Drain a TERMINATING mutator's barrier from OUTSIDE a collection (no GC-worker context).
+    /// Default = `flush`. The LXR RC field barrier overrides it (via its semantics) to apply its
+    /// buffered increments synchronously to RC_TABLE instead of scheduling GC work packets.
+    fn flush_terminating(&mut self) {
+        self.flush();
+    }
+
     /// Weak reference loading barrier.  A mutator should call this when loading from a weak
     /// reference field, for example, when executing  `java.lang.ref.Reference.get()` in JVM, or
     /// loading from a global weak table in CRuby.
@@ -175,6 +182,16 @@ pub trait BarrierSemantics: 'static + Send {
     /// Normally this is called by the slow-path implementation whenever the thread-local buffers are full.
     /// This will also be called externally by the VM, when the thread is being destroyed.
     fn flush(&mut self);
+
+    /// Drain a TERMINATING mutator's buffers from OUTSIDE a collection (e.g. an OCaml domain at
+    /// `Domain.join`, with no GC-worker context). The default is just `flush()` — correct for
+    /// barriers whose `flush` does no work-packet scheduling. Barriers that enqueue GC work in
+    /// `flush` (e.g. the LXR RC field barrier, which schedules `ProcessIncs`/`ProcessDecs`) MUST
+    /// override this to apply their buffered effect SYNCHRONOUSLY instead, because there is no
+    /// running collection to drain those packets and they carry raw slots into a dying thread.
+    fn flush_terminating(&mut self) {
+        self.flush();
+    }
 
     /// Slow-path call for object field write operations.
     fn object_reference_write_slow(
@@ -398,6 +415,10 @@ impl<S: BarrierSemantics> FieldBarrier<S> {
 impl<S: BarrierSemantics> Barrier<S::VM> for FieldBarrier<S> {
     fn flush(&mut self) {
         self.semantics.flush();
+    }
+
+    fn flush_terminating(&mut self) {
+        self.semantics.flush_terminating();
     }
 
     fn load_weak_reference(&mut self, o: ObjectReference) {

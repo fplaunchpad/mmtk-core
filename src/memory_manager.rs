@@ -196,6 +196,26 @@ pub fn flush_mutator<VM: VMBinding>(mutator: &mut Mutator<VM>) {
     mutator.flush()
 }
 
+/// Drain a TERMINATING mutator's barrier buffers from OUTSIDE a collection (no GC-worker context).
+///
+/// Unlike [`flush_mutator`] / [`destroy_mutator`], whose `flush` may SCHEDULE GC work packets
+/// (valid only while a collection is running and a worker will drain them), this applies the
+/// terminating mutator's buffered barrier effect SYNCHRONOUSLY. It is the correct call for a VM
+/// retiring a thread/domain that dies cooperatively *outside* a GC (e.g. OCaml `Domain.join`). For
+/// the LXR RC field barrier it applies the buffered increments directly to the global RC table so a
+/// just-terminated domain's references are not lost (which would prematurely free their referents);
+/// for barriers whose `flush` does no scheduling it is identical to `flush`.
+///
+/// The binding must still NOT use the mutator after this; and this must not be called concurrently
+/// with the same mutator being flushed by a collection (the VM serialises that — e.g. by
+/// deregistering the domain and waiting for any in-flight collection first).
+///
+/// Arguments:
+/// * `mutator`: A reference to the terminating mutator.
+pub fn flush_terminating_mutator<VM: VMBinding>(mutator: &mut Mutator<VM>) {
+    mutator.flush_terminating()
+}
+
 /// Allocate memory for an object.
 ///
 /// When the allocation is successful, it returns the starting address of the new object.  The
