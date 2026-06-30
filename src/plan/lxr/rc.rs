@@ -241,6 +241,17 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
     /// The minimal in-place-promotion inc: increment, and promote on the 0 → 1 transition.
     fn process_inc(&mut self, o: ObjectReference) {
         debug_rc_validate::<VM>("process_inc", o);
+        // Validate `o` is a real heap object in some MMTk space BEFORE indexing its per-object
+        // RC_TABLE metadata. `inc` -> RC_TABLE.fetch_update_atomic(o.to_raw_address()) does NO
+        // mapped-address check, so a garbage ObjectReference faults on the metadata atomic. Under
+        // the multidomain spawn/terminate root-scan window a freed/reused global-root slot can load
+        // as an even garbage value that passes FieldSlot::load's immediate-only filter (the GH#15
+        // variant-1 residual). The tracing plans survive the same garbage because trace_object's
+        // in_space dispatch falls through for a non-in-space ref; RC has no such guard, so add it.
+        // is_in_mmtk_spaces is a cheap SFT lookup that does NOT dereference `o` (safe on garbage).
+        if !crate::memory_manager::is_in_mmtk_spaces(o) {
+            return;
+        }
         // Immix membership gates the per-block / straddle-line metadata in `promote` (LOS /
         // immortal / non-moving objects index unmapped immix-block side metadata otherwise).
         let in_immix = self.lxr.immix_space.in_space(o);
@@ -258,6 +269,13 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
         let Some(o) = s.load() else {
             return;
         };
+        // Filter a garbage root value here too — BEFORE pushing to root_targets — so a freed/reused
+        // root slot (the multidomain GH#15 residual) cannot poison curr_roots/prev_roots and fault
+        // next GC's ProcessDecs (which reads rc.count(o) and would index garbage metadata). Same
+        // cheap, no-deref SFT check as process_inc; keeps the root inc/dec sets garbage-free.
+        if !crate::memory_manager::is_in_mmtk_spaces(o) {
+            return;
+        }
         // Root targets get an extra "root" reference count this GC; remember them so next GC's
         // `process_prev_roots` decrements them (otherwise root-reachable objects never die).
         if KIND == EDGE_KIND_ROOT {
