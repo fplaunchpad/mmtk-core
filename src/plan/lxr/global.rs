@@ -38,6 +38,31 @@ use enum_map::EnumMap;
 
 use mmtk_macros::{HasSpaces, PlanTraceObject};
 
+// ── Backup-trace (cycle collector) trigger state + knobs (P5) ──────────────────────────────────
+/// RC pauses since the last Full backup trace. When it reaches `MMTK_RC_BACKUP_EVERY`, the next
+/// pause is a Full (STW mark/sweep that reclaims cyclic garbage). Reset on each Full.
+static RC_PAUSES_SINCE_BACKUP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+/// Disable the backup trace entirely (pure RC) for A/B. `MMTK_RC_NO_CM` / `MMTK_RC_NO_BACKUP_TRACE`.
+fn backup_trace_disabled() -> bool {
+    std::env::var_os("MMTK_RC_NO_CM").is_some()
+        || std::env::var_os("MMTK_RC_NO_BACKUP_TRACE").is_some()
+}
+/// Run a Full backup trace every K RC pauses (`MMTK_RC_BACKUP_EVERY`, default 16).
+fn backup_every() -> usize {
+    env_usize("MMTK_RC_BACKUP_EVERY", 16).max(1)
+}
+/// Also force a Full when used pages ≥ this % of total (`MMTK_RC_BACKUP_PRESSURE_PCT`, default 90).
+fn backup_pressure_percent() -> usize {
+    env_usize("MMTK_RC_BACKUP_PRESSURE_PCT", 90)
+}
+
 // LXR (reference counting on a hierarchical Immix heap) — P3.5 skeleton.
 //
 // Built UP from our base Immix plan (plan/immix/global.rs), NOT down from the
@@ -131,13 +156,14 @@ impl<VM: VMBinding> Plan for LXR<VM> {
         // mutator stamp a freshly-allocated block with an EVEN epoch, violating the odd=mutator
         // invariant (`init_rc` asserts it) and mis-classifying that live block as non-nursery →
         // the nursery sweep could then free a LIVE block (SIGSEGV).
-        // Minimal RC cut: the only pause kind is RefCount (no CM, no emergency full GC, no defrag).
+        // RefCount = steady-state in-place RC. Full = the periodic STW backup mark/sweep that
+        // reclaims cyclic garbage RC misses (no concurrent marking; the in-place STW cut).
         let pause = self.select_collection_kind();
         self.current_pause.store(Some(pause), Ordering::SeqCst);
         match pause {
             Pause::RefCount => self.schedule_rc_collection(scheduler),
-            // The minimal cut never schedules these (select_collection_kind only returns RefCount).
-            _ => unreachable!("minimal LXR cut only schedules RefCount pauses, got {:?}", pause),
+            Pause::Full => self.schedule_full_collection(scheduler),
+            _ => unreachable!("LXR cut only schedules RefCount + Full pauses, got {:?}", pause),
         }
     }
 
@@ -159,17 +185,19 @@ impl<VM: VMBinding> Plan for LXR<VM> {
 
     fn prepare(&mut self, tls: VMWorkerThread) {
         // RC pause prepare (run from FastRCPrepare in the RCProcessIncs bucket — the normal Prepare
-        // bucket is disabled for a RefCount pause). The minimal cut is RefCount-only.
+        // bucket is disabled for a RefCount pause; for a Full pause it runs in the Prepare bucket).
         let pause = self.current_pause().unwrap();
-        debug_assert_eq!(pause, Pause::RefCount);
-        // `false` = not a full/major heap prepare (no mark-based tracing in the RC pause).
+        debug_assert!(pause == Pause::RefCount || pause == Pause::Full);
+        // `false` = not a full/major-heap *mark-based* prepare for the common spaces (immortal/LOS
+        // are RC-managed). The Full backup trace marks the immix graph; the common spaces don't need
+        // the mark-based prepare.
         self.common.prepare(tls, false);
         self.immix_space.prepare_rc(pause);
     }
 
     fn release(&mut self, tls: VMWorkerThread) {
         let pause = self.current_pause().unwrap();
-        debug_assert_eq!(pause, Pause::RefCount);
+        debug_assert!(pause == Pause::RefCount || pause == Pause::Full);
         self.common.release(tls, false);
         self.immix_space.release_rc(pause);
         // Swap roots: this GC's collected roots become next GC's prev_roots (to be decremented).
@@ -358,27 +386,35 @@ impl<VM: VMBinding> LXR<VM> {
 
 // ── LXR RC pause scheduling (P3 activation) ───────────────────────────────────────────────────
 impl<VM: VMBinding> LXR<VM> {
-    /// Decide the pause kind. Minimal cut: always `RefCount` — emergency full GC, defrag, and the
-    /// SATB initial/final-mark pauses are all DEFERRED (no CM, no mature evac). The heap is sized so
-    /// OOM (which would force a `Full` fallback) does not fire; if it ever does, the
-    /// `schedule_collection` `unreachable!` will surface it loudly.
+    /// Decide the pause kind. Steady state is `RefCount` (in-place RC). Every `K` RC pauses (or when
+    /// the previous RC pause failed to free enough and the heap is near-full) we run a `Pause::Full`
+    /// — a STW backup mark/sweep that reclaims the CYCLIC garbage pure RC cannot. `K` =
+    /// `MMTK_RC_BACKUP_EVERY` (default 16); `MMTK_RC_NO_CM`/`MMTK_RC_NO_BACKUP_TRACE` disables it
+    /// entirely (pure RC, for A/B). The pressure trigger fires a Full when the heap is > ~90% used
+    /// (so kb-style cyclic accumulation gets collected before OOM instead of after).
     fn select_collection_kind(&self) -> Pause {
-        Pause::RefCount
+        if backup_trace_disabled() {
+            return Pause::RefCount;
+        }
+        let n = RC_PAUSES_SINCE_BACKUP.fetch_add(1, Ordering::Relaxed) + 1;
+        let used = self.get_used_pages();
+        let total = self.get_total_pages();
+        let near_full = total > 0 && used * 100 >= total * backup_pressure_percent();
+        if n >= backup_every() || near_full {
+            RC_PAUSES_SINCE_BACKUP.store(0, Ordering::Relaxed);
+            Pause::Full
+        } else {
+            Pause::RefCount
+        }
     }
 
-    /// Disable the work buckets a RefCount pause does not use, so stray packets never run. Adapted
-    /// from lxr-v0.32.0; trimmed to the stages that exist in our base. The RC pause keeps
-    /// `Unconstrained`, `Initial` (= `RCProcessIncs`), `STWRCDecsAndSweep`, `Release`, `Final` (and
-    /// `ClearVOBits` under `vo_bit`) enabled. NOTE: unlike the reference, we DO NOT disable `Prepare`
-    /// or `Closure` — our base root-scan plumbing routes `ScanMutatorRoots`/`ScanVMSpecificRoots`
-    /// through `Prepare`, and the RC root packets are routed to `RCProcessIncs` via `RC_ROOTS`
-    /// (so `Closure` carries no RC work but is harmless if left enabled). Disabling the strictly-
-    /// unused ref-closure / forwarding / compact stages keeps the pause clean.
+    /// Disable the work buckets a pause does not use. For `RefCount` we additionally disable
+    /// `Closure` (the RC root packets route to `RCProcessIncs`, so `Closure` carries no RC work);
+    /// for `Full` we LEAVE `Closure` ENABLED — the backup trace's transitive MARK closure runs
+    /// there. The ref-closure / forwarding / compact stages are unused by either and stay disabled.
     fn disable_unnecessary_buckets(&self, scheduler: &GCWorkScheduler<VM>, pause: Pause) {
-        debug_assert_eq!(pause, Pause::RefCount);
         use WorkBucketStage::*;
         for stage in [
-            Closure,
             SoftRefClosure,
             WeakRefClosure,
             FinalRefClosure,
@@ -391,6 +427,8 @@ impl<VM: VMBinding> LXR<VM> {
         ] {
             scheduler.work_buckets[stage].set_enabled(false);
         }
+        // Closure: disabled for RefCount (no RC work there), ENABLED for Full (the mark closure).
+        scheduler.work_buckets[Closure].set_enabled(pause == Pause::Full);
     }
 
     /// Wrap the previous GC's roots into `ProcessDecs` packets (their extra root reference count is
@@ -450,8 +488,14 @@ impl<VM: VMBinding> LXR<VM> {
             .swap(0, Ordering::Relaxed);
         let prev_roots = self.prev_roots.read().unwrap().len();
         let curr_roots = self.curr_roots.read().unwrap().len();
+        // `dump_rc_stats` runs in `end_of_gc` BEFORE `current_pause` is cleared, so it still reflects
+        // THIS GC's pause kind.
+        let kind = match self.current_pause() {
+            Some(Pause::Full) => "FULL(backup-trace)",
+            _ => "RC",
+        };
         eprintln!(
-            "[RC-STATS] incs={incs} (promoted={promoted}) decs={decs} (dead={dead}) \
+            "[RC-STATS] {kind} incs={incs} (promoted={promoted}) decs={decs} (dead={dead}) \
              blocks_freed: young={young} mature={mature}  root-packets: prev={prev_roots} curr={curr_roots}"
         );
     }
@@ -473,6 +517,31 @@ impl<VM: VMBinding> LXR<VM> {
         // exactly once the bucket has emptied (the STW equivalent of the reference's
         // `LazySweepingJobsCounter::end_of_decs` Drop callback, which we deferred). Without this,
         // dead mature blocks are queued but never returned to the free list → the reclamation leak.
+        scheduler.work_buckets[WorkBucketStage::STWRCDecsAndSweep]
+            .set_sentinel(Box::new(super::gc_work::RCBlockSweepEpilogue));
+    }
+
+    /// Schedule a Full (backup-trace) pause. This is the steady-state RC pause PLUS a STW backup
+    /// mark/sweep that reclaims cyclic garbage:
+    ///   - mark-table zeroing (Unconstrained) so the trace marks into a clean table;
+    ///   - `Closure` re-enabled — the root scan (`RCImmixCollectRootEdges`) both INCREMENTS roots
+    ///     (RC, preserving the root-dec balance) AND seeds a transitive MARK closure in `Closure`;
+    ///   - `prepare_rc(Full)` sets `is_end_of_satb_or_full_gc` so liveness consults the mark bit;
+    ///   - after the closure + decs drain, `RCBlockSweepEpilogue` runs the nursery + mature sweeps
+    ///     and (for Full) the `SweepDeadCycles` dead-cycle sweep, then bumps the epoch.
+    /// No concurrent marking, no copying — pure STW, matching the in-place cut.
+    fn schedule_full_collection(&'static self, scheduler: &GCWorkScheduler<VM>) {
+        self.disable_unnecessary_buckets(scheduler, Pause::Full);
+        // Clean the object mark table before the trace marks into it.
+        self.immix_space.schedule_mark_table_zeroing();
+        self.process_prev_roots(scheduler);
+        type RootEdges<VM> = RCImmixCollectRootEdges<VM>;
+        scheduler.work_buckets[WorkBucketStage::Unconstrained]
+            .add(StopMutators::<LXRRCWorkContext<RootEdges<VM>>>::new());
+        scheduler.work_buckets[WorkBucketStage::RCProcessIncs].add(FastRCPrepare);
+        scheduler.work_buckets[WorkBucketStage::Release]
+            .add(Release::<LXRRCWorkContext<UnsupportedProcessEdges<VM>>>::new(self));
+        // Same post-decs epilogue; it runs the dead-cycle sweep too because current_pause == Full.
         scheduler.work_buckets[WorkBucketStage::STWRCDecsAndSweep]
             .set_sentinel(Box::new(super::gc_work::RCBlockSweepEpilogue));
     }

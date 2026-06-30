@@ -15,15 +15,19 @@
 //! * The reference also bumps `num_clean_blocks_released_*` stats inside a `current_pause().is_none()
 //!   || STWRCDecsAndSweep.is_open()` gate; kept verbatim (the stats fields exist on `ImmixSpace`).
 
+use std::ops::Range;
+
 use atomic::Ordering;
 
 use crate::{
     scheduler::{GCWork, GCWorker, WorkBucketStage},
-    vm::VMBinding,
+    util::{heap::chunk_map::Chunk, linear_scan::Region, rc, ObjectReference},
+    vm::{ObjectModel, VMBinding},
     LazySweepingJobsCounter, MMTK,
 };
 
-use super::block::Block;
+use super::block::{Block, BlockState};
+use super::line::Line;
 use crate::plan::lxr::LXR;
 
 /// Sweep the mature blocks that a batch of decrements flagged as possibly-dead. Any block whose RC
@@ -76,6 +80,133 @@ impl<VM: VMBinding> GCWork<VM> for SweepBlocksAfterDecs {
             lxr.immix_space
                 .num_clean_blocks_released_lazy
                 .fetch_add(count, Ordering::Relaxed);
+        }
+    }
+}
+
+// ── Backup-trace (cycle collector) work packets (P5, additive) ─────────────────────────────────
+// Vendored + adapted from lxr-v0.32.0 rc_work.rs (`ConcurrentChunkMetadataZeroing`,
+// `SweepDeadCycles`). These power the periodic STOP-THE-WORLD backup mark/sweep that reclaims the
+// CYCLIC garbage pure RC cannot (a dead cycle's members keep each other's RC > 0 forever). Only the
+// Full (`Pause::Full`) pause schedules them; the steady-state RC pause never touches them.
+
+/// Zero the object MARK-BIT side-metadata across a range of chunks, scheduled at the START of a
+/// Full pause so the backup trace marks into a clean table. (Reference: `ConcurrentChunkMetadataZeroing`.)
+pub(crate) struct ChunkMarkZeroing {
+    pub chunks: Range<Chunk>,
+}
+
+impl ChunkMarkZeroing {
+    #[inline]
+    fn reset_object_mark<VM: VMBinding>(chunk: Chunk) {
+        VM::VMObjectModel::LOCAL_MARK_BIT_SPEC
+            .extract_side_spec()
+            .bzero_metadata(chunk.start(), Chunk::BYTES);
+    }
+}
+
+impl<VM: VMBinding> GCWork<VM> for ChunkMarkZeroing {
+    fn do_work(&mut self, _worker: &mut GCWorker<VM>, mmtk: &'static MMTK<VM>) {
+        let ix = &mmtk.get_plan().downcast_ref::<LXR<VM>>().unwrap().immix_space;
+        let num_chunks =
+            (self.chunks.end.start() - self.chunks.start.start()) >> Chunk::LOG_BYTES;
+        for i in 0..num_chunks {
+            let chunk = self.chunks.start.next_nth(i);
+            if !ix.chunk_map.get(chunk).is_some() {
+                continue;
+            }
+            Self::reset_object_mark::<VM>(chunk);
+        }
+    }
+}
+
+/// The DEAD-CYCLE sweep: after the backup trace has set the mark bit on every reachable object,
+/// scan each mature block; an object with `rc.count != 0` but NOT marked is **dead cyclic garbage**
+/// (it had references — RC > 0 — only because of an unreachable cycle the trace did not visit).
+/// Reclaim it (`rc.set(o, 0)` + unmark its straddle lines), and free any block left with no live
+/// object. (Reference: `SweepDeadCycles`.)
+///
+/// ADAPTATION: dropped the concurrent-marking `SeqCst` fence + RC re-check (no concurrent decs in the
+/// STW cut) and the defrag-source / mature-evac handling (no copying). `to_object_reference` →
+/// `ObjectReference::from_raw_address_unchecked`; `Line::from`/`is_aligned` → `Line::of` /
+/// `is_aligned_to(Line::BYTES)`.
+pub(crate) struct SweepDeadCycles<VM: VMBinding> {
+    chunks: Range<Chunk>,
+    _counter: LazySweepingJobsCounter,
+    rc: rc::RefCountHelper<VM>,
+}
+
+impl<VM: VMBinding> SweepDeadCycles<VM> {
+    pub fn new(chunks: Range<Chunk>, counter: LazySweepingJobsCounter) -> Self {
+        Self {
+            chunks,
+            _counter: counter,
+            rc: rc::RefCountHelper::NEW,
+        }
+    }
+
+    fn process_dead_object(&mut self, o: ObjectReference) {
+        if !crate::args::BLOCK_ONLY {
+            self.rc.unmark_straddle_object(o);
+        }
+        self.rc.set(o, 0);
+    }
+
+    /// Returns true iff the block has NO live (rc != 0 && marked) object — i.e. it can be freed.
+    fn process_block(&mut self, block: Block, immix_space: &super::ImmixSpace<VM>) -> bool {
+        let mut has_live = false;
+        let mut cursor = block.start();
+        let limit = block.end();
+        while cursor < limit {
+            let o = unsafe { ObjectReference::from_raw_address_unchecked(cursor) };
+            cursor += rc::MIN_OBJECT_SIZE;
+            let c = self.rc.count(o);
+            if c != 0 && !immix_space.is_marked(o) {
+                // rc>0 but unreachable => dead cyclic garbage. Skip straddle CONTINUATION cells
+                // (a >1-line object's continuation lines carry an rc==1 straddle marker, not a real
+                // object header): only the object START is a real object.
+                if !crate::args::BLOCK_ONLY && o.to_raw_address().is_aligned_to(Line::BYTES) {
+                    if c == 1 && self.rc.is_straddle_line(Line::of(o.to_raw_address())) {
+                        continue;
+                    }
+                }
+                self.process_dead_object(o);
+            } else if c != 0 {
+                has_live = true;
+            }
+        }
+        !has_live
+    }
+}
+
+impl<VM: VMBinding> GCWork<VM> for SweepDeadCycles<VM> {
+    fn do_work(&mut self, _worker: &mut GCWorker<VM>, mmtk: &'static MMTK<VM>) {
+        let lxr = mmtk.get_plan().downcast_ref::<LXR<VM>>().unwrap();
+        let immix_space = &lxr.immix_space;
+        let mut dead_blocks = 0;
+        let num_chunks =
+            (self.chunks.end.start() - self.chunks.start.start()) >> Chunk::LOG_BYTES;
+        for i in 0..num_chunks {
+            let chunk = self.chunks.start.next_nth(i);
+            if !immix_space.chunk_map.get(chunk).is_some() {
+                continue;
+            }
+            for block in chunk
+                .iter_region::<Block>()
+                .filter(|b| b.get_state() != BlockState::Unallocated)
+            {
+                let dead = self.process_block(block, immix_space);
+                // `rc_dead=true`: SweepDeadCycles already zeroed every dead object's RC above, so the
+                // block is genuinely empty — force the dealloc path (which also frees to the list).
+                if dead && block.rc_sweep_mature::<VM>(immix_space, false, true) {
+                    dead_blocks += 1;
+                }
+            }
+        }
+        if dead_blocks != 0 {
+            immix_space
+                .num_clean_blocks_released_mature
+                .fetch_add(dead_blocks, Ordering::Relaxed);
         }
     }
 }

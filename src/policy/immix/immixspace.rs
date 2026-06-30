@@ -615,10 +615,10 @@ impl<VM: VMBinding> ImmixSpace<VM> {
     /// selection, mark-state setup) are DEFERRED — they are never reached because the minimal LXR
     /// plan only ever schedules a `RefCount` pause. Vendored/adapted from lxr-v0.32.0 immixspace.rs.
     pub fn prepare_rc(&mut self, pause: crate::plan::lxr::Pause) {
-        debug_assert_eq!(
-            pause,
-            crate::plan::lxr::Pause::RefCount,
-            "minimal LXR cut only schedules RefCount pauses; Full/InitialMark prepare_rc deferred"
+        use crate::plan::lxr::Pause;
+        debug_assert!(
+            pause == Pause::RefCount || pause == Pause::Full,
+            "minimal LXR cut only schedules RefCount + Full (backup-trace) pauses"
         );
         self.num_clean_blocks_released_young
             .store(0, Ordering::SeqCst);
@@ -627,17 +627,45 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         self.num_clean_blocks_released_lazy
             .store(0, Ordering::SeqCst);
         self.copy_alloc_bytes.store(0, Ordering::SeqCst);
+        // Full (backup trace): the mark bit is temporarily authoritative over RC for liveness, so
+        // weak-ref / finalizer `is_live`/`is_reachable` queries during this pause AND the trace
+        // result (consult is_marked) — `is_end_of_satb_or_full_gc` enables that read-side. Cleared
+        // in `release_rc`.
+        if pause == Pause::Full {
+            self.is_end_of_satb_or_full_gc = true;
+        }
+    }
+
+    /// Schedule the object-mark-bit zeroing tasks (Full pause prologue) so the backup trace marks
+    /// into a clean table. Fans out one `ChunkMarkZeroing` per chunk batch into `Unconstrained`.
+    pub fn schedule_mark_table_zeroing(&self) {
+        let tasks = self.chunk_map.generate_tasks(|chunk| {
+            Box::new(super::rc_work::ChunkMarkZeroing {
+                chunks: chunk..chunk.next(),
+            })
+        });
+        self.scheduler().work_buckets[WorkBucketStage::Unconstrained].bulk_add(tasks);
+    }
+
+    /// Schedule the dead-cycle sweep (Full pause epilogue): scans all mature blocks and reclaims
+    /// objects that are `rc>0` but were NOT marked by the backup trace (dead cyclic garbage). Fans
+    /// out one `SweepDeadCycles` per chunk batch into `Unconstrained` (runs in the post-decs epilogue).
+    pub fn schedule_dead_cycle_sweep(&self) {
+        let tasks = self.chunk_map.generate_tasks(|chunk| {
+            Box::new(super::rc_work::SweepDeadCycles::<VM>::new(
+                chunk..chunk.next(),
+                crate::LazySweepingJobsCounter::new_decs(),
+            )) as Box<dyn GCWork<VM>>
+        });
+        self.scheduler().work_buckets[WorkBucketStage::Unconstrained].bulk_add(tasks);
     }
 
     /// RC-pause release. Minimal cut (`Pause::RefCount`): sweep the unpromoted nursery blocks back
     /// to the page resource's free list, flush, reset the inc buffer + reused-line counter. The
     /// post-SATB mature sweeping and lazy-decrement draining are DEFERRED.
     pub fn release_rc(&mut self, pause: crate::plan::lxr::Pause) {
-        debug_assert_eq!(
-            pause,
-            crate::plan::lxr::Pause::RefCount,
-            "minimal LXR cut only schedules RefCount pauses; Full/FinalMark release_rc deferred"
-        );
+        use crate::plan::lxr::Pause;
+        debug_assert!(pause == Pause::RefCount || pause == Pause::Full);
         if crate::plan::lxr::rc::rc_debug_on() {
             eprintln!(
                 "[RC-PHASE] release_rc start: incs_total={} promoted={}",

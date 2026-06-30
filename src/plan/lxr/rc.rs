@@ -497,6 +497,22 @@ impl<VM: VMBinding> ProcessEdgesWork for RCImmixCollectRootEdges<VM> {
     fn process_slots(&mut self) {
         if !self.slots.is_empty() {
             let lxr = self.mmtk().get_plan().downcast_ref::<LXR<VM>>().unwrap();
+            // FULL (backup-trace) pause: ALSO drive a transitive MARK closure from these same root
+            // slots (in the `Closure` bucket). The RC inc below preserves the root-dec balance; the
+            // mark closure sets the mark bit on the reachable graph so the dead-cycle sweep can tell
+            // reachable cyclic objects (marked) from dead cyclic garbage (rc>0 but unmarked).
+            if lxr.current_pause() == Some(crate::plan::lxr::Pause::Full) {
+                let mark_roots = self.slots.clone();
+                crate::memory_manager::add_work_packet(
+                    self.mmtk(),
+                    WorkBucketStage::Closure,
+                    crate::scheduler::gc_work::PlanProcessEdges::<
+                        VM,
+                        LXR<VM>,
+                        { crate::policy::immix::TRACE_KIND_FAST },
+                    >::new(mark_roots, true, self.mmtk(), WorkBucketStage::Closure),
+                );
+            }
             let roots = std::mem::take(&mut self.slots);
             let mut w = ProcessIncs::<_, EDGE_KIND_ROOT>::new(roots, lxr);
             GCWork::do_work(&mut w, self.worker(), self.mmtk());

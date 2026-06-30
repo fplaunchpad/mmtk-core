@@ -70,6 +70,15 @@ impl<VM: VMBinding> GCWork<VM> for RCBlockSweepEpilogue {
             lxr.immix_space
                 .schedule_rc_block_sweeping_tasks(crate::LazySweepingJobsCounter::new_decs());
         }
+        // FULL (backup-trace) pause only: after the mark closure set the mark bit on every reachable
+        // object, sweep the DEAD CYCLES — mature objects with rc>0 that the trace did NOT reach
+        // (cyclic garbage RC alone can never free). Runs in `Unconstrained` after this epilogue.
+        if !no_free
+            && lxr.current_pause() == Some(super::Pause::Full)
+            && std::env::var_os("MMTK_RC_NO_CYCLE_SWEEP").is_none()
+        {
+            lxr.immix_space.schedule_dead_cycle_sweep();
+        }
         // The SINGLE per-GC phase-epoch bump (GC→mutator), done HERE rather than in `Plan::release`
         // (which runs before the decs/this sweep). The nursery sweep now keys on block STATE
         // (Unallocated = unpromoted), so it is epoch-independent. There is NO pause-start bump — that
