@@ -555,3 +555,73 @@ impl<VM: VMBinding> DerefMut for RCImmixCollectRootEdges<VM> {
         &mut self.base
     }
 }
+
+/// Synchronously -- OUTSIDE any collection, with NO GC-worker/closure context -- durably keep
+/// `root` and its transitive pointer-reachable children alive under the LXR reference-counting
+/// plan. Used by the OCaml domain-termination path (issue #31): the just-built `Finished(Ok
+/// result)` chain (three heap blocks) starts at RC 0 -- nothing has incremented it -- and under
+/// LXR it is NOT saved by the tracing-plan machinery in `sync_and_terminate`:
+///   * the `caml_mmtk_is_young`-retry loop is a dead no-op (LXR is non-generational, so
+///     `mmtk_ocaml_is_in_nursery` always returns false), and
+///   * `caml_mmtk_collect()`'s global-root scan of `ml_values->result` coalesces onto a peer GC
+///     that already ran its root scan, so it never promotes the result, and
+///   * the `term_sync.state` field-barrier increment is buffered but the terminating mutator's
+///     barrier buffer is dropped un-flushed at deregister.
+/// So the result's clean nursery block (`BlockState::Unallocated`, all-RC-zero) is reclaimed by
+/// `sweep_nursery_blocks` and reused before the joiner dereferences `term_sync.state` -- SIGSEGV
+/// in `Domain.join` (rr-confirmed).
+///
+/// This gives `root` and every transitive child RC >= 1 (so `Block::rc_dead()` is false and
+/// `sweep_nursery_blocks`'s `state==Unallocated && rc_dead()` predicate spares each block), and
+/// flips each fresh nursery block to `Unmarked` (`set_as_in_place_promoted`) for correct mature
+/// bookkeeping. It mirrors `ProcessIncs::process_inc` / `promote` / `scan_nursery_object` but is
+/// driven by an explicit worklist instead of scheduled `ProcessIncs` packets, so it needs no
+/// worker and no open work bucket -- exactly like `LXRFieldBarrierSemantics::drain_terminating`
+/// calls `rc.inc` directly. Unlike that bare single inc, it recurses so the WHOLE `Finished(Ok
+/// v)` chain survives (a lone `rc.inc(root)` leaves the inner `Ok` and payload blocks at RC 0,
+/// which get swept -- the reason a plain terminating-drain did not fix the crash).
+///
+/// This is an intentional root increment with NO matching decrement while the result is published
+/// only through the terminating domain: the result stays reachably alive via `term_sync.state`
+/// once the joiner links it, and is reclaimed normally when `term_sync` itself dies (its field
+/// dec cascade decrements the chain). The un-paired inc is a bounded over-retention (one result
+/// chain per terminated domain), never an unbounded leak and never a crash.
+pub(crate) fn lxr_keep_alive_recursive<VM: VMBinding>(lxr: &LXR<VM>, root: ObjectReference) {
+    use crate::policy::immix::block::BlockState;
+    let rc = RefCountHelper::<VM>::NEW;
+    let mut worklist: Vec<ObjectReference> = vec![root];
+    while let Some(o) = worklist.pop() {
+        // Cheap, no-deref SFT guard (same as `process_inc`): never index RC_TABLE for a
+        // non-in-space / garbage reference.
+        if !crate::memory_manager::is_in_mmtk_spaces(o) {
+            continue;
+        }
+        // `inc` returns `Ok(0)` exactly on the 0 -> 1 (fresh-promote) transition. If the object
+        // was already live (RC >= 1) its block is already spared and its subgraph already carries
+        // counts -- do not re-scan (this also terminates on shared children and cycles).
+        if rc.inc(o) != Ok(0) {
+            continue;
+        }
+        // Fresh promote: block-state flip + straddle-line metadata, but ONLY for immix-space
+        // objects (LOS / immortal / non-moving objects index unmapped immix-block side metadata
+        // otherwise). RC_TABLE is whole-heap-mapped, so the inc above is always safe.
+        let in_immix = lxr.immix_space.in_space(o);
+        if in_immix {
+            let block = Block::containing(o);
+            if block.get_state() == BlockState::Unallocated {
+                block.set_as_in_place_promoted(&lxr.immix_space);
+            }
+            rc.promote_with_size(o, VM::VMObjectModel::get_current_size(o));
+        } else {
+            o.to_raw_address().unlog_field_relaxed::<VM>();
+        }
+        // Enqueue every pointer child for a recursive keep-alive; unlog each field (it now
+        // belongs to a mature object, so the field barrier will not re-log it).
+        SlotIterator::<VM>::iterate_fields(o, fake_tls(), |slot| {
+            slot.to_address().unlog_field_relaxed::<VM>();
+            if let Some(target) = slot.load() {
+                worklist.push(target);
+            }
+        });
+    }
+}

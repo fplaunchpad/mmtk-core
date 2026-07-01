@@ -835,6 +835,29 @@ pub fn is_in_mmtk_spaces(object: ObjectReference) -> bool {
         .is_in_space(object)
 }
 
+/// Durably keep `object` and its transitive children alive under the LXR reference-counting plan,
+/// applied SYNCHRONOUSLY from a terminating mutator with no GC-worker context. Used by OCaml
+/// `Domain.join` (issue #31): the terminating domain's result value must survive its own teardown
+/// (nursery-block sweep + reuse) until the joiner reads it via `term_sync.state`. Under LXR the
+/// tracing-plan promotion in `sync_and_terminate` is inert (the plan is non-generational and the
+/// forced collect coalesces past the result's global-root scan), so the result would be swept at
+/// RC 0. This bumps the whole `Finished(Ok v)` chain to RC >= 1. No-op / returns false unless the
+/// active plan is LXR (the tracing/generational plans keep the result alive via the collect path
+/// instead).
+pub fn lxr_keep_alive_recursive<VM: VMBinding>(
+    mmtk: &'static MMTK<VM>,
+    object: ObjectReference,
+) -> bool {
+    use crate::plan::lxr::LXR;
+    match mmtk.get_plan().downcast_ref::<LXR<VM>>() {
+        Some(lxr) => {
+            crate::plan::lxr::rc::lxr_keep_alive_recursive(lxr, object);
+            true
+        }
+        None => false,
+    }
+}
+
 /// Is the address in the mapped memory? The runtime can use this function to check
 /// if an address is mapped by MMTk. Note that this is different than is_in_mmtk_spaces().
 /// For malloc spaces, MMTk does not map those addresses (malloc does the mmap), so
