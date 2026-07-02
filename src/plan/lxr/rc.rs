@@ -277,7 +277,18 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
     /// then increment + maybe-promote it.
     fn process_slot(&mut self, s: VM::VMSlot) {
         if KIND == EDGE_KIND_MATURE {
-            s.to_address().unlog_field_relaxed::<VM>();
+            // Guard the slot-unlog against non-MMTk (fiber-stack) slot addresses: a Cont_tag's
+            // stack slots reach here as mature edges; their UNLOG side-metadata page is unmapped, so
+            // unlogging them faults (the multidomain chameneos-under-LXR SIGSEGV — rr-confirmed at
+            // rc.rs:280). Same is_in_mmtk_spaces guard as scan_nursery_object / the keep-alive scan.
+            let sa = s.to_address();
+            if sa.is_mapped()
+                && crate::memory_manager::is_in_mmtk_spaces(unsafe {
+                    ObjectReference::from_raw_address_unchecked(sa)
+                })
+            {
+                sa.unlog_field_relaxed::<VM>();
+            }
         }
         let Some(o) = s.load() else {
             return;
