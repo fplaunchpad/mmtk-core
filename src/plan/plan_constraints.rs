@@ -52,6 +52,12 @@ pub struct PlanConstraints {
     /// `false` for every non-RC plan, so the gated RC overlays stay inert and those
     /// plans remain byte-identical. Only the (P3) LXR plan sets this true.
     pub rc_enabled: bool,
+    /// LXR / reference counting: does this plan use the per-field *unlog* bit
+    /// (`GLOBAL_FIELD_UNLOG_BIT_SPEC`) driven by the coalescing field-logging write
+    /// barrier (`BarrierSelector::FieldBarrier`)? `false` for every non-RC plan. Only
+    /// the (P3) LXR plan sets this true; kept separate from `needs_log_bit` (the
+    /// per-object generational/SATB log bit) because LXR logs at field granularity.
+    pub needs_field_log_bit: bool,
 }
 
 impl PlanConstraints {
@@ -76,6 +82,7 @@ impl PlanConstraints {
             needs_prepare_mutator: cfg!(feature = "marksweep_as_nonmoving"),
             generational: false,
             rc_enabled: false,
+            needs_field_log_bit: false,
         }
     }
 }

@@ -318,6 +318,14 @@ pub enum WorkBucketStage {
     /// Clear the VO bit metadata.  Mainly used by ImmixSpace.
     #[cfg(feature = "vo_bit")]
     ClearVOBits,
+    /// LXR: drain any in-flight concurrent work before a stop-the-world RC/mark pause. Opens right
+    /// after `Prepare` (kept inert for non-LXR plans).
+    FinishConcurrentWork,
+    /// LXR: the stage in which root/mature reference-count *increments* are processed (LXR aliases
+    /// `RCProcessIncs` to this). Placed right after `Prepare` so the RC root packets the mutator
+    /// root scan (which runs in `Prepare`) routes here are processed BEFORE `Release` sweeps the
+    /// unpromoted nursery. `FastRCPrepare` (which runs `prepare_rc`) also lives here.
+    Initial,
     /// Compute the transtive closure starting from transitively pinning (TP) roots following only strong references.
     /// No objects in this closure are allow to move.
     TPinningClosure,
@@ -364,22 +372,12 @@ pub enum WorkBucketStage {
     /// Work packets that should be done just before GC shall go here.  This includes releasing
     /// resources and setting states in plans, spaces, GC workers, mutators, etc.
     Release,
+    /// LXR: stop-the-world reference-count *decrement* processing + immix line/block sweep. Placed
+    /// AFTER `Release` (matching the reference) so dead-object decrements and the lazy block sweep
+    /// run once the pause's increments + `release_rc` nursery sweep are done.
+    STWRCDecsAndSweep,
     /// Resume mutators and end GC.
     Final,
-    // ---- LXR (P1, additive) ----
-    // These RC stages are APPENDED after `Final` (rather than inserted where LXR places them,
-    // before `Prepare`) so every pre-existing variant keeps its discriminant and the scheduler's
-    // sequential stage-walk order is unchanged. They are inert for all existing plans: no plan
-    // adds work to them, so they open and immediately drain. `FIRST_STW_STAGE` is deliberately
-    // left at `Prepare` (LXR moves it to `FinishConcurrentWork`); that change is part of the LXR
-    // plan's scheduling and lands in P3.
-    /// LXR: drain any in-flight concurrent work before a stop-the-world RC/mark pause.
-    FinishConcurrentWork,
-    /// LXR: the stage in which root/mature reference-count increments are processed
-    /// (LXR aliases `RCProcessIncs` to this).
-    Initial,
-    /// LXR: stop-the-world reference-count decrement processing and immix line/block sweep.
-    STWRCDecsAndSweep,
 }
 
 impl WorkBucketStage {

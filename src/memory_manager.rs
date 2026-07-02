@@ -196,6 +196,26 @@ pub fn flush_mutator<VM: VMBinding>(mutator: &mut Mutator<VM>) {
     mutator.flush()
 }
 
+/// Drain a TERMINATING mutator's barrier buffers from OUTSIDE a collection (no GC-worker context).
+///
+/// Unlike [`flush_mutator`] / [`destroy_mutator`], whose `flush` may SCHEDULE GC work packets
+/// (valid only while a collection is running and a worker will drain them), this applies the
+/// terminating mutator's buffered barrier effect SYNCHRONOUSLY. It is the correct call for a VM
+/// retiring a thread/domain that dies cooperatively *outside* a GC (e.g. OCaml `Domain.join`). For
+/// the LXR RC field barrier it applies the buffered increments directly to the global RC table so a
+/// just-terminated domain's references are not lost (which would prematurely free their referents);
+/// for barriers whose `flush` does no scheduling it is identical to `flush`.
+///
+/// The binding must still NOT use the mutator after this; and this must not be called concurrently
+/// with the same mutator being flushed by a collection (the VM serialises that — e.g. by
+/// deregistering the domain and waiting for any in-flight collection first).
+///
+/// Arguments:
+/// * `mutator`: A reference to the terminating mutator.
+pub fn flush_terminating_mutator<VM: VMBinding>(mutator: &mut Mutator<VM>) {
+    mutator.flush_terminating()
+}
+
 /// Allocate memory for an object.
 ///
 /// When the allocation is successful, it returns the starting address of the new object.  The
@@ -813,6 +833,29 @@ pub fn is_in_mmtk_spaces(object: ObjectReference) -> bool {
     SFT_MAP
         .get_checked(object.to_raw_address())
         .is_in_space(object)
+}
+
+/// Durably keep `object` and its transitive children alive under the LXR reference-counting plan,
+/// applied SYNCHRONOUSLY from a terminating mutator with no GC-worker context. Used by OCaml
+/// `Domain.join` (issue #31): the terminating domain's result value must survive its own teardown
+/// (nursery-block sweep + reuse) until the joiner reads it via `term_sync.state`. Under LXR the
+/// tracing-plan promotion in `sync_and_terminate` is inert (the plan is non-generational and the
+/// forced collect coalesces past the result's global-root scan), so the result would be swept at
+/// RC 0. This bumps the whole `Finished(Ok v)` chain to RC >= 1. No-op / returns false unless the
+/// active plan is LXR (the tracing/generational plans keep the result alive via the collect path
+/// instead).
+pub fn lxr_keep_alive_recursive<VM: VMBinding>(
+    mmtk: &'static MMTK<VM>,
+    object: ObjectReference,
+) -> bool {
+    use crate::plan::lxr::LXR;
+    match mmtk.get_plan().downcast_ref::<LXR<VM>>() {
+        Some(lxr) => {
+            crate::plan::lxr::rc::lxr_keep_alive_recursive(lxr, object);
+            true
+        }
+        None => false,
+    }
 }
 
 /// Is the address in the mapped memory? The runtime can use this function to check

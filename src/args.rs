@@ -144,6 +144,26 @@ pub const RC_NURSERY_EVACUATION: bool = !cfg!(feature = "lxr_no_nursery_evac");
 #[allow(dead_code)]
 pub const RC_MATURE_EVACUATION: bool = !cfg!(feature = "lxr_no_mature_evac");
 
+// Additional compile-time flags referenced by the RC work packets / block-allocation / barrier
+// (P3). All default to LXR's defaults (the `lxr_*` cargo features are undeclared here, so each
+// `cfg!(feature=...)` is `false`). Inert until `MMTK_PLAN=LXR` flips `rc_enabled`.
+/// Sweep/scan whole blocks rather than lines. Mirrors `crate::policy::immix::BLOCK_ONLY`.
+#[allow(dead_code)]
+pub const BLOCK_ONLY: bool = crate::policy::immix::BLOCK_ONLY;
+/// Don't nursery-evacuate objects that live in recycled (reused) lines. LXR default = false.
+#[allow(dead_code)]
+pub const RC_DONT_EVACUATE_NURSERY_IN_RECYCLED_LINES: bool =
+    cfg!(feature = "lxr_dont_evacuate_nursery_in_recycled_lines");
+/// Barrier-takerate measurement build (counts fast/slow barrier hits). LXR default = false.
+#[allow(dead_code)]
+pub const TAKERATE_MEASUREMENT: bool = cfg!(feature = "lxr_measure_barrier_takerate");
+/// Barrier-cost measurement build (forces the slow path / disables the fast path). Default false.
+#[allow(dead_code)]
+pub const BARRIER_MEASUREMENT: bool = cfg!(feature = "barrier_measurement");
+/// Companion to `BARRIER_MEASUREMENT`: measure the fast path only (skip the slow path). Default false.
+#[allow(dead_code)]
+pub const BARRIER_MEASUREMENT_NO_SLOW: bool = cfg!(feature = "barrier_measurement_no_slow");
+
 /// One more atomic-store per barrier slow-path if this value is smaller than 6.
 #[allow(dead_code)]
 pub const LOG_BYTES_PER_RC_LOCK_BIT: usize = {

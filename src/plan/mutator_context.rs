@@ -474,6 +474,13 @@ pub trait MutatorContext<VM: VMBinding>: Send + 'static {
     fn flush(&mut self) {
         self.flush_remembered_sets();
     }
+    /// Drain a TERMINATING mutator's barrier from OUTSIDE a collection (no GC-worker context). Used
+    /// by a VM when a thread/domain dies cooperatively (e.g. OCaml `Domain.join`). Default routes to
+    /// the barrier's `flush_terminating` (which is `flush` unless the barrier overrides it — the LXR
+    /// RC field barrier does, applying its buffered increments directly to RC_TABLE).
+    fn flush_terminating(&mut self) {
+        self.barrier().flush_terminating();
+    }
     /// Get the mutator thread for this mutator context. This is the same value as the argument supplied in
     /// [`crate::memory_manager::bind_mutator`] when this mutator is created.
     fn get_tls(&self) -> VMMutatorThread;

@@ -257,6 +257,14 @@ lxr_lock_6 = []
 lxr_lock_7 = []
 lxr_lock_8 = []
 lxr_lock_9 = []
+lxr_no_cm = []                                       # disable concurrent marking (deferred; default off)
+lxr_no_recursive_dec = []                            # disable recursive decrements
+lxr_no_decs = []                                     # disable decrements entirely
+lxr_dont_evacuate_nursery_in_recycled_lines = []     # don't nursery-evac objects in reused lines
+lxr_measure_barrier_takerate = []                    # count barrier fast/slow takerate
+barrier_measurement = []                             # force the barrier slow path (cost measurement)
+barrier_measurement_no_slow = []                     # measure fast path only (skip slow path)
+force_zeroing = []                                   # force-zero fresh nursery blocks
 
 # Do not modify the following line - ci-common.sh matches it
 # -- Mutally exclusive features --

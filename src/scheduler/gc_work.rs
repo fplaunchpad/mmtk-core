@@ -580,6 +580,10 @@ pub trait ProcessEdgesWork:
     /// If true, we do object scanning in this work packet with the same worker without scheduling overhead.
     /// If false, we will add object scanning work packets to the global queue and allow other workers to work on it.
     const SCAN_OBJECTS_IMMEDIATELY: bool = true;
+    /// LXR: are these root edges processed as reference-count *increments* rather than a trace?
+    /// When `true`, the roots-work factory routes the root packet into the `RCProcessIncs` bucket
+    /// (instead of `Closure`) so it runs in the RC pause. `false` for every non-RC `ProcessEdgesWork`.
+    const RC_ROOTS: bool = false;
 
     /// Create a [`ProcessEdgesWork`].
     ///
@@ -773,10 +777,17 @@ impl<VM: VMBinding, DPE: ProcessEdgesWork<VM = VM>, PPE: ProcessEdgesWork<VM = V
         // different names, and our `capture.bt` mentions all of them, `bpftrace` may complain that
         // it cannot find one or more of those USDT trace points in the binary.
         probe!(mmtk, roots, RootsKind::NORMAL, slots.len());
+        // LXR: RC root edges are processed as increments in the RC pause, so they go to the
+        // `RCProcessIncs` (= `Initial`) bucket — `Closure` is disabled during a RefCount pause.
+        let bucket = if DPE::RC_ROOTS {
+            WorkBucketStage::RCProcessIncs
+        } else {
+            WorkBucketStage::Closure
+        };
         crate::memory_manager::add_work_packet(
             self.mmtk,
-            WorkBucketStage::Closure,
-            DPE::new(slots, true, self.mmtk, WorkBucketStage::Closure),
+            bucket,
+            DPE::new(slots, true, self.mmtk, bucket),
         );
     }
 

@@ -227,11 +227,30 @@ impl<VM: VMBinding> RefCountHelper<VM> {
         }
     }
 
-    // NOTE (deferred to P3): `promote`, `promote_with_size`, `prefetch_read`, `prefetch_write`,
-    // and `rc_table_range` are intentionally not vendored here. `promote*` call LXR's
-    // `ObjectReference::log_start_address` (field-unlog logging, a barrier concern that needs the
-    // field-unlog spec to be live); the prefetch hints need LXR's `SideMetadataSpec::prefetch_*`
-    // (not in our 0.32.0); `rc_table_range` is only used by the immix-policy RC sweep (P2).
+    /// Promote a freshly-incremented nursery object to mature: mark the straddle-line metadata
+    /// for any object spanning more than one immix line. Vendored from lxr-v0.32.0 `util/rc.rs`.
+    ///
+    /// Adaptation: the reference also calls `o.log_start_address::<VM>()`, but that method is a
+    /// no-op `{}` in the reference (the per-object start-address log is unused under the default
+    /// config), so it is dropped here. The per-field unlog logging that actually matters for the
+    /// barrier is done by `scan_nursery_object` in the RC trace, not here.
+    pub fn promote(&self, o: ObjectReference) {
+        let size = VM::VMObjectModel::get_current_size(o);
+        if size > Line::BYTES {
+            self.mark_straddle_object_with_size(o, size);
+        }
+    }
+
+    /// As [`Self::promote`], but the object's size is already known (saves a re-read).
+    pub fn promote_with_size(&self, o: ObjectReference, size: usize) {
+        if size > Line::BYTES {
+            self.mark_straddle_object_with_size(o, size);
+        }
+    }
+
+    // NOTE (deferred to P3+): `prefetch_read`, `prefetch_write`, and `rc_table_range` are
+    // intentionally not vendored. The prefetch hints need LXR's `SideMetadataSpec::prefetch_*`
+    // (not in our 0.32.0); `rc_table_range` is only used by the immix-policy RC sweep.
 }
 
 impl<VM: VMBinding> Clone for RefCountHelper<VM> {

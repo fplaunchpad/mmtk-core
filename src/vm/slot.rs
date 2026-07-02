@@ -133,6 +133,14 @@ pub trait Slot: Copy + Send + Debug + PartialEq + Eq + Hash {
     /// See: <https://github.com/mmtk/mmtk-core/issues/1038>
     fn store(&self, object: ObjectReference);
 
+    /// The address of the slot itself (where the `ObjectReference` is stored). Used by the LXR
+    /// field-logging write barrier and RC trace to index the per-field unlog-bit side metadata.
+    /// (LXR additive.) The provided default panics; the slot representations the LXR plan uses
+    /// (`SimpleSlot`, `Address`) override it. Non-LXR plans never call it.
+    fn to_address(&self) -> Address {
+        unimplemented!("Slot::to_address is only required by the LXR field barrier / RC trace")
+    }
+
     /// Prefetch the slot so that a subsequent `load` will be faster.
     fn prefetch_load(&self) {
         // no-op by default
@@ -184,6 +192,10 @@ impl Slot for SimpleSlot {
     fn store(&self, object: ObjectReference) {
         unsafe { (*self.slot_addr).store(object.to_raw_address(), atomic::Ordering::Relaxed) }
     }
+
+    fn to_address(&self) -> Address {
+        self.as_address()
+    }
 }
 
 /// For backword compatibility, we let `Address` implement `Slot` with the same semantics as
@@ -204,6 +216,10 @@ impl Slot for Address {
 
     fn store(&self, object: ObjectReference) {
         unsafe { Address::store(*self, object) }
+    }
+
+    fn to_address(&self) -> Address {
+        *self
     }
 }
 

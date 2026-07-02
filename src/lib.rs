@@ -54,3 +54,65 @@ pub mod vm;
 pub use crate::plan::{
     AllocationSemantics, BarrierSelector, Mutator, MutatorContext, ObjectQueue, Plan,
 };
+
+// ---- LXR (P3, additive) — lazy-sweeping job counter ----------------------------------------
+//
+// Vendored (and *simplified*) from the LXR research fork's `LazySweepingJobsCounter`. In the
+// reference it is an RAII token threaded through every decrement / block-sweep packet; when the
+// last token of a generation drops it fires the registered `end_of_decs` / `end_of_lazy`
+// callbacks (which kick off the lazy mature sweep). That global callback infrastructure
+// (`LazySweepingJobs`, the swap-on-GC double-buffering, the `postpone`d sweep jobs) is part of
+// the *lazy-decrement / concurrent-sweeping* machinery we are deliberately **deferring** for the
+// minimal single-domain RC cut. So here the type is reduced to a trivially-cloneable marker that
+// only carries the two reference-counted `Arc<AtomicUsize>` generations so the `ProcessDecs` /
+// `SweepBlocksAfterDecs` signatures that take/clone it compile unchanged. It performs no
+// callback on drop. When lazy decrements are wired (deferred), restore the reference's Drop +
+// `LazySweepingJobs` registry.
+#[allow(dead_code)]
+pub struct LazySweepingJobsCounter {
+    decs_counter: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[allow(dead_code)]
+impl LazySweepingJobsCounter {
+    /// A fresh counter (no decs generation). Minimal port: self-contained `Arc`s, no registry.
+    pub fn new() -> Self {
+        Self {
+            decs_counter: None,
+            counter: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    /// A counter that also participates in the "decs" generation. Minimal port: same as `new`
+    /// but seeds the `decs_counter` arm so `clone_with_decs` keeps a decs generation alive.
+    pub fn new_decs() -> Self {
+        Self {
+            decs_counter: Some(std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0))),
+            counter: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    /// Clone, sharing the `counter` generation but dropping the decs arm (matches the reference).
+    #[allow(clippy::should_implement_trait)]
+    pub fn clone(&self) -> Self {
+        Self {
+            decs_counter: None,
+            counter: self.counter.clone(),
+        }
+    }
+
+    /// Clone, sharing both generations.
+    pub fn clone_with_decs(&self) -> Self {
+        Self {
+            decs_counter: self.decs_counter.clone(),
+            counter: self.counter.clone(),
+        }
+    }
+}
+
+impl Default for LazySweepingJobsCounter {
+    fn default() -> Self {
+        Self::new()
+    }
+}

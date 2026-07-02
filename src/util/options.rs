@@ -56,6 +56,9 @@ pub enum PlanSelector {
     /// STW-evacuated Immix mature space with an SATB deletion barrier. The faithful
     /// MMTk realization of OCaml 5's collector (ocaml-mmtk RQ7).
     Bactrian,
+    /// LXR: reference counting on a hierarchical Immix heap (P3 — currently a structural
+    /// clone of Immix with `rc_enabled = false`; RC behaviour layered on incrementally).
+    LXR,
 }
 
 /// MMTk option for perf events

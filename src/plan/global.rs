@@ -69,6 +69,7 @@ pub fn create_mutator<VM: VMBinding>(
         PlanSelector::Compressor => {
             crate::plan::compressor::mutator::create_compressor_mutator(tls, mmtk)
         }
+        PlanSelector::LXR => crate::plan::lxr::mutator::create_lxr_mutator(tls, mmtk),
     })
 }
 
@@ -112,6 +113,9 @@ pub fn create_plan<VM: VMBinding>(
         }
         PlanSelector::Compressor => {
             Box::new(crate::plan::compressor::Compressor::new(args)) as Box<dyn Plan<VM = VM>>
+        }
+        PlanSelector::LXR => {
+            Box::new(crate::plan::lxr::LXR::new(args)) as Box<dyn Plan<VM = VM>>
         }
     };
 

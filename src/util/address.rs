@@ -349,6 +349,88 @@ impl Address {
     }
 }
 
+impl Address {
+    // ── LXR field-unlog-bit helpers (P3) ──────────────────────────────────────
+    // Per-field *unlog* bit driven by LXR's coalescing field-logging write barrier
+    // (`BarrierSelector::FieldBarrier`). LOGGED = "this field was already recorded
+    // this epoch" (coalescing: log a field at most once); UNLOGGED is the initial /
+    // cleared state. Vendored from the LXR fork (wenyuzhao/mmtk-core `lxr-v0.32.0`,
+    // `util/address.rs`); inert until the LXR plan wires the barrier. Operates on the
+    // VM-side `GLOBAL_FIELD_UNLOG_BIT_SPEC` (1 bit per pointer-word). `unlog_field_relaxed`
+    // hardcodes 64 heap-bytes/unlog-byte (OCaml has no compressed pointers, so the LXR
+    // `COMPRESSED_PTR_ENABLED` branch is always the 64 case).
+
+    pub fn is_field_logged<VM: VMBinding>(self) -> bool {
+        use crate::vm::ObjectModel;
+        debug_assert!(!self.is_zero());
+        unsafe {
+            VM::VMObjectModel::GLOBAL_FIELD_UNLOG_BIT_SPEC
+                .as_spec()
+                .extract_side_spec()
+                .load::<u8>(self)
+                == crate::plan::barriers::LOGGED_VALUE
+        }
+    }
+
+    pub fn attempt_log_field<VM: VMBinding>(self) -> bool {
+        use crate::vm::ObjectModel;
+        debug_assert!(!self.is_zero());
+        let log_bit = *VM::VMObjectModel::GLOBAL_FIELD_UNLOG_BIT_SPEC
+            .as_spec()
+            .extract_side_spec();
+        loop {
+            let old_value: u8 = log_bit.load_atomic(self, Ordering::SeqCst);
+            if old_value == crate::plan::barriers::LOGGED_VALUE {
+                return false;
+            }
+            if log_bit
+                .compare_exchange_atomic(
+                    self,
+                    crate::plan::barriers::UNLOGGED_VALUE,
+                    crate::plan::barriers::LOGGED_VALUE,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+
+    pub fn log_field<VM: VMBinding>(self) {
+        use crate::vm::ObjectModel;
+        debug_assert!(!self.is_zero());
+        VM::VMObjectModel::GLOBAL_FIELD_UNLOG_BIT_SPEC
+            .as_spec()
+            .extract_side_spec()
+            .store_atomic(self, crate::plan::barriers::LOGGED_VALUE, Ordering::Relaxed)
+    }
+
+    pub fn unlog_field<VM: VMBinding>(self) {
+        use crate::vm::ObjectModel;
+        debug_assert!(!self.is_zero());
+        VM::VMObjectModel::GLOBAL_FIELD_UNLOG_BIT_SPEC
+            .as_spec()
+            .extract_side_spec()
+            .store_atomic(self, crate::plan::barriers::UNLOGGED_VALUE, Ordering::Relaxed)
+    }
+
+    pub fn unlog_field_relaxed<VM: VMBinding>(self) {
+        use crate::vm::ObjectModel;
+        debug_assert!(!self.is_zero());
+        // OCaml has no compressed pointers -> always 64 heap-bytes per unlog byte.
+        let heap_bytes_per_unlog_byte = 64usize;
+        let a = self.align_down(heap_bytes_per_unlog_byte);
+        unsafe {
+            VM::VMObjectModel::GLOBAL_FIELD_UNLOG_BIT_SPEC
+                .as_spec()
+                .extract_side_spec()
+                .store(a, 0xffu8)
+        }
+    }
+}
+
 /// allows print Address as upper-case hex value
 impl fmt::UpperHex for Address {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {

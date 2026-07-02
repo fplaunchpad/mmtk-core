@@ -66,6 +66,13 @@ pub trait Barrier<VM: VMBinding>: 'static + Send + Downcast {
     /// Flush thread-local states like buffers or remembered sets.
     fn flush(&mut self) {}
 
+    /// Drain a TERMINATING mutator's barrier from OUTSIDE a collection (no GC-worker context).
+    /// Default = `flush`. The LXR RC field barrier overrides it (via its semantics) to apply its
+    /// buffered increments synchronously to RC_TABLE instead of scheduling GC work packets.
+    fn flush_terminating(&mut self) {
+        self.flush();
+    }
+
     /// Weak reference loading barrier.  A mutator should call this when loading from a weak
     /// reference field, for example, when executing  `java.lang.ref.Reference.get()` in JVM, or
     /// loading from a global weak table in CRuby.
@@ -175,6 +182,16 @@ pub trait BarrierSemantics: 'static + Send {
     /// Normally this is called by the slow-path implementation whenever the thread-local buffers are full.
     /// This will also be called externally by the VM, when the thread is being destroyed.
     fn flush(&mut self);
+
+    /// Drain a TERMINATING mutator's buffers from OUTSIDE a collection (e.g. an OCaml domain at
+    /// `Domain.join`, with no GC-worker context). The default is just `flush()` — correct for
+    /// barriers whose `flush` does no work-packet scheduling. Barriers that enqueue GC work in
+    /// `flush` (e.g. the LXR RC field barrier, which schedules `ProcessIncs`/`ProcessDecs`) MUST
+    /// override this to apply their buffered effect SYNCHRONOUSLY instead, because there is no
+    /// running collection to drain those packets and they carry raw slots into a dying thread.
+    fn flush_terminating(&mut self) {
+        self.flush();
+    }
 
     /// Slow-path call for object field write operations.
     fn object_reference_write_slow(
@@ -339,6 +356,87 @@ impl<S: BarrierSemantics> Barrier<S::VM> for SATBBarrier<S> {
             self.semantics
                 .object_reference_write_slow(src, slot, target);
         }
+    }
+
+    fn object_reference_write_post(
+        &mut self,
+        _src: ObjectReference,
+        _slot: <S::VM as VMBinding>::VMSlot,
+        _target: Option<ObjectReference>,
+    ) {
+        unimplemented!()
+    }
+
+    fn object_reference_write_slow(
+        &mut self,
+        src: ObjectReference,
+        slot: <S::VM as VMBinding>::VMSlot,
+        target: Option<ObjectReference>,
+    ) {
+        self.semantics
+            .object_reference_write_slow(src, slot, target);
+    }
+
+    fn memory_region_copy_pre(
+        &mut self,
+        src: <S::VM as VMBinding>::VMMemorySlice,
+        dst: <S::VM as VMBinding>::VMMemorySlice,
+    ) {
+        self.semantics.memory_region_copy_slow(src, dst);
+    }
+
+    fn memory_region_copy_post(
+        &mut self,
+        _src: <S::VM as VMBinding>::VMMemorySlice,
+        _dst: <S::VM as VMBinding>::VMMemorySlice,
+    ) {
+        unimplemented!()
+    }
+}
+
+/// LXR field-logging write barrier (P3). A pre-write barrier that delegates every store
+/// to the semantics' slow path; the coalescing "log a field at most once per epoch"
+/// decision lives in the *semantics* (via the per-field unlog bit), so — unlike
+/// `ObjectBarrier`/`SATBBarrier` — this wrapper does NOT gate on the per-object log bit.
+/// Vendored (and trimmed to our base `Barrier`/`BarrierSemantics` signatures) from
+/// wenyuzhao/mmtk-core `lxr-v0.32.0`. Inert until the (P3) LXR plan installs it; no plan
+/// selects `BarrierSelector::FieldBarrier` yet, so the shipping plans stay byte-identical.
+pub struct FieldBarrier<S: BarrierSemantics> {
+    semantics: S,
+}
+
+impl<S: BarrierSemantics> FieldBarrier<S> {
+    /// Create a new FieldBarrier with the given semantics.
+    pub fn new(semantics: S) -> Self {
+        Self { semantics }
+    }
+}
+
+impl<S: BarrierSemantics> Barrier<S::VM> for FieldBarrier<S> {
+    fn flush(&mut self) {
+        self.semantics.flush();
+    }
+
+    fn flush_terminating(&mut self) {
+        self.semantics.flush_terminating();
+    }
+
+    fn load_weak_reference(&mut self, o: ObjectReference) {
+        self.semantics.load_weak_reference(o)
+    }
+
+    fn object_probable_write(&mut self, obj: ObjectReference) {
+        self.semantics.object_probable_write_slow(obj);
+    }
+
+    fn object_reference_write_pre(
+        &mut self,
+        src: ObjectReference,
+        slot: <S::VM as VMBinding>::VMSlot,
+        target: Option<ObjectReference>,
+    ) {
+        self.semantics
+            .object_reference_write_slow(src, slot, target);
     }
 
     fn object_reference_write_post(

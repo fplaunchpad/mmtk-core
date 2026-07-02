@@ -13,7 +13,7 @@
 //!
 //! For more about implementing a plan, it is recommended to read the [MMTk tutorial](/docs/tutorial/Tutorial.md).
 
-mod barriers;
+pub(crate) mod barriers;
 pub use barriers::BarrierSelector;
 
 mod gc_work;
@@ -47,6 +47,9 @@ mod sticky;
 mod compressor;
 mod concurrent;
 mod immix;
+/// LXR — reference counting on a hierarchical Immix heap (P3, minimal single-domain).
+/// `pub(crate)` because the RC machinery is cross-cutting (plan/lxr + policy/immix + LOS).
+pub(crate) mod lxr;
 mod markcompact;
 mod marksweep;
 mod nogc;

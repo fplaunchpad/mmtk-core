@@ -36,6 +36,49 @@ use std::sync::{atomic::AtomicU8, atomic::AtomicUsize, Arc};
 pub(crate) const TRACE_KIND_FAST: TraceKind = 0;
 pub(crate) const TRACE_KIND_DEFRAG: TraceKind = 1;
 
+// ── RC double-free / use-after-free block tracker (MMTK_RC_DEBUG) ──────────────────────────────
+// Tracks the set of blocks currently believed to be on the free list. Freeing a block already in
+// the set is a DOUBLE-FREE (the freelist would hand it out twice -> aliasing -> heap-address
+// SIGSEGV under reallocation pressure, which is exactly the freeing-on / tight-heap crash class).
+// Panics loudly with the block address so the offending sweep is pinpointed. Active only under
+// MMTK_RC_DEBUG; zero cost otherwise.
+static RC_FREE_BLOCKS: std::sync::Mutex<Option<std::collections::HashSet<usize>>> =
+    std::sync::Mutex::new(None);
+
+fn rc_debug_track_free(site: &str, block: Block) {
+    if !crate::plan::lxr::rc::rc_debug_on() {
+        return;
+    }
+    let addr = block.start().as_usize();
+    let end = addr + crate::policy::immix::block::Block::BYTES;
+    // Log the freed block's [start, end) range so a later heap-address SIGSEGV can be matched
+    // against the blocks this pause freed (if the faulting address falls in a freed block's range,
+    // the sweep freed the crashing block -> confirms the UAF + names the block + free site).
+    if std::env::var_os("MMTK_RC_LOG_FREES").is_some() {
+        eprintln!("[RC-FREE] {site}: block [{addr:#x}, {end:#x})");
+    }
+    let mut g = RC_FREE_BLOCKS.lock().unwrap();
+    let set = g.get_or_insert_with(std::collections::HashSet::new);
+    if !set.insert(addr) {
+        panic!(
+            "[RC-DOUBLE-FREE] {site}: block {:#x} freed while already on the free list \
+             (double-free -> aliasing).",
+            addr
+        );
+    }
+}
+
+fn rc_debug_track_alloc(block: Block) {
+    if !crate::plan::lxr::rc::rc_debug_on() {
+        return;
+    }
+    let addr = block.start().as_usize();
+    let mut g = RC_FREE_BLOCKS.lock().unwrap();
+    if let Some(set) = g.as_mut() {
+        set.remove(&addr);
+    }
+}
+
 pub struct ImmixSpace<VM: VMBinding> {
     common: CommonSpace<VM>,
     pr: BlockPageResource<VM, Block>,
@@ -72,6 +115,24 @@ pub struct ImmixSpace<VM: VMBinding> {
     /// lxr P2.D: count of nursery blocks promoted in place this GC. Written only by
     /// the P3 nursery-promotion gc_work; init-only / inert today.
     pub in_place_promoted_nursery_blocks: AtomicUsize,
+    // ── LXR (P3, additive) — RC block-allocation + lazy mature-sweep bookkeeping ──
+    // All inert until the LXR plan runs (`rc_enabled` stays false). Vendored/adapted from
+    // lxr-v0.32.0 immixspace.rs.
+    /// Per-mutator-phase clean/reusable nursery block tracking + nursery sweep.
+    pub block_allocation: crate::policy::immix::block_allocation::BlockAllocation<VM>,
+    /// Mature blocks that *may* have gone fully dead after a batch of decrements (deduplicated by
+    /// the per-block log bit). Drained into `SweepBlocksAfterDecs` packets by
+    /// `schedule_rc_block_sweeping_tasks`.
+    possibly_dead_mature_blocks: crossbeam::queue::SegQueue<(Block, bool)>,
+    /// Clean blocks released this GC, by source (young / mature / lazily). Stats only.
+    pub num_clean_blocks_released_young: AtomicUsize,
+    pub num_clean_blocks_released_mature: AtomicUsize,
+    pub num_clean_blocks_released_lazy: AtomicUsize,
+    /// Bytes the RC copy-allocator handed out this GC (mature evac, deferred). Stats only.
+    pub copy_alloc_bytes: AtomicUsize,
+    /// Lines consumed by mutators reusing partially-free (recycled) blocks this phase. Drives
+    /// `get_mutator_recycled_lines_in_pages`. Written by the reuse allocator path (deferred); 0 today.
+    reused_lines_consumed: AtomicUsize,
 }
 
 /// Some arguments for Immix Space.
@@ -428,6 +489,13 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             rc: crate::util::rc::RefCountHelper::NEW,
             is_end_of_satb_or_full_gc: false,
             in_place_promoted_nursery_blocks: AtomicUsize::new(0),
+            block_allocation: crate::policy::immix::block_allocation::BlockAllocation::new(),
+            possibly_dead_mature_blocks: crossbeam::queue::SegQueue::new(),
+            num_clean_blocks_released_young: AtomicUsize::new(0),
+            num_clean_blocks_released_mature: AtomicUsize::new(0),
+            num_clean_blocks_released_lazy: AtomicUsize::new(0),
+            copy_alloc_bytes: AtomicUsize::new(0),
+            reused_lines_consumed: AtomicUsize::new(0),
             pr: if common.vmrequest.is_discontiguous() {
                 BlockPageResource::new_discontiguous(
                     Block::LOG_PAGES,
@@ -462,6 +530,194 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         self.reusable_blocks.flush_all();
         #[cfg(target_pointer_width = "64")]
         self.pr.flush_all()
+    }
+
+    // ── LXR (P3, additive) — RC block-allocation + lazy mature-sweep support ──────
+    // Inert until the LXR plan runs (`rc_enabled` stays false). Vendored/adapted from
+    // lxr-v0.32.0 immixspace.rs. `block_allocation.rs` (a sibling module) reaches the private
+    // `pr`/`defrag` fields through these `pub(super)`/`pub(crate)` accessors.
+
+    /// The block page resource (private field). Exposed to the `block_allocation` sibling module
+    /// for the bulk nursery release / reset.
+    pub(super) fn block_page_resource(&self) -> &BlockPageResource<VM, Block> {
+        &self.pr
+    }
+
+    /// Notify the defrag bookkeeping that a fresh clean block was handed out. Exposed for the
+    /// `block_allocation` sibling module (the `defrag` field is `pub(super)`).
+    pub(super) fn notify_new_clean_block(&self, copy: bool) {
+        self.defrag.notify_new_clean_block(copy);
+    }
+
+    /// Pages worth of lines mutators consumed by reusing partially-free blocks this phase. Used by
+    /// `block_allocation::total_young_allocation_in_bytes`. Currently 0 (the reuse-allocator path
+    /// that bumps `reused_lines_consumed` is deferred).
+    pub(crate) fn get_mutator_recycled_lines_in_pages(&self) -> usize {
+        debug_assert!(self.rc_enabled);
+        self.reused_lines_consumed.load(Ordering::Relaxed)
+            >> (LOG_BYTES_IN_PAGE - Line::LOG_BYTES as u8)
+    }
+
+    /// Record a mature block that may have died after a batch of decrements. Deduplicated by the
+    /// per-block log bit so a block is only swept once per epoch. Drained by
+    /// `schedule_rc_block_sweeping_tasks`.
+    ///
+    /// Only blocks in a live (allocated) state are recorded: a nursery block is in
+    /// `BlockState::Unallocated` (the RC nursery convention) and is reclaimed by the *nursery* sweep
+    /// (`rc_sweep_nursery_blocks`), which `rc_sweep_mature` would refuse anyway (it returns early on
+    /// `Unallocated`). Excluding nursery blocks here keeps the two sweeps' block sets disjoint, so a
+    /// block is never a candidate for both free paths in the same pause.
+    pub fn add_to_possibly_dead_mature_blocks(&self, block: Block, is_defrag_source: bool) {
+        if block.get_state() == BlockState::Unallocated {
+            return;
+        }
+        if block.log() {
+            self.possibly_dead_mature_blocks
+                .push((block, is_defrag_source));
+        }
+    }
+
+    /// Drain `possibly_dead_mature_blocks` into per-worker `SweepBlocksAfterDecs` packets,
+    /// prioritised into the always-open `Unconstrained` bucket. Vendored from lxr-v0.32.0.
+    pub fn schedule_rc_block_sweeping_tasks(&self, counter: crate::LazySweepingJobsCounter) {
+        let size = self.possibly_dead_mature_blocks.len();
+        let num_bins = self.scheduler().num_workers();
+        let bin_cap = size / num_bins + if size % num_bins == 0 { 0 } else { 1 };
+        let mut bins = (0..num_bins)
+            .map(|_| Vec::with_capacity(bin_cap))
+            .collect::<Vec<Vec<(Block, bool)>>>();
+        'out: for bin in bins.iter_mut() {
+            for _ in 0..bin_cap {
+                if let Some(block) = self.possibly_dead_mature_blocks.pop() {
+                    bin.push(block);
+                } else {
+                    break 'out;
+                }
+            }
+        }
+        let packets: Vec<Box<dyn GCWork<VM>>> = bins
+            .into_iter()
+            .map(|blocks| {
+                Box::new(super::rc_work::SweepBlocksAfterDecs::new(
+                    blocks,
+                    counter.clone(),
+                )) as Box<dyn GCWork<VM>>
+            })
+            .collect();
+        // Plain bulk_add (not bulk_add_prioritized): our base's Unconstrained bucket has no
+        // prioritized queue (the reference's does) — bulk_add_prioritized unwraps None and aborts.
+        self.scheduler().work_buckets[WorkBucketStage::Unconstrained]
+            .bulk_add(packets);
+    }
+
+    /// RC-pause prepare. Minimal cut: only the `Pause::RefCount` path is implemented (reset the
+    /// per-GC block-release / copy counters). The `Pause::Full`/`InitialMark` branches (mature-evac
+    /// selection, mark-state setup) are DEFERRED — they are never reached because the minimal LXR
+    /// plan only ever schedules a `RefCount` pause. Vendored/adapted from lxr-v0.32.0 immixspace.rs.
+    pub fn prepare_rc(&mut self, pause: crate::plan::lxr::Pause) {
+        use crate::plan::lxr::Pause;
+        debug_assert!(
+            pause == Pause::RefCount || pause == Pause::Full,
+            "minimal LXR cut only schedules RefCount + Full (backup-trace) pauses"
+        );
+        self.num_clean_blocks_released_young
+            .store(0, Ordering::SeqCst);
+        self.num_clean_blocks_released_mature
+            .store(0, Ordering::SeqCst);
+        self.num_clean_blocks_released_lazy
+            .store(0, Ordering::SeqCst);
+        self.copy_alloc_bytes.store(0, Ordering::SeqCst);
+        // Full (backup trace): the mark bit is temporarily authoritative over RC for liveness, so
+        // weak-ref / finalizer `is_live`/`is_reachable` queries during this pause AND the trace
+        // result (consult is_marked) — `is_end_of_satb_or_full_gc` enables that read-side. Cleared
+        // in `release_rc`.
+        if pause == Pause::Full {
+            self.is_end_of_satb_or_full_gc = true;
+        }
+    }
+
+    /// Schedule the object-mark-bit zeroing tasks (Full pause prologue) so the backup trace marks
+    /// into a clean table. Fans out one `ChunkMarkZeroing` per chunk batch into `Unconstrained`.
+    pub fn schedule_mark_table_zeroing(&self) {
+        let tasks = self.chunk_map.generate_tasks(|chunk| {
+            Box::new(super::rc_work::ChunkMarkZeroing {
+                chunks: chunk..chunk.next(),
+            })
+        });
+        self.scheduler().work_buckets[WorkBucketStage::Unconstrained].bulk_add(tasks);
+    }
+
+    /// Schedule the dead-cycle sweep (Full pause epilogue): scans all mature blocks and reclaims
+    /// objects that are `rc>0` but were NOT marked by the backup trace (dead cyclic garbage). Fans
+    /// out one `SweepDeadCycles` per chunk batch into `Unconstrained` (runs in the post-decs epilogue).
+    pub fn schedule_dead_cycle_sweep(&self) {
+        let tasks = self.chunk_map.generate_tasks(|chunk| {
+            Box::new(super::rc_work::SweepDeadCycles::<VM>::new(
+                chunk..chunk.next(),
+                crate::LazySweepingJobsCounter::new_decs(),
+            )) as Box<dyn GCWork<VM>>
+        });
+        self.scheduler().work_buckets[WorkBucketStage::Unconstrained].bulk_add(tasks);
+    }
+
+    /// RC-pause release. Minimal cut (`Pause::RefCount`): sweep the unpromoted nursery blocks back
+    /// to the page resource's free list, flush, reset the inc buffer + reused-line counter. The
+    /// post-SATB mature sweeping and lazy-decrement draining are DEFERRED.
+    pub fn release_rc(&mut self, pause: crate::plan::lxr::Pause) {
+        use crate::plan::lxr::Pause;
+        debug_assert!(pause == Pause::RefCount || pause == Pause::Full);
+        if crate::plan::lxr::rc::rc_debug_on() {
+            eprintln!(
+                "[RC-PHASE] release_rc start: incs_total={} promoted={}",
+                crate::plan::lxr::rc::RC_INCS_TOTAL.load(Ordering::Relaxed),
+                crate::plan::lxr::rc::RC_INCS_PROMOTED.load(Ordering::Relaxed),
+            );
+        }
+        // NOTE: the nursery sweep is NOT done here. It is deferred to the post-decrement epilogue
+        // (`RCBlockSweepEpilogue`, after `STWRCDecsAndSweep` drains) so that NO decrement — neither
+        // the prev-root decs nor the field-barrier decs (old overwritten values, which can point at
+        // YOUNG objects) — can read an object whose nursery block we already freed. Freeing nursery
+        // blocks here (in Release, before the decs) was a use-after-free: a dec would dereference a
+        // dangling young object -> SIGSEGV at a heap address.
+        self.flush_page_resource();
+        self.rc.reset_inc_buffer_size();
+        self.is_end_of_satb_or_full_gc = false;
+        self.reused_lines_consumed.store(0, Ordering::Relaxed);
+    }
+
+    /// Sweep the unpromoted nursery blocks handed out this phase. Frees only blocks from the
+    /// `block_allocation` per-phase list (NOT a chunk scan): each was explicitly recorded in
+    /// `initialize_new_clean_block`, so it is provably a real, mapped, this-phase nursery
+    /// allocation. The previous chunk-scan version faulted by touching blocks never handed out as
+    /// nursery allocations (page-resource free-queue blocks, a mid-spawn domain's freshly-acquired
+    /// allocator block whose per-block metadata is not in a sweepable state).
+    ///
+    /// `MMTK_RC_NO_NURSERY_SWEEP` / `MMTK_RC_NO_FREE` keep the list-drain accounting but skip the
+    /// actual freeing (bisect knobs).
+    pub(crate) fn rc_sweep_nursery_blocks(&self) {
+        let no_free = std::env::var_os("MMTK_RC_NO_NURSERY_SWEEP").is_some()
+            || std::env::var_os("MMTK_RC_NO_FREE").is_some();
+        let released = if no_free {
+            // Drain + reset the list/counters but do not free (so the bisect still measures).
+            self.block_allocation.reset_nursery_counters();
+            0
+        } else {
+            self.block_allocation.sweep_nursery_blocks()
+        };
+        if released != 0 {
+            self.num_clean_blocks_released_young
+                .fetch_add(released, Ordering::Relaxed);
+        }
+        if crate::plan::lxr::rc::rc_debug_on() {
+            eprintln!(
+                "[RC-SWEEP] nursery: {released} unpromoted nursery blocks freed{}",
+                if no_free {
+                    " SKIPPED (MMTK_RC_NO_NURSERY_SWEEP/NO_FREE)"
+                } else {
+                    ""
+                }
+            );
+        }
     }
 
     /// Get the number of defrag headroom pages.
@@ -649,7 +905,21 @@ impl<VM: VMBinding> ImmixSpace<VM> {
 
     /// Release a block.
     pub fn release_block(&self, block: Block) {
-        block.deinit();
+        rc_debug_track_free("release_block", block);
+        // RC: `deinit_rc` also clears the in-place-promoted / owner / defrag-source per-block state.
+        if self.rc_enabled {
+            block.deinit_rc(self);
+        } else {
+            block.deinit();
+        }
+        self.pr.release_block(block);
+    }
+
+    /// Push an already-deinitialised block back to the page resource free list (accounting +
+    /// freelist). Used by the RC mature sweep (`Block::rc_sweep_mature`), which has already run
+    /// `deinit_rc` under the per-block lock, so we must NOT deinit again here.
+    pub(crate) fn release_block_to_free_list(&self, block: Block) {
+        rc_debug_track_free("release_block_to_free_list", block);
         self.pr.release_block(block);
     }
 
@@ -664,9 +934,22 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         if block_address.is_zero() {
             return None;
         }
-        self.defrag.notify_new_clean_block(copy);
         let block = Block::from_aligned_address(block_address);
-        block.init(copy);
+        rc_debug_track_alloc(block);
+        if self.rc_enabled {
+            // RC: route through block_allocation so the new block gets its RC tables (mark / field
+            // unlog), nursery-block accounting, and `init_rc`. `cm_enabled = false` (CM deferred).
+            // Ensure block_allocation's `&ImmixSpace` back-pointer is set: the plan-level lazy init
+            // only runs at the first GC, but clean-block allocation happens earlier (mutator startup),
+            // and `initialize_new_clean_block`/`self.space()` would deref a NULL space. `self` here is
+            // the stable (post-boxing) space address; `init` just (idempotently) stores it.
+            self.block_allocation.init(self);
+            self.block_allocation
+                .initialize_new_clean_block(block, copy, false);
+        } else {
+            self.defrag.notify_new_clean_block(copy);
+            block.init(copy);
+        }
         self.chunk_map.set_allocated(block.chunk(), true);
         self.lines_consumed
             .fetch_add(Block::LINES, Ordering::SeqCst);
@@ -676,6 +959,15 @@ impl<VM: VMBinding> ImmixSpace<VM> {
     /// Pop a reusable block from the reusable block list.
     pub fn get_reusable_block(&self, copy: bool) -> Option<Block> {
         if super::BLOCK_ONLY {
+            return None;
+        }
+        // Minimal RC cut: DISABLE partial-block (recycled-line) reuse — always allocate fresh clean
+        // blocks. The RC reuse path (`init_rc(copy, reuse=true)` + `reused_lines_consumed` tracking +
+        // the per-line RC reuse counter) is the most fragile part of the LXR allocator (phase-epoch
+        // asserts, straddle-line bookkeeping on partially-live blocks); deferring it keeps the first
+        // RC bring-up correct. Throughput cost only. Reusable blocks are still populated by the
+        // standard sweep but never handed back out under RC.
+        if self.rc_enabled {
             return None;
         }
         loop {
@@ -918,6 +1210,39 @@ impl<VM: VMBinding> ImmixSpace<VM> {
 
     pub(crate) fn is_marked(&self, object: ObjectReference) -> bool {
         self.is_marked_with(object, self.mark_state)
+    }
+
+    // ── LXR / RC mark helpers (P3.4) ──────────────────────────────────────────
+    // The additive parallel of attempt_mark/unmark for the RC plan: LXR fixes the
+    // mark state to 1 (0->1 / 1->0 fetch_update) rather than CAS-ing against a passed
+    // mark_state, so the other plans keep the existing 2-arg `attempt_mark(object,
+    // mark_state)` unchanged (byte-identical). Vendored from lxr-v0.32.0 immixspace.rs.
+    // Used by the RC trace + cm.rs; `allow(dead_code)` until the LXR plan lands (P3.6).
+
+    /// Atomically mark an object (0 -> 1). Returns true iff this call did the marking.
+    #[allow(dead_code)]
+    pub(crate) fn attempt_mark_rc(&self, object: ObjectReference) -> bool {
+        VM::VMObjectModel::LOCAL_MARK_BIT_SPEC
+            .fetch_update_metadata::<VM, u8, _>(
+                object,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |v| if v != 0 { None } else { Some(1) },
+            )
+            .is_ok()
+    }
+
+    /// Atomically unmark an object (1 -> 0). Returns true iff this call did the unmarking.
+    #[allow(dead_code)]
+    pub(crate) fn unmark_rc(&self, object: ObjectReference) -> bool {
+        VM::VMObjectModel::LOCAL_MARK_BIT_SPEC
+            .fetch_update_metadata::<VM, u8, _>(
+                object,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |v| if v != 1 { None } else { Some(0) },
+            )
+            .is_ok()
     }
 
     /// Check if an object is pinned.

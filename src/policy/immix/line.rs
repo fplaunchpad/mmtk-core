@@ -51,6 +51,18 @@ impl Line {
         Block::from_unaligned_address(self.0)
     }
 
+    /// LXR/RC: the line whose region contains `a` (rounds `a` down to the line boundary).
+    /// Vendored from the LXR fork (`lxr-v0.32.0` line.rs); used by the RC inc/sweep paths.
+    pub fn of(a: Address) -> Self {
+        Self(a.align_down(Self::BYTES))
+    }
+
+    /// LXR/RC: the line containing an object's start.
+    pub fn containing<VM: VMBinding>(object: ObjectReference) -> Self {
+        use crate::vm::ObjectModel;
+        Self(VM::VMObjectModel::ref_to_object_start(object).align_down(Self::BYTES))
+    }
+
     /// Get line index within its containing block.
     pub fn get_index_within_block(&self) -> usize {
         let addr = self.start();

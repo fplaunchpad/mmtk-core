@@ -138,6 +138,12 @@ define_side_metadata_specs!(
     IX_LINE_REUSE_COUNT   = (global: false, log_num_of_bits: 3, log_bytes_in_region: crate::policy::immix::line::Line::LOG_BYTES),
     // Per-page reuse counter for the large object space (LOS_PAGE_REUSE_COUNT).
     LOS_PAGE_REUSE_COUNT   = (global: false, log_num_of_bits: 3, log_bytes_in_region: LOG_BYTES_IN_PAGE as usize),
+    // Per-block "in use" spin-lock bit (LXR's Block::try_lock / unlock) — guards the RC mature
+    // block sweep against a concurrent mutator reusing the block. 1 bit per immix block.
+    BLOCK_IN_USE   = (global: false, log_num_of_bits: 0, log_bytes_in_region: crate::policy::immix::block::Block::LOG_BYTES),
+    // Per-block owner word (LXR's Block::get_owner / set_owner) — the VMThread that owns the
+    // block's local allocation list. Pointer-width word per immix block.
+    BLOCK_OWNER   = (global: false, log_num_of_bits: crate::util::constants::LOG_BITS_IN_ADDRESS, log_bytes_in_region: crate::policy::immix::block::Block::LOG_BYTES),
 );
 
 #[cfg(test)]
