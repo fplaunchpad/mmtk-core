@@ -217,8 +217,21 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
             o.to_raw_address().unlog_field_relaxed::<VM>();
         }
         SlotIterator::<VM>::iterate_fields(o, fake_tls(), |slot| {
-            // Unlog this field (it now belongs to a mature object).
-            slot.to_address().unlog_field_relaxed::<VM>();
+            // Unlog this field (it now belongs to a mature object) — but ONLY if the slot address is
+            // in an MMTk space. A `Cont_tag` object's `iterate_fields` yields fiber-stack slot
+            // addresses (mmap'd/caml_stat_alloc'd, outside MMTk spaces; runtime/fiber.c); their
+            // GLOBAL_FIELD_UNLOG side-metadata page is unmapped, so unlogging them faults (the
+            // chameneos-under-LXR SIGSEGV). Stacks are not field-barrier-tracked, so skipping the
+            // unlog is correct. Same cheap no-deref SFT guard used for objects at :252/:276/:596
+            // (cf. the GH#15 FieldSlot::load re-check).
+            let sa = slot.to_address();
+            if sa.is_mapped()
+                && crate::memory_manager::is_in_mmtk_spaces(unsafe {
+                    ObjectReference::from_raw_address_unchecked(sa)
+                })
+            {
+                sa.unlog_field_relaxed::<VM>();
+            }
             let Some(target) = slot.load() else {
                 return;
             };
@@ -618,7 +631,16 @@ pub(crate) fn lxr_keep_alive_recursive<VM: VMBinding>(lxr: &LXR<VM>, root: Objec
         // Enqueue every pointer child for a recursive keep-alive; unlog each field (it now
         // belongs to a mature object, so the field barrier will not re-log it).
         SlotIterator::<VM>::iterate_fields(o, fake_tls(), |slot| {
-            slot.to_address().unlog_field_relaxed::<VM>();
+            // Skip fiber-stack slots (Cont_tag): outside MMTk spaces, so their UNLOG side-metadata
+            // is unmapped and unlogging faults — see scan_nursery_object above (chameneos SIGSEGV).
+            let sa = slot.to_address();
+            if sa.is_mapped()
+                && crate::memory_manager::is_in_mmtk_spaces(unsafe {
+                    ObjectReference::from_raw_address_unchecked(sa)
+                })
+            {
+                sa.unlog_field_relaxed::<VM>();
+            }
             if let Some(target) = slot.load() {
                 worklist.push(target);
             }
