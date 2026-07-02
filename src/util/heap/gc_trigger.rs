@@ -8,6 +8,7 @@ use crate::util::constants::BYTES_IN_PAGE;
 use crate::util::conversions;
 use crate::util::options::{GCTriggerSelector, Options, DEFAULT_MAX_NURSERY, DEFAULT_MIN_NURSERY};
 use crate::vm::Collection;
+use crate::vm::ObjectModel;
 use crate::vm::VMBinding;
 use crate::MMTK;
 use std::mem::MaybeUninit;
@@ -27,6 +28,13 @@ pub struct GCTrigger<VM: VMBinding> {
     /// Set by mutators to trigger GC.  It is atomic so that mutators can check if GC has already
     /// been requested efficiently in `poll` without acquiring any mutex.
     request_flag: AtomicBool,
+    /// Multiplier applied to a `Bounded` nursery's min/max budget (default 1). Bindings whose
+    /// VM has per-thread/per-domain minor heaps can set this to the live domain/thread count
+    /// (`set_nursery_scale`) so the shared-nursery budget scales like N domain-local nurseries.
+    /// The nursery "size" is only an accounting budget consulted at trigger checks — updating
+    /// this does no eager work (no mapping, no copying); the new budget simply takes effect at
+    /// the next trigger evaluation / collection.
+    nursery_scale: AtomicUsize,
     scheduler: Arc<GCWorkScheduler<VM>>,
     options: Arc<Options>,
     state: Arc<GlobalState>,
@@ -80,9 +88,19 @@ impl<VM: VMBinding> GCTrigger<VM> {
             },
             options,
             request_flag: AtomicBool::new(false),
+            nursery_scale: AtomicUsize::new(1),
             scheduler,
             state,
         }
+    }
+
+    /// Set the nursery budget multiplier (see the `nursery_scale` field). Only affects a
+    /// `Bounded` nursery; `Fixed` and `ProportionalBounded` nurseries are left untouched
+    /// (an explicit pin stays authoritative; a proportional nursery already scales with the
+    /// heap). Takes effect lazily at the next trigger check. `scale` is clamped to >= 1.
+    pub fn set_nursery_scale(&self, scale: usize) {
+        self.nursery_scale
+            .store(scale.max(1), Ordering::Relaxed);
     }
 
     /// Set the plan. This is called in `create_plan()` after we created a boxed plan.
@@ -221,7 +239,25 @@ impl<VM: VMBinding> GCTrigger<VM> {
         use crate::util::options::NurserySize;
         debug_assert!(self.plan().generational().is_some());
         match *self.options.nursery {
-            NurserySize::Bounded { min: _, max } => max,
+            NurserySize::Bounded { min: _, max } => {
+                let scaled = max.saturating_mul(self.nursery_scale.load(Ordering::Relaxed));
+                if self.policy.can_heap_size_grow() {
+                    // Growable (space-overhead/MemBalancer) heap: the trigger adds
+                    // headroom for the scaled budget (see SpaceOverheadTrigger::
+                    // on_gc_end), so the budget itself needs no clamp.
+                    scaled
+                } else {
+                    // Pinned heap (MMTK_HEAP_SIZE_MB): no headroom mechanism — a
+                    // budget that dwarfs the fixed heap would turn every GC into a
+                    // full-heap one via virtual_memory_exhausted(). Cap the SCALED
+                    // portion at a quarter of the heap; never go below the
+                    // unscaled budget (scale=1 behaviour is unchanged).
+                    let quarter_heap = conversions::pages_to_bytes(
+                        self.policy.get_current_heap_size_in_pages(),
+                    ) / 4;
+                    std::cmp::max(max, std::cmp::min(scaled, quarter_heap))
+                }
+            }
             NurserySize::ProportionalBounded { min: _, max } => {
                 let heap_size_bytes =
                     conversions::pages_to_bytes(self.policy.get_current_heap_size_in_pages());
@@ -243,7 +279,9 @@ impl<VM: VMBinding> GCTrigger<VM> {
         use crate::util::options::NurserySize;
         debug_assert!(self.plan().generational().is_some());
         match *self.options.nursery {
-            NurserySize::Bounded { min, max: _ } => min,
+            NurserySize::Bounded { min, max: _ } => {
+                min.saturating_mul(self.nursery_scale.load(Ordering::Relaxed))
+            }
             NurserySize::ProportionalBounded { min, max: _ } => {
                 let min_bytes =
                     conversions::pages_to_bytes(self.policy.get_current_heap_size_in_pages())
@@ -413,7 +451,29 @@ impl<VM: VMBinding> GCTriggerPolicy<VM> for SpaceOverheadTrigger {
         }
         // Size the heap to live × (1 + overhead), clamped to [min, max].
         let live = mmtk.get_plan().get_reserved_pages();
-        let target = ((live as f64) * (1.0 + self.overhead)) as usize;
+        // Per-domain nursery-scaling headroom (stock parity: stock's per-domain
+        // minor arenas sit OUTSIDE the major-heap budget, so total capacity grows
+        // with domain count without stealing mature room). Add the SCALED-UP
+        // portion of the nursery budget — zero at scale=1, so single-domain heap
+        // sizing is unchanged — plus its worst-case copy reserve, so a full
+        // scaled nursery still passes virtual_memory_exhausted() and a minor GC
+        // stays a minor GC (without the copy reserve, a tiny-live-set program
+        // with a scaled budget degenerates to all-full-heap GCs — measured:
+        // par_spectralnorm d=8 went 28 -> 671 fulls).
+        let nursery_headroom_pages = if mmtk.get_plan().generational().is_some() {
+            let effective = mmtk.gc_trigger.get_max_nursery_bytes();
+            let base = match *mmtk.gc_trigger.options.nursery {
+                crate::util::options::NurserySize::Bounded { min: _, max } => max,
+                _ => effective,
+            };
+            let extra = effective.saturating_sub(base) as f64;
+            conversions::bytes_to_pages_up(
+                (extra * (1.0 + VM::VMObjectModel::VM_WORST_CASE_COPY_EXPANSION)) as usize,
+            )
+        } else {
+            0
+        };
+        let target = ((live as f64) * (1.0 + self.overhead)) as usize + nursery_headroom_pages;
         let clamped = target.clamp(self.min_heap_pages, self.max_heap_pages);
         self.current_heap_pages.store(clamped, Ordering::Relaxed);
     }
