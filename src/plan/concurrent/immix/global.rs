@@ -152,6 +152,8 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
             }
             Pause::InitialMark => self.schedule_concurrent_marking_initial_pause(scheduler),
             Pause::FinalMark => self.schedule_concurrent_marking_final_pause(scheduler),
+            // Nursery pauses only exist in generational concurrent plans (Bactrian).
+            Pause::Nursery => unreachable!("ConcurrentImmix has no nursery pause"),
         }
     }
 
@@ -185,6 +187,7 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
                     .schedule_unlog_bits_op(UnlogBitsOperation::BulkSet);
             }
             Pause::FinalMark => (),
+            Pause::Nursery => unreachable!("ConcurrentImmix has no nursery pause"),
         }
     }
 
@@ -213,6 +216,7 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
                     // we will need to clear the unlog bits at an appropriate place.
                 }
             }
+            Pause::Nursery => unreachable!("ConcurrentImmix has no nursery pause"),
         }
     }
 
@@ -283,6 +287,7 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
                 }
                 self.set_concurrent_marking_state(false);
             }
+            Pause::Nursery => unreachable!("ConcurrentImmix has no nursery pause"),
         }
         info!("{:?} start", pause);
     }

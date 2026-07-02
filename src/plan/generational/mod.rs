@@ -28,8 +28,11 @@ pub mod immix;
 
 // Common generational code
 
-pub(super) mod gc_work;
-pub(super) mod global;
+// pub(crate): the Bactrian plan (plan::concurrent::bactrian) reuses the nursery
+// work packets (GenNurseryProcessEdges, ProcessModBuf, ProcessRegionModBuf) and
+// CommonGenPlan from outside the generational module tree.
+pub(crate) mod gc_work;
+pub(crate) mod global;
 
 /// # Barrier overhead measurement:
 ///  - Set `FULL_NURSERY_GC` to `true`.
@@ -71,14 +74,15 @@ const RESERVED_ALLOCATORS: ReservedAllocators = ReservedAllocators {
 };
 
 lazy_static! {
-    static ref ALLOCATOR_MAPPING: EnumMap<AllocationSemantics, AllocatorSelector> = {
+    // pub(crate): also used by the Bactrian plan (plan::concurrent::bactrian).
+    pub(crate) static ref ALLOCATOR_MAPPING: EnumMap<AllocationSemantics, AllocatorSelector> = {
         let mut map = create_allocator_mapping(RESERVED_ALLOCATORS, true);
         map[AllocationSemantics::Default] = AllocatorSelector::BumpPointer(0);
         map
     };
 }
 
-fn create_gen_space_mapping<VM: VMBinding>(
+pub(crate) fn create_gen_space_mapping<VM: VMBinding>(
     plan: &'static dyn Plan<VM = VM>,
     nursery: &'static CopySpace<VM>,
 ) -> Vec<(AllocatorSelector, &'static dyn Space<VM>)> {

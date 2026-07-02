@@ -1,3 +1,4 @@
+pub mod bactrian;
 pub mod barrier;
 pub(super) mod concurrent_marking_work;
 pub(super) mod global;
@@ -22,6 +23,10 @@ pub enum Pause {
     InitialMark,
     /// The pause after concurrent marking.
     FinalMark,
+    /// A nursery collection in a single pause, while a concurrent marking cycle may be
+    /// in progress. Used by generational concurrent plans (Bactrian); the marking state
+    /// is untouched by this pause.
+    Nursery,
 }
 
 unsafe impl bytemuck::ZeroableInOption for Pause {}

@@ -52,6 +52,10 @@ pub enum PlanSelector {
     StickyImmix,
     /// Concurrent non-moving immix using SATB
     ConcurrentImmix,
+    /// Generational concurrent plan: copying nursery + concurrently-marked,
+    /// STW-evacuated Immix mature space with an SATB deletion barrier. The faithful
+    /// MMTk realization of OCaml 5's collector (ocaml-mmtk RQ7).
+    Bactrian,
 }
 
 /// MMTk option for perf events

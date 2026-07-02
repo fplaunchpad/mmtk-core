@@ -59,6 +59,14 @@ impl<VM: VMBinding, P: ConcurrentPlan<VM = VM> + PlanTraceObject<VM>, const KIND
     }
 
     fn trace_object(&mut self, object: ObjectReference) -> ObjectReference {
+        // Generational concurrent plans (Bactrian) exclude their moving nursery from
+        // concurrent marking: young objects are post-snapshot (born after InitialMark
+        // emptied the nursery), so they need no marking, and tracing one here would
+        // copy it outside a pause. Enqueue-side filters keep young references out of
+        // the marking queues; this is the defensive backstop.
+        if self.plan.should_skip_concurrent_trace(object) {
+            return object;
+        }
         let new_object = self
             .plan
             .trace_object::<Self, KIND>(self, object, self.worker());
@@ -81,6 +89,13 @@ impl<VM: VMBinding, P: ConcurrentPlan<VM = VM> + PlanTraceObject<VM>, const KIND
                 let Some(t) = s.load() else {
                     return;
                 };
+
+                // Never enqueue young references: they would dangle across the next
+                // nursery pause (the nursery moves). Sound to skip under SATB — young
+                // objects are all post-snapshot (see ConcurrentPlan::should_skip_concurrent_trace).
+                if self.plan.should_skip_concurrent_trace(t) {
+                    return;
+                }
 
                 self.next_objects.push(t);
                 if self.next_objects.len() > Self::SATB_BUFFER_SIZE {
