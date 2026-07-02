@@ -670,9 +670,12 @@ impl<E: ProcessEdgesWork> GCWork<E::VM> for E {
     fn do_work(&mut self, worker: &mut GCWorker<E::VM>, _mmtk: &'static MMTK<E::VM>) {
         self.set_worker(worker);
         self.process_slots();
-        if !self.nodes.is_empty() {
-            self.flush();
-        }
+        // Always flush: `flush()` no-ops on empty nodes, and a ProcessEdgesWork type
+        // may buffer more than `nodes` (Bactrian's InitialMark trace buffers marking
+        // seeds). Gating the call on `nodes` silently dropped those auxiliary buffers
+        // for packets that traced only non-moving/mature targets (e.g. a remembered-set
+        // packet whose slots all point at mature objects promotes nothing).
+        self.flush();
         #[cfg(feature = "sanity")]
         if self.roots && !_mmtk.is_in_sanity() {
             self.cache_roots_for_sanity_gc();

@@ -188,6 +188,28 @@ impl<VM: VMBinding> ProcessEdgesWork for SanityGCProcessEdges<VM> {
         }
     }
 
+    fn process_slot(&mut self, slot: SlotOf<Self>) {
+        let Some(object) = slot.load() else {
+            return;
+        };
+        // Diagnostic context for the VO-bit check in trace_object: report the slot
+        // (and whether it came from a root packet) so a missed object can be traced
+        // back to its referrer.
+        #[cfg(feature = "vo_bit")]
+        if !crate::util::metadata::vo_bit::is_vo_bit_set(object) {
+            eprintln!(
+                "[sanity] missed object {} referenced from slot {:?} (roots packet: {})",
+                object,
+                slot,
+                self.is_roots()
+            );
+        }
+        let new_object = self.trace_object(object);
+        if Self::OVERWRITE_REFERENCE && new_object != object {
+            slot.store(new_object);
+        }
+    }
+
     fn trace_object(&mut self, object: ObjectReference) -> ObjectReference {
         let mut sanity_checker = self.mmtk().sanity_checker.lock().unwrap();
         if !sanity_checker.refs.contains(&object) {
@@ -218,7 +240,23 @@ impl<VM: VMBinding> ProcessEdgesWork for SanityGCProcessEdges<VM> {
         // bit set when sanity GC starts.
         #[cfg(feature = "vo_bit")]
         if !crate::util::metadata::vo_bit::is_vo_bit_set(object) {
-            panic!("VO bit is not set: {}", object);
+            // Include the owning space + mark/line state to make swept-live
+            // diagnostics actionable (distinguishes "never traced this cycle" from
+            // "copied but VO bit not maintained on the copy path").
+            let space_name = unsafe { crate::mmtk::SFT_MAP.get_unchecked(object.to_raw_address()) }
+                .name()
+                .to_string();
+            let mark = <VM::VMObjectModel as crate::vm::ObjectModel<VM>>::LOCAL_MARK_BIT_SPEC
+                .load_atomic::<VM, u8>(object, None, atomic::Ordering::SeqCst);
+            let line_start = object.to_raw_address().align_down(256);
+            let line_mark = crate::policy::immix::line::Line::MARK_TABLE
+                .load_atomic::<u8>(line_start, atomic::Ordering::SeqCst);
+            let header: usize =
+                unsafe { object.to_raw_address().sub(8).load::<usize>() };
+            panic!(
+                "VO bit is not set: {} (space: {}, mark_bit: {}, line_mark: {}, header: {:#x})",
+                object, space_name, mark, line_mark, header
+            );
         }
 
         object

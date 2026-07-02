@@ -33,6 +33,8 @@ impl<VM: VMBinding, P: ConcurrentPlan<VM = VM> + PlanTraceObject<VM>, const KIND
     const SATB_BUFFER_SIZE: usize = 8192;
 
     pub fn new(objects: Vec<ObjectReference>, mmtk: &'static MMTK<VM>) -> Self {
+        crate::plan::concurrent::diag::ENQUEUED
+            .fetch_add(objects.len(), std::sync::atomic::Ordering::Relaxed);
         let plan = mmtk.get_plan().downcast_ref::<P>().unwrap();
 
         Self {
@@ -65,8 +67,11 @@ impl<VM: VMBinding, P: ConcurrentPlan<VM = VM> + PlanTraceObject<VM>, const KIND
         // copy it outside a pause. Enqueue-side filters keep young references out of
         // the marking queues; this is the defensive backstop.
         if self.plan.should_skip_concurrent_trace(object) {
+            crate::plan::concurrent::diag::SKIPPED_YOUNG
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return object;
         }
+        crate::plan::concurrent::diag::TRACED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let new_object = self
             .plan
             .trace_object::<Self, KIND>(self, object, self.worker());

@@ -7,6 +7,24 @@ pub mod immix;
 
 use bytemuck::NoUninit;
 
+/// Bring-up diagnostics for generational concurrent plans (Bactrian): global counters
+/// of concurrent-marking traffic, printed by the plan when BACTRIAN_TRACE is set.
+pub(crate) mod diag {
+    use std::sync::atomic::AtomicUsize;
+    /// Objects handed to ConcurrentTraceObjects packets (seeds + SATB + recursion).
+    pub static ENQUEUED: AtomicUsize = AtomicUsize::new(0);
+    /// Objects processed by ConcurrentTraceObjects::trace_object.
+    pub static TRACED: AtomicUsize = AtomicUsize::new(0);
+    /// Young references skipped by the concurrent trace.
+    pub static SKIPPED_YOUNG: AtomicUsize = AtomicUsize::new(0);
+    /// InitialMark mark-seed objects pushed.
+    pub static SEEDED: AtomicUsize = AtomicUsize::new(0);
+    /// SATB old values enqueued by the barrier.
+    pub static SATB_ENQ: AtomicUsize = AtomicUsize::new(0);
+    /// SATB old values dropped as young by the barrier.
+    pub static SATB_YOUNG_DROP: AtomicUsize = AtomicUsize::new(0);
+}
+
 /// The pause type for a concurrent GC phase.
 // TODO: This is probably not be general enough for all the concurrent plans.
 // TODO: We could consider moving this to specific plans later.
