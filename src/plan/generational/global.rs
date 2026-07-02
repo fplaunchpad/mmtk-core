@@ -325,7 +325,20 @@ pub trait GenerationalPlanExt<VM: VMBinding>: GenerationalPlan<VM = VM> {
 
 /// Is current GC only collecting objects allocated since last GC? This method can be called
 /// with any plan (generational or not). For non generational plans, it will always return false.
+///
+/// For a generational *concurrent* plan (Bactrian), the cycle-completing pause (`FinalMark`)
+/// is nursery-anchored (`is_current_gc_nursery()` is true — the remembered-set/promotion
+/// machinery relies on that), but it also SWEEPS mature-dead objects over the completed mark
+/// state — so the answer to "is this GC only collecting nursery objects" is NO. Liveness-judging
+/// consumers (FinalizableProcessor, ReferenceProcessor) must process their FULL candidate lists
+/// at that pause: a mature candidate that died during the cycle is freed by the FinalMark sweep,
+/// and skipping it here would leave a dangling entry to be "resurrected" at a later GC
+/// (observed: SIGBUS calling a garbage custom-finalizer pointer). Non-concurrent plans are
+/// unaffected (`concurrent()` is `None`).
 pub fn is_nursery_gc<VM: VMBinding>(plan: &dyn Plan<VM = VM>) -> bool {
     plan.generational()
         .is_some_and(|plan| plan.is_current_gc_nursery())
+        && !plan
+            .concurrent()
+            .is_some_and(|c| c.current_pause_finishes_mark())
 }
