@@ -513,6 +513,22 @@ impl<VM: VMBinding> Bactrian<VM> {
                 // behaviour), isolating the concurrent machinery when debugging.
                 if std::env::var_os("BACTRIAN_NO_CONCURRENT").is_some() {
                     Pause::Full
+                } else if self.immix_space.reserved_pages()
+                    < conc_mark_min_mature_pages()
+                {
+                    // ADAPTIVE MARKING (W-night 2026-08-08, binding SHAPE.md):
+                    // a concurrent marker streaming a small live set through
+                    // the shared LLC while the mutator runs costs more in
+                    // mutator stalls + SATB barrier activity than it saves in
+                    // pause time. Measured on binarytrees-20 (~100 MB live,
+                    // 1 worker): mutator 7.84G -> 6.78G cycles and 14.17G ->
+                    // 13.40G instructions with STW marking, whole-process
+                    // within 3% of stock OCaml. Small live sets mark fast
+                    // enough that the pause is acceptable; large ones (where
+                    // pauses actually hurt) keep the concurrent path.
+                    // MMTK_CONC_MARK_MIN_MATURE_MB tunes the threshold
+                    // (default 256; 0 = always concurrent, the old behaviour).
+                    Pause::Full
                 } else {
                     Pause::InitialMark
                 }
@@ -568,4 +584,20 @@ impl<VM: VMBinding> Bactrian<VM> {
     fn previous_pause(&self) -> Option<Pause> {
         self.previous_pause.load(Ordering::SeqCst)
     }
+}
+
+
+/// Mature-size floor (in pages) below which a requested major cycle is run as
+/// a STW Full GC instead of concurrent marking. See the ADAPTIVE MARKING
+/// comment at the Pause decision. Bactrian-plan-local: no other plan (and not
+/// LXR) consults this.
+fn conc_mark_min_mature_pages() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let mb = std::env::var("MMTK_CONC_MARK_MIN_MATURE_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(256);
+        mb * 1024 * 1024 / crate::util::constants::BYTES_IN_PAGE
+    })
 }
