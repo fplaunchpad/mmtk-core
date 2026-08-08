@@ -23,7 +23,13 @@ fn block_size() -> usize {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|kb| kb.is_power_of_two() && (32..=4096).contains(kb))
-            .unwrap_or(32);
+            // Default 512KB (measured, OCaml binding SHAPE.md round 13): the
+            // 32KB granule's tail-skip phase-locks medium-object placement
+            // (matmul 213-903M LLC-loads vs vanilla's 57M floor, reached at
+            // 512KB) and its refill rate costs every allocating bench 2-10%
+            // of mutator cycles (bt 7.02->6.66G, LU 6.93->6.21G, kb below
+            // vanilla at 3.86G). Upstream default was 32.
+            .unwrap_or(512);
         kb * 1024
     })
 }
