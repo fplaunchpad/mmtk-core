@@ -7,6 +7,7 @@ use crate::plan::generational::global::GenerationalPlanExt;
 use crate::plan::global::PlanTraceObject;
 use crate::plan::VectorObjectQueue;
 use crate::policy::gc_work::TraceKind;
+use crate::policy::space::Space;
 use crate::policy::gc_work::DEFAULT_TRACE;
 use crate::policy::immix::TRACE_KIND_FAST;
 use crate::scheduler::gc_work::PlanProcessEdges;
@@ -165,7 +166,9 @@ impl<VM: VMBinding> ProcessEdgesWork for BactrianNurseryProcessEdges<VM> {
             return;
         };
         let new_object = self.trace_object(object);
-        debug_assert!(!self.plan.is_object_in_nursery(new_object));
+        // With survivor aging, a trace result may legitimately be YOUNG (in the
+        // aged to-space); it must only never remain in the nursery proper.
+        debug_assert!(!self.plan.gen.nursery.in_space(new_object));
         if new_object != object {
             slot.store(new_object);
         }

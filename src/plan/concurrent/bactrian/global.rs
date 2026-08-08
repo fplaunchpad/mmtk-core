@@ -11,6 +11,7 @@ use crate::plan::global::CreateSpecificPlanArgs;
 use crate::plan::AllocationSemantics;
 use crate::plan::Plan;
 use crate::plan::PlanConstraints;
+use crate::policy::copyspace::CopySpace;
 use crate::policy::gc_work::TraceKind;
 use crate::policy::immix::defrag::StatsForDefrag;
 use crate::policy::immix::ImmixSpace;
@@ -52,6 +53,28 @@ pub struct Bactrian<VM: VMBinding> {
     #[space]
     #[copy_semantics(CopySemantics::Mature)]
     pub immix_space: ImmixSpace<VM>,
+    /// Survivor-aging semispace pair (MMTK_NURSERY_AGE >= 1): nursery survivors
+    /// of a plain minor are copied here (staying YOUNG — one extra minor to die)
+    /// instead of being promoted; the pair flips each aging minor and the old
+    /// to-space's residents (age 1) promote to mature. Both spaces are part of
+    /// the young generation for every barrier/SATB/marking young-check (see
+    /// is_object_in_nursery). Empty and inert when aging is off (the default).
+    /// Full-heap traces evacuate them to mature via the derive attribute below.
+    #[space]
+    #[copy_semantics(CopySemantics::PromoteToMature)]
+    pub aged0: CopySpace<VM>,
+    #[space]
+    #[copy_semantics(CopySemantics::PromoteToMature)]
+    pub aged1: CopySpace<VM>,
+    /// Which aged space is the current to-space (mirrors GenCopy's `hi`).
+    aged_hi: AtomicBool,
+    /// Latched per pause in prepare(): true only for a plain Nursery pause with
+    /// aging enabled and no concurrent marking active. Aging MUST be off in any
+    /// marking-fused pause and during marking: the SATB barrier skips young
+    /// objects, which is sound only because no young object survives a marking
+    /// snapshot — a survivor kept young across the snapshot could hold the only
+    /// (unlogged) edge to a mature object and the marker would miss it.
+    aging_this_gc: AtomicBool,
     /// Whether the last GC was a defrag GC for the immix space.
     last_gc_was_defrag: AtomicBool,
     current_pause: Atomic<Option<Pause>>,
@@ -94,11 +117,25 @@ impl<VM: VMBinding> Plan for Bactrian<VM> {
             copy_mapping: enum_map! {
                 CopySemantics::PromoteToMature => CopySelector::ImmixHybrid(0),
                 CopySemantics::Mature => CopySelector::ImmixHybrid(0),
+                // Young-to-young survivor copies (aging minors only).
+                CopySemantics::Nursery => CopySelector::CopySpace(0),
                 _ => CopySelector::Unused,
             },
-            space_mapping: vec![(CopySelector::ImmixHybrid(0), &self.immix_space)],
+            space_mapping: vec![
+                (CopySelector::ImmixHybrid(0), &self.immix_space),
+                // Rebound to the current aged to-space in prepare_worker.
+                (CopySelector::CopySpace(0), &self.aged0),
+            ],
             constraints: &BACTRIAN_CONSTRAINTS,
         }
+    }
+
+    fn prepare_worker(&self, worker: &mut GCWorker<Self::VM>) {
+        // Keep the CopySpace copy context bound to the current aged to-space
+        // (GenCopy's rebind pattern); harmless when aging is off — the
+        // CopySemantics::Nursery mapping is simply never exercised.
+        unsafe { worker.get_copy_context_mut().copy[0].assume_init_mut() }
+            .rebind(self.aged_to());
     }
 
     fn collection_required(&self, space_full: bool, space: Option<SpaceStats<Self::VM>>) -> bool
@@ -166,6 +203,10 @@ impl<VM: VMBinding> Plan for Bactrian<VM> {
                     Some(StatsForDefrag::new(self)),
                     UnlogBitsOperation::BulkClear,
                 );
+                // Whole young generation (incl. aged survivors) evacuates to
+                // mature at a Full pause.
+                self.aging_this_gc.store(false, Ordering::SeqCst);
+                self.prepare_aged_all_from();
             }
             Pause::InitialMark => {
                 // A nursery collection fused with the start of a marking cycle. The
@@ -194,10 +235,37 @@ impl<VM: VMBinding> Plan for Bactrian<VM> {
                 // FinalMark sweep. (ConcurrentImmix flips this at end_of_gc, but it
                 // has no in-pause promotions.)
                 self.set_concurrent_marking_state(true);
+                // No aging in a marking-fused pause (see aging_this_gc docs):
+                // the whole young generation promotes so the snapshot holds.
+                self.aging_this_gc.store(false, Ordering::SeqCst);
+                self.prepare_aged_all_from();
             }
             Pause::Nursery => {
                 // Plain minor collection (GenImmix's nursery prepare).
                 self.gen.prepare(tls);
+                let aging = nursery_age() >= 1 && !self.concurrent_marking_in_progress();
+                self.aging_this_gc.store(aging, Ordering::SeqCst);
+                if aging {
+                    // Flip: last aging minor's to-space (age-1 survivors)
+                    // becomes this minor's from-space and promotes to mature;
+                    // this minor's nursery survivors copy young into the new
+                    // to-space.
+                    self.aged_hi
+                        .store(!self.aged_hi.load(Ordering::SeqCst), Ordering::SeqCst);
+                    let hi = self.aged_hi.load(Ordering::SeqCst);
+                    self.aged0.prepare(hi);
+                    self.aged1.prepare(!hi);
+                    self.gen
+                        .nursery
+                        .set_copy_for_sft_trace(Some(CopySemantics::Nursery));
+                    self.aged_from_mut()
+                        .set_copy_for_sft_trace(Some(CopySemantics::PromoteToMature));
+                    self.aged_to_mut().set_copy_for_sft_trace(None);
+                } else {
+                    // Aging off (or marking active): evacuate any aged residue
+                    // to mature alongside the nursery, exactly as before.
+                    self.prepare_aged_all_from();
+                }
             }
             Pause::FinalMark => {
                 // A nursery collection that completes the marking cycle. Only the
@@ -207,6 +275,8 @@ impl<VM: VMBinding> Plan for Bactrian<VM> {
                 self.gen
                     .nursery
                     .set_copy_for_sft_trace(Some(CopySemantics::PromoteToMature));
+                self.aging_this_gc.store(false, Ordering::SeqCst);
+                self.prepare_aged_all_from();
             }
         }
     }
@@ -218,12 +288,28 @@ impl<VM: VMBinding> Plan for Bactrian<VM> {
                 self.gen.release(tls);
                 // Unlog bits were reconstructed during tracing; keep them.
                 self.immix_space.release(true, UnlogBitsOperation::NoOp);
+                self.aged0.release();
+                self.aged1.release();
             }
-            Pause::InitialMark | Pause::Nursery => {
+            Pause::InitialMark => {
                 // Minor collection: release the nursery (and common spaces at nursery
-                // level). The mature space is untouched — for InitialMark its sweep
-                // happens at FinalMark, after marking completes.
+                // level). The mature space is untouched — its sweep happens at
+                // FinalMark, after marking completes. Both aged spaces were
+                // from-spaces (whole young gen promoted for the snapshot).
                 self.gen.release(tls);
+                self.aged0.release();
+                self.aged1.release();
+            }
+            Pause::Nursery => {
+                self.gen.release(tls);
+                if self.aging_this_gc.load(Ordering::SeqCst) {
+                    // Only the from side was evacuated; the to side holds this
+                    // minor's still-young survivors.
+                    self.aged_from_mut().release();
+                } else {
+                    self.aged0.release();
+                    self.aged1.release();
+                }
             }
             Pause::FinalMark => {
                 // Nursery release + mature/common sweep over the completed mark state.
@@ -233,6 +319,8 @@ impl<VM: VMBinding> Plan for Bactrian<VM> {
                 self.gen.nursery.release();
                 self.gen.common.release(tls, true);
                 self.immix_space.release(true, UnlogBitsOperation::NoOp);
+                self.aged0.release();
+                self.aged1.release();
             }
         }
     }
@@ -274,11 +362,19 @@ impl<VM: VMBinding> Plan for Bactrian<VM> {
     }
 
     fn get_collection_reserved_pages(&self) -> usize {
-        self.gen.get_collection_reserved_pages() + self.immix_space.defrag_headroom_pages()
+        // Aged residents will be copied (to mature) at the next collection;
+        // reserve for them like the nursery's own copy reserve.
+        self.gen.get_collection_reserved_pages()
+            + self.aged0.reserved_pages()
+            + self.aged1.reserved_pages()
+            + self.immix_space.defrag_headroom_pages()
     }
 
     fn get_used_pages(&self) -> usize {
-        self.gen.get_used_pages() + self.immix_space.reserved_pages()
+        self.gen.get_used_pages()
+            + self.aged0.reserved_pages()
+            + self.aged1.reserved_pages()
+            + self.immix_space.reserved_pages()
     }
 
     /// Return the number of pages available for allocation. Assuming all future
@@ -345,11 +441,17 @@ impl<VM: VMBinding> GenerationalPlan for Bactrian<VM> {
     }
 
     fn is_object_in_nursery(&self, object: ObjectReference) -> bool {
+        // The aged pair is part of the YOUNG generation: every barrier, SATB
+        // young-drop, and concurrent-marking skip routes through this check.
         self.gen.nursery.in_space(object)
+            || self.aged0.in_space(object)
+            || self.aged1.in_space(object)
     }
 
     fn is_address_in_nursery(&self, addr: Address) -> bool {
         self.gen.nursery.address_in_space(addr)
+            || self.aged0.address_in_space(addr)
+            || self.aged1.address_in_space(addr)
     }
 
     fn get_mature_physical_pages_available(&self) -> usize {
@@ -362,6 +464,10 @@ impl<VM: VMBinding> GenerationalPlan for Bactrian<VM> {
 
     fn force_full_heap_collection(&self) {
         self.gen.force_full_heap_collection()
+    }
+
+    fn nursery_keeps_movable_survivors(&self) -> bool {
+        self.aging_this_gc.load(Ordering::SeqCst)
     }
 
     /// For Bactrian, a "full heap collection" in the generational sense is any pause
@@ -385,8 +491,47 @@ impl<VM: VMBinding> crate::plan::generational::global::GenerationalPlanExt<VM> f
         object: ObjectReference,
         worker: &mut GCWorker<VM>,
     ) -> ObjectReference {
-        self.gen
-            .trace_object_nursery::<Q, KIND>(queue, object, worker)
+        assert!(
+            KIND != crate::policy::gc_work::TRACE_KIND_TRANSITIVE_PIN,
+            "A copying nursery cannot pin objects"
+        );
+        // Nursery proper: survivors stay YOUNG (copy to the aged to-space) on
+        // an aging minor, else promote to mature as before.
+        if self.gen.nursery.in_space(object) {
+            let semantics = if self.aging_this_gc.load(Ordering::Relaxed) {
+                CopySemantics::Nursery
+            } else {
+                CopySemantics::PromoteToMature
+            };
+            return self
+                .gen
+                .nursery
+                .trace_object::<Q>(queue, object, Some(semantics), worker);
+        }
+        // Aged pair: from-space residents (age 1) promote to mature; to-space
+        // objects were copied this GC and CopySpace::trace_object returns them
+        // unchanged (its !is_from_space early exit).
+        if self.aged0.in_space(object) {
+            return self.aged0.trace_object::<Q>(
+                queue,
+                object,
+                Some(CopySemantics::PromoteToMature),
+                worker,
+            );
+        }
+        if self.aged1.in_space(object) {
+            return self.aged1.trace_object::<Q>(
+                queue,
+                object,
+                Some(CopySemantics::PromoteToMature),
+                worker,
+            );
+        }
+        // Large objects allocated young live in the LOS.
+        if self.gen.common.get_los().in_space(object) {
+            return self.gen.common.get_los().trace_object::<Q>(queue, object);
+        }
+        object
     }
 }
 
@@ -439,9 +584,22 @@ impl<VM: VMBinding> Bactrian<VM> {
         scheduler.work_buckets[WorkBucketStage::FinalizableForwarding].set_enabled(false);
         scheduler.work_buckets[WorkBucketStage::Compact].set_enabled(false);
 
+        let aged0 = CopySpace::new(
+            plan_args.get_nursery_space_args("aged0", true, false, VMRequest::discontiguous()),
+            false,
+        );
+        let aged1 = CopySpace::new(
+            plan_args.get_nursery_space_args("aged1", true, false, VMRequest::discontiguous()),
+            true,
+        );
+
         let bactrian = Bactrian {
             gen: CommonGenPlan::new(plan_args),
             immix_space,
+            aged0,
+            aged1,
+            aged_hi: AtomicBool::new(false),
+            aging_this_gc: AtomicBool::new(false),
             last_gc_was_defrag: AtomicBool::new(false),
             current_pause: Atomic::new(None),
             previous_pause: Atomic::new(None),
@@ -586,6 +744,57 @@ impl<VM: VMBinding> Bactrian<VM> {
     }
 }
 
+
+impl<VM: VMBinding> Bactrian<VM> {
+    fn aged_to(&self) -> &CopySpace<VM> {
+        if self.aged_hi.load(Ordering::SeqCst) {
+            &self.aged1
+        } else {
+            &self.aged0
+        }
+    }
+
+    fn aged_from_mut(&mut self) -> &mut CopySpace<VM> {
+        if self.aged_hi.load(Ordering::SeqCst) {
+            &mut self.aged0
+        } else {
+            &mut self.aged1
+        }
+    }
+
+    fn aged_to_mut(&mut self) -> &mut CopySpace<VM> {
+        if self.aged_hi.load(Ordering::SeqCst) {
+            &mut self.aged1
+        } else {
+            &mut self.aged0
+        }
+    }
+
+    /// Both aged spaces become from-spaces (their residents evacuate to mature
+    /// through the nursery/full trace). Used by every non-aging pause.
+    fn prepare_aged_all_from(&mut self) {
+        self.aged0.prepare(true);
+        self.aged1.prepare(true);
+        self.aged0
+            .set_copy_for_sft_trace(Some(CopySemantics::PromoteToMature));
+        self.aged1
+            .set_copy_for_sft_trace(Some(CopySemantics::PromoteToMature));
+    }
+}
+
+/// MMTK_NURSERY_AGE: >= 1 enables survivor aging (one extra minor to die before
+/// promotion — the semispace pair gives exactly one age step today; values > 1
+/// are accepted but behave as 1 until per-object age bits exist). Default 0
+/// (off): behaviour is identical to the pre-aging plan.
+fn nursery_age() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("MMTK_NURSERY_AGE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0)
+    })
+}
 
 /// Mature-size floor (in pages) below which a requested major cycle is run as
 /// a STW Full GC instead of concurrent marking. See the ADAPTIVE MARKING

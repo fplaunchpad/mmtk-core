@@ -41,8 +41,23 @@ impl<F: Finalizable> FinalizableProcessor<F> {
         finalizable.keep_alive::<E>(e);
     }
 
-    pub fn scan<E: ProcessEdgesWork>(&mut self, tls: VMWorkerThread, e: &mut E, nursery: bool) {
-        let start = if nursery { self.nursery_index } else { 0 };
+    pub fn scan<E: ProcessEdgesWork>(
+        &mut self,
+        tls: VMWorkerThread,
+        e: &mut E,
+        nursery: bool,
+        // Set when the plan's nursery GC may keep live young objects young
+        // (survivor aging): previously-scanned candidates can then MOVE again
+        // at a later minor, so the nursery_index skip is unsound — rescan all,
+        // but judge only YOUNG candidates (a mature candidate's liveness bits
+        // are stale at a minor; it cannot move at one either — keep it as-is).
+        young: Option<&dyn Fn(ObjectReference) -> bool>,
+    ) {
+        let start = if nursery && young.is_none() {
+            self.nursery_index
+        } else {
+            0
+        };
 
         // We should go through ready_for_finalize objects and keep them alive.
         // Unlike candidates, those objects are known to be alive. This means
@@ -54,6 +69,11 @@ impl<F: Finalizable> FinalizableProcessor<F> {
         for mut f in self.candidates.drain(start..).collect::<Vec<F>>() {
             let reff = f.get_reference();
             trace!("Pop {:?} for finalization", reff);
+            if nursery && young.map_or(false, |is_young| !is_young(reff)) {
+                // Aging minor, mature candidate: untraced this GC — keep.
+                self.candidates.push(f);
+                continue;
+            }
             if reff.is_live() {
                 FinalizableProcessor::<F>::forward_finalizable_reference(e, &mut f);
                 trace!("{:?} is live, push {:?} back to candidates", reff, f);
@@ -162,7 +182,23 @@ impl<E: ProcessEdgesWork> GCWork<E::VM> for Finalization<E> {
 
         let mut w = E::new(vec![], false, mmtk, WorkBucketStage::FinalRefClosure);
         w.set_worker(worker);
-        finalizable_processor.scan(worker.tls, &mut w, is_nursery_gc(mmtk.get_plan()));
+        let nursery = is_nursery_gc(mmtk.get_plan());
+        let aging = nursery
+            && mmtk
+                .get_plan()
+                .generational()
+                .map_or(false, |g| g.nursery_keeps_movable_survivors());
+        let is_young = |o: crate::util::ObjectReference| {
+            mmtk.get_plan()
+                .generational()
+                .map_or(false, |g| g.is_object_in_nursery(o))
+        };
+        finalizable_processor.scan(
+            worker.tls,
+            &mut w,
+            nursery,
+            if aging { Some(&is_young) } else { None },
+        );
 
         let num_candidates_end = finalizable_processor.candidates.len();
         let num_ready_for_finalize_end = finalizable_processor.ready_for_finalize.len();

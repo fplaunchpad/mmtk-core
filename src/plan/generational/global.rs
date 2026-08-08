@@ -307,6 +307,16 @@ pub trait GenerationalPlan: Plan {
 
     /// Force the next collection to be full heap.
     fn force_full_heap_collection(&self);
+
+    /// True while the CURRENT nursery GC may leave live young objects behind
+    /// (moved but still young — e.g. survivor aging), so "survived a minor"
+    /// no longer implies "mature and immobile at the next minor". Machinery
+    /// that skips previously-scanned entries on nursery GCs (e.g. the
+    /// finalizable processor's nursery_index) must rescan under this mode.
+    /// Default false: every stock generational plan promotes all survivors.
+    fn nursery_keeps_movable_survivors(&self) -> bool {
+        false
+    }
 }
 
 /// This trait is the extension trait for [`GenerationalPlan`] (see Rust's extension trait pattern).
