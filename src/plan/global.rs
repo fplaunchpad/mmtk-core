@@ -849,7 +849,13 @@ impl<VM: VMBinding> CommonPlan<VM> {
             if #[cfg(feature = "immortal_as_nonmoving")] {
                 self.nonmoving.release();
             } else if #[cfg(feature = "marksweep_as_nonmoving")] {
-                self.nonmoving.prepare(_full_heap);
+                // Upstream 0.32 bug: this called `self.nonmoving.prepare(..)`
+                // (a copy-paste of prepare_nonmoving_space), so the
+                // pending_release_packets counter was never armed and every
+                // mutator's FreeListAllocator::release underflowed it at the
+                // first GC (epilogue assert). Call the actual release, which
+                // arms the counter and schedules ReleaseMarkSweepSpace.
+                self.nonmoving.release();
             } else {
                 self.nonmoving.release(_full_heap, UnlogBitsOperation::NoOp);
             }
