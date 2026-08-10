@@ -586,6 +586,12 @@ impl SideMetadataSpec {
     /// Store the given value to the side metadata for the given address.
     /// This method has similar semantics to `store` in Rust atomics.
     pub fn store_atomic<T: MetadataValue>(&self, data_addr: Address, metadata: T, order: Ordering) {
+        // UP-trace: a single tracer in a stopped world needs no atomicity
+        // (see util::up_trace); the plain twin also skips the RMW for
+        // sub-byte specs' fetch_update loop.
+        if crate::util::up_trace::up() {
+            return unsafe { self.store(data_addr, metadata) };
+        }
         self.side_metadata_access::<true, T, _, _, _>(
             data_addr,
             Some(metadata),
@@ -731,6 +737,16 @@ impl SideMetadataSpec {
         success_order: Ordering,
         failure_order: Ordering,
     ) -> std::result::Result<T, T> {
+        // UP-trace: plain read-compare-write (single tracer; see util::up_trace).
+        if crate::util::up_trace::up() {
+            let old = unsafe { self.load::<T>(data_addr) };
+            return if old == old_metadata {
+                unsafe { self.store(data_addr, new_metadata) };
+                Ok(old)
+            } else {
+                Err(old)
+            };
+        }
         self.side_metadata_access::<true, T, _, _, _>(
             data_addr,
             Some(new_metadata),
@@ -920,6 +936,12 @@ impl SideMetadataSpec {
         val: T,
         order: Ordering,
     ) -> T {
+        // UP-trace: plain load-or-store (single tracer; see util::up_trace).
+        if crate::util::up_trace::up() {
+            let old = unsafe { self.load::<T>(data_addr) };
+            unsafe { self.store(data_addr, old.bitor(val)) };
+            return old;
+        }
         self.side_metadata_access::<true, T, _, _, _>(
             data_addr,
             Some(val),
