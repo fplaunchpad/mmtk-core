@@ -36,6 +36,8 @@ pub mod metadata;
 pub mod opaque_pointer;
 /// MMTk command line options.
 pub mod options;
+/// Single-tracer plain-operation trace mode (see module docs).
+pub mod up_trace;
 #[cfg(feature = "test_private")]
 pub mod test_private;
 /// Test utilities. We need this module for `MockVM` in criterion benches, which does not include code with `cfg(test)`.

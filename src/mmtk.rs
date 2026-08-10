@@ -134,6 +134,12 @@ unsafe impl<VM: VMBinding> Sync for MMTK<VM> {}
 unsafe impl<VM: VMBinding> Send for MMTK<VM> {}
 
 impl<VM: VMBinding> MMTK<VM> {
+    /// Number of GC worker threads (fork addition: lets VM bindings gate
+    /// single-tracer fast paths — see util::up_trace).
+    pub fn worker_count(&self) -> usize {
+        self.scheduler.num_workers()
+    }
+
     /// Create an MMTK instance. This is not public. Bindings should use [`MMTKBuilder::build`].
     pub(crate) fn new(options: Arc<Options>) -> Self {
         // Verify the Mmapper can handle the required address space size.

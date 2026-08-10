@@ -21,6 +21,13 @@ const FORWARDING_POINTER_MASK: usize = 0xffff_fffc;
 /// Attempt to become the worker thread who will forward the object.
 /// The successful worker will set the object forwarding bits to BEING_FORWARDED, preventing other workers from forwarding the same object.
 pub fn attempt_to_forward<VM: VMBinding>(object: ObjectReference) -> u8 {
+    // UP-trace: a single tracer cannot race itself — the claim CAS and the
+    // BEING_FORWARDED intermediate state exist only to exclude other workers.
+    // Return the current status; NOT_TRIGGERED sends the caller straight to
+    // forward_object (which under UP writes the final state plainly).
+    if crate::util::up_trace::up() {
+        return get_forwarding_status::<VM>(object);
+    }
     loop {
         let old_value = get_forwarding_status::<VM>(object);
         if old_value != FORWARDING_NOT_TRIGGERED_YET
@@ -98,12 +105,20 @@ pub fn forward_object<VM: VMBinding>(
 ) -> ObjectReference {
     let new_object = VM::VMObjectModel::copy(object, semantics, copy_context);
     on_after_forwarding(new_object);
+    // UP-trace: SeqCst stores compile to locked XCHG on x86; with a single
+    // tracer Relaxed (a plain MOV) is sufficient — the pause-ending barrier
+    // publishes before any other thread can look.
+    let ord = if crate::util::up_trace::up() {
+        Ordering::Relaxed
+    } else {
+        Ordering::SeqCst
+    };
     if let Some(shift) = forwarding_bits_offset_in_forwarding_pointer::<VM>() {
         VM::VMObjectModel::LOCAL_FORWARDING_POINTER_SPEC.store_atomic::<VM, usize>(
             object,
             new_object.to_raw_address().as_usize() | ((FORWARDED as usize) << shift),
             None,
-            Ordering::SeqCst,
+            ord,
         )
     } else {
         write_forwarding_pointer::<VM>(object, new_object);
@@ -111,7 +126,7 @@ pub fn forward_object<VM: VMBinding>(
             object,
             FORWARDED,
             None,
-            Ordering::SeqCst,
+            ord,
         );
     }
     new_object
