@@ -29,6 +29,18 @@ pub struct BlockPageResource<VM: VMBinding, B: Region + 'static> {
     sync: Mutex<()>,
 }
 
+/// Whether freed blocks return their pages to the OS (see release_block).
+/// Read once; MMTK_RELEASE_FREED_PAGES=0 disables.
+#[cfg(target_os = "linux")]
+fn release_freed_pages() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("MMTK_RELEASE_FREED_PAGES")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
+
 impl<VM: VMBinding, B: Region> PageResource<VM> for BlockPageResource<VM, B> {
     fn common(&self) -> &CommonPageResource {
         self.flpr.common()
@@ -170,6 +182,26 @@ impl<VM: VMBinding, B: Region> BlockPageResource<VM, B> {
         let pages = 1 << Self::LOG_PAGES;
         debug_assert!(pages as usize <= self.common().accounting.get_committed_pages());
         self.common().accounting.release(pages as _);
+        // Return the block's pages to the OS (MADV_DONTNEED: immediate RSS
+        // drop, deterministic for measurement). Rationale (OCaml binding,
+        // SHAPE.md addendum 9): the Immix mature space retained its high-water
+        // residency forever — 96MB resident against ~35MB live on
+        // binarytrees — because freed blocks kept their pages. Cost: a
+        // refault + zeroed page on reacquisition, paid by the GC worker on
+        // promotion copies (bounded by promotion volume; the copy writes the
+        // whole page anyway). The nursery is unaffected by construction (it
+        // uses MonotonePageResource). MMTK_RELEASE_FREED_PAGES=0 opts out
+        // (recommended for RC/LXR-style per-object block churn).
+        #[cfg(target_os = "linux")]
+        if release_freed_pages() {
+            unsafe {
+                libc::madvise(
+                    block.start().to_mut_ptr(),
+                    (pages as usize) << crate::util::constants::LOG_BYTES_IN_PAGE,
+                    libc::MADV_DONTNEED,
+                );
+            }
+        }
         self.block_queue.push(block)
     }
 
