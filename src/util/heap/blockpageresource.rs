@@ -35,9 +35,14 @@ pub struct BlockPageResource<VM: VMBinding, B: Region + 'static> {
 fn release_freed_pages() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
+        // Default OFF: measured +0.9% whole-process cycles on binarytrees
+        // for a -4-5% mean-RSS win (OCaml binding, addendum 9 follow-up) —
+        // and the D4 gap is nursery-residency-dominated anyway. Opt in with
+        // MMTK_RELEASE_FREED_PAGES=1 when footprint matters more than the
+        // last percent of throughput.
         std::env::var("MMTK_RELEASE_FREED_PAGES")
-            .map(|v| v != "0")
-            .unwrap_or(true)
+            .map(|v| v == "1")
+            .unwrap_or(false)
     })
 }
 
