@@ -1022,64 +1022,6 @@ impl<VM: VMBinding, P: PlanTraceObject<VM> + Plan<VM = VM>, const KIND: TraceKin
             slot.store(new_object);
         }
     }
-
-    fn flush(&mut self) {
-        // UP direct-trace closure: with a single tracer inside a stopped-world
-        // pause, consume the whole transitive closure inside THIS packet with
-        // an explicit work list instead of bouncing every generation of the
-        // BFS through packet creation and bucket scheduling. Per object this
-        // performs exactly the packet path's protocol (support_slot_enqueuing
-        // -> scan_object -> plan.post_scan_object -> process each slot), so
-        // trace semantics and scan-time line marking are identical; only the
-        // scheduling round-trips go away. Gated off when live-bytes stats are
-        // requested (the packet path accounts them) and for objects that do
-        // not support slot enqueuing (never the case for the OCaml binding —
-        // such objects fall back to a scan packet below).
-        if crate::util::up_trace::up() && !*self.base.mmtk().get_options().count_live_bytes_in_gc {
-            use crate::vm::Scanning;
-            let tls = self.worker().tls;
-            let mut scratch: Vec<SlotOf<Self>> = Vec::new();
-            let mut deferred: Vec<ObjectReference> = Vec::new();
-            loop {
-                let nodes = self.pop_nodes();
-                if nodes.is_empty() {
-                    break;
-                }
-                for object in nodes {
-                    if !<VM as VMBinding>::VMScanning::support_slot_enqueuing(tls, object) {
-                        deferred.push(object);
-                        continue;
-                    }
-                    {
-                        let mut collector = ScratchSlotCollector(&mut scratch);
-                        <VM as VMBinding>::VMScanning::scan_object(tls, object, &mut collector);
-                    }
-                    self.plan.post_scan_object(object);
-                    for i in 0..scratch.len() {
-                        self.process_slot(scratch[i]);
-                    }
-                    scratch.clear();
-                }
-            }
-            for object in deferred {
-                self.base.nodes.enqueue(object);
-            }
-        }
-        // Default flush behaviour: hand accumulated nodes to a scan-objects packet.
-        let nodes = self.pop_nodes();
-        if !nodes.is_empty() {
-            self.start_or_dispatch_scan_work(self.create_scan_work(nodes));
-        }
-    }
-}
-
-/// Slot visitor that collects slots into a scratch buffer, for the UP
-/// direct-trace drain in [`PlanProcessEdges::flush`].
-pub(crate) struct ScratchSlotCollector<'a, S: Slot>(pub(crate) &'a mut Vec<S>);
-impl<S: Slot> SlotVisitor<S> for ScratchSlotCollector<'_, S> {
-    fn visit_slot(&mut self, slot: S) {
-        self.0.push(slot);
-    }
 }
 
 // Impl Deref/DerefMut to ProcessEdgesBase for PlanProcessEdges
