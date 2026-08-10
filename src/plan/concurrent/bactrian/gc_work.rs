@@ -96,27 +96,29 @@ impl<VM: VMBinding> BactrianNurseryProcessEdges<VM> {
         use crate::vm::Scanning;
         let tls = self.worker().tls;
         let mut scratch: Vec<SlotOf<Self>> = Vec::new();
-        loop {
-            let nodes = self.pop_nodes();
-            if nodes.is_empty() {
-                break;
+        // LIFO drain (see PlanProcessEdges::flush): bounded by trace depth,
+        // children processed right after their parent — stock oldify's
+        // todo-list order, which is also the promotion copy order it yields.
+        let mut stack = self.pop_nodes();
+        while let Some(object) = stack.pop() {
+            // The OCaml binding always supports slot enqueuing (trait
+            // default). The packet path would fall back to
+            // scan_object_and_trace_edges otherwise; this drain does not.
+            debug_assert!(<VM as VMBinding>::VMScanning::support_slot_enqueuing(
+                tls, object
+            ));
+            {
+                let mut collector = ScratchSlotCollector(&mut scratch);
+                <VM as VMBinding>::VMScanning::scan_object(tls, object, &mut collector);
             }
-            for object in nodes {
-                // The OCaml binding always supports slot enqueuing (trait
-                // default). The packet path would fall back to
-                // scan_object_and_trace_edges otherwise; this drain does not.
-                debug_assert!(<VM as VMBinding>::VMScanning::support_slot_enqueuing(
-                    tls, object
-                ));
-                {
-                    let mut collector = ScratchSlotCollector(&mut scratch);
-                    <VM as VMBinding>::VMScanning::scan_object(tls, object, &mut collector);
-                }
-                self.plan.post_scan_object(object);
-                for i in 0..scratch.len() {
-                    self.process_slot(scratch[i]);
-                }
-                scratch.clear();
+            self.plan.post_scan_object(object);
+            for i in 0..scratch.len() {
+                self.process_slot(scratch[i]);
+            }
+            scratch.clear();
+            if !self.base.nodes.is_empty() {
+                let mut children = self.pop_nodes();
+                stack.append(&mut children);
             }
         }
     }

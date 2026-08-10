@@ -1040,16 +1040,17 @@ impl<VM: VMBinding, P: PlanTraceObject<VM> + Plan<VM = VM>, const KIND: TraceKin
             let tls = self.worker().tls;
             let mut scratch: Vec<SlotOf<Self>> = Vec::new();
             let mut deferred: Vec<ObjectReference> = Vec::new();
-            loop {
-                let nodes = self.pop_nodes();
-                if nodes.is_empty() {
-                    break;
-                }
-                for object in nodes {
-                    if !<VM as VMBinding>::VMScanning::support_slot_enqueuing(tls, object) {
-                        deferred.push(object);
-                        continue;
-                    }
+            // LIFO drain: pop one object, scan it, its children land on top of
+            // the stack. Depth-first keeps the work list bounded by trace depth
+            // (a layer-at-a-time drain materializes the full BFS frontier —
+            // millions of objects on a full-heap trace — measured 8% SLOWER
+            // than the packet path) and processes children right after their
+            // parent, stock oldify's todo-list order.
+            let mut stack = self.pop_nodes();
+            while let Some(object) = stack.pop() {
+                if !<VM as VMBinding>::VMScanning::support_slot_enqueuing(tls, object) {
+                    deferred.push(object);
+                } else {
                     {
                         let mut collector = ScratchSlotCollector(&mut scratch);
                         <VM as VMBinding>::VMScanning::scan_object(tls, object, &mut collector);
@@ -1059,6 +1060,10 @@ impl<VM: VMBinding, P: PlanTraceObject<VM> + Plan<VM = VM>, const KIND: TraceKin
                         self.process_slot(scratch[i]);
                     }
                     scratch.clear();
+                }
+                if !self.base.nodes.is_empty() {
+                    let mut children = self.pop_nodes();
+                    stack.append(&mut children);
                 }
             }
             for object in deferred {
