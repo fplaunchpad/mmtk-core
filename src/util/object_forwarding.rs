@@ -18,6 +18,33 @@ const FORWARDING_POINTER_MASK: usize = 0x00ff_ffff_ffff_fff8;
 #[cfg(target_pointer_width = "32")]
 const FORWARDING_POINTER_MASK: usize = 0xffff_fffc;
 
+/// Is the value-range forwarding discriminator active? Requires BOTH the
+/// binding's guarantee (headers below heap start, see
+/// [`crate::vm::ObjectModel::HEADER_FORWARDING_SENTINEL`]) and a
+/// stopped-world single-tracer pause (`up_trace::up()`): with one tracer the
+/// BEING_FORWARDED claim state never exists, so "the header word is a heap
+/// pointer" is a complete two-state encoding and the side FORWARDING_BITS
+/// table is never touched. Multi-tracer pauses fall back to the side bits.
+#[inline(always)]
+fn header_sentinel_active<VM: VMBinding>() -> bool {
+    VM::VMObjectModel::HEADER_FORWARDING_SENTINEL && crate::util::up_trace::up()
+}
+
+/// Under the sentinel: FORWARDED iff the header word now holds a heap pointer.
+#[inline(always)]
+fn sentinel_status<VM: VMBinding>(object: ObjectReference) -> u8 {
+    let word = VM::VMObjectModel::LOCAL_FORWARDING_POINTER_SPEC.load_atomic::<VM, usize>(
+        object,
+        None,
+        Ordering::Relaxed,
+    );
+    if word >= crate::util::heap::layout::vm_layout::vm_layout().heap_start.as_usize() {
+        FORWARDED
+    } else {
+        FORWARDING_NOT_TRIGGERED_YET
+    }
+}
+
 /// Attempt to become the worker thread who will forward the object.
 /// The successful worker will set the object forwarding bits to BEING_FORWARDED, preventing other workers from forwarding the same object.
 pub fn attempt_to_forward<VM: VMBinding>(object: ObjectReference) -> u8 {
@@ -122,18 +149,25 @@ pub fn forward_object<VM: VMBinding>(
         )
     } else {
         write_forwarding_pointer::<VM>(object, new_object);
-        VM::VMObjectModel::LOCAL_FORWARDING_BITS_SPEC.store_atomic::<VM, u8>(
-            object,
-            FORWARDED,
-            None,
-            ord,
-        );
+        // Sentinel mode: the header-pointer store above IS the state change
+        // (word >= heap start now reads FORWARDED); no side bits to set.
+        if !header_sentinel_active::<VM>() {
+            VM::VMObjectModel::LOCAL_FORWARDING_BITS_SPEC.store_atomic::<VM, u8>(
+                object,
+                FORWARDED,
+                None,
+                ord,
+            );
+        }
     }
     new_object
 }
 
 /// Return the forwarding bits for a given `ObjectReference`.
 pub fn get_forwarding_status<VM: VMBinding>(object: ObjectReference) -> u8 {
+    if header_sentinel_active::<VM>() {
+        return sentinel_status::<VM>(object);
+    }
     VM::VMObjectModel::LOCAL_FORWARDING_BITS_SPEC.load_atomic::<VM, u8>(
         object,
         None,
@@ -164,6 +198,11 @@ pub fn state_is_being_forwarded(forwarding_bits: u8) -> bool {
 /// Zero the forwarding bits of an object.
 /// This function is used on new objects.
 pub fn clear_forwarding_bits<VM: VMBinding>(object: ObjectReference) {
+    // Sentinel mode never writes the side bits, and a fresh copy's real
+    // header (below heap start) already reads NOT_TRIGGERED — nothing to do.
+    if header_sentinel_active::<VM>() {
+        return;
+    }
     VM::VMObjectModel::LOCAL_FORWARDING_BITS_SPEC.store_atomic::<VM, u8>(
         object,
         0,
@@ -202,7 +241,9 @@ pub fn write_forwarding_pointer<VM: VMBinding>(
     new_object: ObjectReference,
 ) {
     debug_assert!(
-        is_being_forwarded::<VM>(object),
+        // Sentinel mode has no BEING_FORWARDED claim state: the single tracer
+        // goes straight from unforwarded to this store.
+        header_sentinel_active::<VM>() || is_being_forwarded::<VM>(object),
         "write_forwarding_pointer called for object {:?} that is not being forwarded! Forwarding state = 0x{:x}",
         object,
         get_forwarding_status::<VM>(object),
