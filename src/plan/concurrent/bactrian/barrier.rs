@@ -149,11 +149,16 @@ impl<VM: VMBinding> BactrianBarrier<VM> {
             || self.plan.current_pause() == Some(Pause::FinalMark)
     }
 
-    fn satb_bucket(&self) -> WorkBucketStage {
+    /// Hand a SATB packet to its executor. Mid-window the packet is marking
+    /// work: route via the plan (sliced mode parks it for an in-pause quantum;
+    /// worker-concurrent mode feeds the Concurrent bucket). Outside a window
+    /// (pause-time flushes at FinalMark/Full) it must run inside the CURRENT
+    /// pause: the Closure bucket.
+    fn dispatch_satb_packet(&self, w: ProcessModBufSATB<VM, Bactrian<VM>, TRACE_KIND_FAST>) {
         if self.plan.concurrent_work_in_progress() {
-            WorkBucketStage::Concurrent
+            self.plan.schedule_marking_packet(Box::new(w));
         } else {
-            WorkBucketStage::Closure
+            self.mmtk.scheduler.work_buckets[WorkBucketStage::Closure].add(w);
         }
     }
 
@@ -161,11 +166,7 @@ impl<VM: VMBinding> BactrianBarrier<VM> {
         if !self.satb.is_empty() {
             if self.should_create_satb_packets() {
                 let satb = self.satb.take();
-                self.mmtk.scheduler.work_buckets[self.satb_bucket()].add(ProcessModBufSATB::<
-                    VM,
-                    Bactrian<VM>,
-                    TRACE_KIND_FAST,
-                >::new(satb));
+                self.dispatch_satb_packet(ProcessModBufSATB::new(satb));
             } else {
                 let _ = self.satb.take();
             }
@@ -177,11 +178,7 @@ impl<VM: VMBinding> BactrianBarrier<VM> {
         if !self.refs.is_empty() {
             if self.should_create_satb_packets() {
                 let refs = self.refs.take();
-                self.mmtk.scheduler.work_buckets[self.satb_bucket()].add(ProcessModBufSATB::<
-                    VM,
-                    Bactrian<VM>,
-                    TRACE_KIND_FAST,
-                >::new(refs));
+                self.dispatch_satb_packet(ProcessModBufSATB::new(refs));
             } else {
                 let _ = self.refs.take();
             }

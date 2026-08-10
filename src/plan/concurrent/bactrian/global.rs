@@ -18,6 +18,8 @@ use crate::policy::immix::ImmixSpace;
 use crate::policy::immix::ImmixSpaceArgs;
 use crate::policy::immix::{TRACE_KIND_DEFRAG, TRACE_KIND_FAST};
 use crate::policy::space::Space;
+use crate::plan::concurrent::bactrian::gc_work::BactrianMarkQuantum;
+use crate::scheduler::GCWork;
 use crate::scheduler::GCWorkScheduler;
 use crate::scheduler::GCWorker;
 use crate::scheduler::WorkBucketStage;
@@ -78,6 +80,21 @@ pub struct Bactrian<VM: VMBinding> {
     /// Whether the last GC was a defrag GC for the immix space.
     last_gc_was_defrag: AtomicBool,
     current_pause: Atomic<Option<Pause>>,
+    /// Sliced-STW marking (default ON; MMTK_MARK_SLICED=0 reverts to the
+    /// worker-concurrent design): ALL marking work parks in
+    /// `parked_marking` and is drained in budgeted quanta inside nursery
+    /// pauses — stock OCaml's mutator mark slices, executed as short
+    /// stop-the-world quanta on the worker. Rationale (SHAPE.md round 25):
+    /// worker-concurrent marking at 1 mutator costs more in cross-core LLC
+    /// interference than it saves in pause time (bt@2M: mutator 5.8G ->
+    /// 13.7G cycles), while STW fulls cost the D3 tail (78-122ms pauses vs
+    /// vanilla's 15ms max). Sliced quanta keep both: no simultaneity, no
+    /// tail, and single-tracer (UP) economics stay armed.
+    sliced_marking: bool,
+    /// Parked marking packets for sliced mode (ConcurrentTraceObjects,
+    /// ProcessModBufSATB). Mutator-side SATB flushes push here between
+    /// pauses; quanta pop inside pauses. MPMC-safe.
+    parked_marking: crossbeam::deque::Injector<Box<dyn GCWork<VM>>>,
     previous_pause: Atomic<Option<Pause>>,
     concurrent_marking_active: AtomicBool,
 }
@@ -145,10 +162,7 @@ impl<VM: VMBinding> Plan for Bactrian<VM> {
         // Concurrent marking finished all its work: transition to FinalMark at the
         // next poll site. (The GC-worker side self-trigger in the scheduler covers
         // the case where no mutator polls; see Scheduler::concurrent_marking_drained.)
-        if self.concurrent_marking_in_progress()
-            && self.gen.common.base.scheduler.work_buckets[WorkBucketStage::Concurrent]
-                .is_drained()
-        {
+        if self.concurrent_marking_in_progress() && self.marking_queue_drained() {
             return true;
         }
         self.gen.collection_required(self, space_full, space)
@@ -183,6 +197,26 @@ impl<VM: VMBinding> Plan for Bactrian<VM> {
             }
             Pause::InitialMark | Pause::FinalMark | Pause::Nursery => {
                 scheduler.schedule_common_work::<BactrianNurseryGCWorkContext<VM>>(self);
+                if self.sliced_marking {
+                    match pause {
+                        // Mid-cycle nursery pause: drain a bounded mark quantum
+                        // AFTER the nursery closure (Release opens once Closure
+                        // and weak processing are done).
+                        Pause::Nursery if self.concurrent_marking_in_progress() => {
+                            scheduler.work_buckets[WorkBucketStage::Release]
+                                .add(BactrianMarkQuantum::budgeted(self));
+                        }
+                        // FinalMark: drain EVERYTHING parked, unbudgeted, inside
+                        // the Closure stage — mutators are stopped and their
+                        // late SATB flushes (parked during StopMutators) are all
+                        // in by the time Closure opens.
+                        Pause::FinalMark => {
+                            scheduler.work_buckets[WorkBucketStage::Closure]
+                                .add(BactrianMarkQuantum::unbudgeted(self));
+                        }
+                        _ => {}
+                    }
+                }
             }
         }
     }
@@ -550,9 +584,41 @@ impl<VM: VMBinding> ConcurrentPlan for Bactrian<VM> {
         // nursery pause, so the concurrent marker must never see them.
         self.gen.nursery.in_space(object)
     }
+
+    fn schedule_marking_packet(&self, w: Box<dyn GCWork<VM>>) {
+        if self.sliced_marking {
+            self.parked_marking.push(w);
+        } else {
+            self.gen.common.base.scheduler.work_buckets[WorkBucketStage::Concurrent]
+                .add_boxed_no_notify(w);
+        }
+    }
+
+    fn marking_queue_drained(&self) -> bool {
+        if self.sliced_marking {
+            self.parked_marking.is_empty()
+        } else {
+            self.gen.common.base.scheduler.work_buckets[WorkBucketStage::Concurrent].is_drained()
+        }
+    }
+
+    fn marking_confined_to_pauses(&self) -> bool {
+        self.sliced_marking
+    }
 }
 
 impl<VM: VMBinding> Bactrian<VM> {
+    /// Pop one parked marking packet (sliced mode).
+    pub(super) fn pop_marking_packet(&self) -> Option<Box<dyn GCWork<VM>>> {
+        loop {
+            match self.parked_marking.steal() {
+                crossbeam::deque::Steal::Success(w) => return Some(w),
+                crossbeam::deque::Steal::Retry => continue,
+                crossbeam::deque::Steal::Empty => return None,
+            }
+        }
+    }
+
     pub fn new(args: CreateGeneralPlanArgs<VM>) -> Self {
         let mut plan_args = CreateSpecificPlanArgs {
             global_args: args,
@@ -602,6 +668,10 @@ impl<VM: VMBinding> Bactrian<VM> {
             aging_this_gc: AtomicBool::new(false),
             last_gc_was_defrag: AtomicBool::new(false),
             current_pause: Atomic::new(None),
+            sliced_marking: std::env::var("MMTK_MARK_SLICED")
+                .map(|v| v != "0")
+                .unwrap_or(true),
+            parked_marking: crossbeam::deque::Injector::new(),
             previous_pause: Atomic::new(None),
             concurrent_marking_active: AtomicBool::new(false),
         };
@@ -619,9 +689,7 @@ impl<VM: VMBinding> Bactrian<VM> {
             // FinalMark (upgrading to Full mid-cycle is unsafe w.r.t. defrag — same
             // restriction as ConcurrentImmix). Any pending full-heap request stays
             // set (next_gc_full_heap) and is honoured after the cycle completes.
-            if self.gen.common.base.scheduler.work_buckets[WorkBucketStage::Concurrent]
-                .is_drained()
-            {
+            if self.marking_queue_drained() {
                 Pause::FinalMark
             } else {
                 Pause::Nursery
@@ -671,9 +739,12 @@ impl<VM: VMBinding> Bactrian<VM> {
                 // behaviour), isolating the concurrent machinery when debugging.
                 if std::env::var_os("BACTRIAN_NO_CONCURRENT").is_some() {
                     Pause::Full
-                } else if self.immix_space.reserved_pages()
-                    < conc_mark_min_mature_pages()
+                } else if !self.sliced_marking
+                    && self.immix_space.reserved_pages() < conc_mark_min_mature_pages()
                 {
+                    // (The adaptive-STW escape below exists for WORKER-concurrent
+                    // marking's cross-core interference; sliced quanta have no
+                    // simultaneity, so sliced mode always takes the cycle path.)
                     // ADAPTIVE MARKING (W-night 2026-08-08, binding SHAPE.md):
                     // a concurrent marker streaming a small live set through
                     // the shared LLC while the mutator runs costs more in

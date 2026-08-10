@@ -512,8 +512,10 @@ impl<VM: VMBinding> GCWorkScheduler<VM> {
         let Some(concurrent) = worker.mmtk.get_plan().concurrent() else {
             return false;
         };
-        concurrent.concurrent_work_in_progress()
-            && self.work_buckets[WorkBucketStage::Concurrent].is_drained()
+        // marking_queue_drained consults wherever the plan parks marking work:
+        // the Concurrent bucket (worker-concurrent) or the plan-owned sliced
+        // queue (sliced-STW quanta).
+        concurrent.concurrent_work_in_progress() && concurrent.marking_queue_drained()
     }
 
     /// Respond to a worker reqeust.

@@ -1,5 +1,6 @@
 use crate::plan::concurrent::Pause;
 use crate::plan::Plan;
+use crate::scheduler::{GCWork, WorkBucketStage};
 use crate::util::ObjectReference;
 
 /// Trait for a concurrent plan.
@@ -28,5 +29,31 @@ pub trait ConcurrentPlan: Plan {
             self.current_pause(),
             Some(Pause::FinalMark) | Some(Pause::Full)
         )
+    }
+
+    /// Route a marking work packet (`ConcurrentTraceObjects` /
+    /// `ProcessModBufSATB` / marking seeds). Default: park it in the
+    /// `Concurrent` bucket for background execution by GC workers — the
+    /// worker-concurrent design. A plan running SLICED marking (see
+    /// [`Self::marking_confined_to_pauses`]) overrides this to park the packet
+    /// in a plan-owned queue that is only drained in budgeted quanta inside
+    /// stopped-world pauses.
+    fn schedule_marking_packet(&self, w: Box<dyn GCWork<Self::VM>>) {
+        self.base().scheduler.work_buckets[WorkBucketStage::Concurrent].add_boxed_no_notify(w);
+    }
+
+    /// Is the marking work queue fully drained (cycle ready for `FinalMark`)?
+    /// Must agree with wherever [`Self::schedule_marking_packet`] parks work.
+    fn marking_queue_drained(&self) -> bool {
+        self.base().scheduler.work_buckets[WorkBucketStage::Concurrent].is_drained()
+    }
+
+    /// Return `true` if this plan executes ALL marking work inside
+    /// stopped-world pauses (sliced-STW marking): no marking packet ever runs
+    /// while mutators run. Bindings may use this to keep single-tracer
+    /// (plain-op) tracing modes armed across the marking window — with one
+    /// worker and a stopped world, the tracer is single even mid-cycle.
+    fn marking_confined_to_pauses(&self) -> bool {
+        false
     }
 }

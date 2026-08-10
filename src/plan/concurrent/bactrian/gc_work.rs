@@ -86,6 +86,66 @@ impl<S: Slot> crate::vm::SlotVisitor<S> for SlotCollector<'_, S> {
     }
 }
 
+/// Sliced-STW mark quantum: pops parked marking packets (see
+/// `Bactrian::parked_marking`) and executes them on this worker, world
+/// stopped, until the queue empties or the budget expires. Scheduled in the
+/// Release stage of mid-cycle Nursery pauses (budgeted — stock OCaml's
+/// allocation-paced mark slice, one per minor) and in the Closure stage of
+/// FinalMark (unbudgeted — drain everything, including SATB flushes parked
+/// during StopMutators).
+pub(in crate::plan) struct BactrianMarkQuantum<VM: VMBinding> {
+    plan: &'static Bactrian<VM>,
+    budget: Option<std::time::Duration>,
+}
+
+/// Per-quantum budget. MMTK_MARK_SLICE_MS overrides (fractional ok);
+/// default 2ms — comparable to a nursery pause at the stock-parity 2 MiB
+/// nursery, so mid-cycle pauses stay in vanilla's slice-pause class.
+fn mark_slice_budget() -> std::time::Duration {
+    static V: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let ms = std::env::var("MMTK_MARK_SLICE_MS")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|ms| *ms > 0.0 && *ms <= 1000.0)
+            .unwrap_or(2.0);
+        std::time::Duration::from_secs_f64(ms / 1e3)
+    })
+}
+
+impl<VM: VMBinding> BactrianMarkQuantum<VM> {
+    pub(in crate::plan) fn budgeted(plan: &'static Bactrian<VM>) -> Self {
+        Self {
+            plan,
+            budget: Some(mark_slice_budget()),
+        }
+    }
+    pub(in crate::plan) fn unbudgeted(plan: &'static Bactrian<VM>) -> Self {
+        Self { plan, budget: None }
+    }
+}
+
+impl<VM: VMBinding> crate::scheduler::GCWork<VM> for BactrianMarkQuantum<VM> {
+    fn do_work(
+        &mut self,
+        worker: &mut crate::scheduler::GCWorker<VM>,
+        mmtk: &'static MMTK<VM>,
+    ) {
+        let deadline = self.budget.map(|b| std::time::Instant::now() + b);
+        let mut packets = 0usize;
+        while let Some(mut w) = self.plan.pop_marking_packet() {
+            w.do_work(worker, mmtk);
+            packets += 1;
+            if let Some(d) = deadline {
+                if std::time::Instant::now() >= d {
+                    break;
+                }
+            }
+        }
+        probe!(mmtk, bactrian_mark_quantum, packets);
+    }
+}
+
 impl<VM: VMBinding> BactrianNurseryProcessEdges<VM> {
     /// Match ProcessEdgesWork's own buffer sizing for the seed packets.
     const SEED_CAPACITY: usize = 4096;
@@ -135,10 +195,10 @@ impl<VM: VMBinding> BactrianNurseryProcessEdges<VM> {
                 objects,
                 self.base.mmtk(),
             );
-            // Like ProcessRootSlots: park the packets in the Concurrent bucket
-            // without notifying — the scheduler opens the bucket (and wakes workers)
-            // when the pause ends.
-            self.base.mmtk().scheduler.work_buckets[WorkBucketStage::Concurrent].add_no_notify(w);
+            // Route via the plan: worker-concurrent mode parks in the Concurrent
+            // bucket without notifying (the scheduler opens it when the pause
+            // ends); sliced mode parks in the plan queue for in-pause quanta.
+            self.plan.schedule_marking_packet(Box::new(w));
         }
     }
 }
