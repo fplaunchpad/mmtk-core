@@ -77,14 +77,7 @@ pub(in crate::plan) struct BactrianNurseryProcessEdges<VM: VMBinding> {
     mark_seed: Vec<ObjectReference>,
 }
 
-/// Slot visitor that just collects slots into a scratch buffer, for the UP
-/// direct-trace drain below.
-struct SlotCollector<'a, S: Slot>(&'a mut Vec<S>);
-impl<S: Slot> crate::vm::SlotVisitor<S> for SlotCollector<'_, S> {
-    fn visit_slot(&mut self, slot: S) {
-        self.0.push(slot);
-    }
-}
+use crate::scheduler::gc_work::ScratchSlotCollector;
 
 impl<VM: VMBinding> BactrianNurseryProcessEdges<VM> {
     /// Match ProcessEdgesWork's own buffer sizing for the seed packets.
@@ -116,7 +109,7 @@ impl<VM: VMBinding> BactrianNurseryProcessEdges<VM> {
                     tls, object
                 ));
                 {
-                    let mut collector = SlotCollector(&mut scratch);
+                    let mut collector = ScratchSlotCollector(&mut scratch);
                     <VM as VMBinding>::VMScanning::scan_object(tls, object, &mut collector);
                 }
                 self.plan.post_scan_object(object);
