@@ -77,9 +77,56 @@ pub(in crate::plan) struct BactrianNurseryProcessEdges<VM: VMBinding> {
     mark_seed: Vec<ObjectReference>,
 }
 
+/// Slot visitor that just collects slots into a scratch buffer, for the UP
+/// direct-trace drain below.
+struct SlotCollector<'a, S: Slot>(&'a mut Vec<S>);
+impl<S: Slot> crate::vm::SlotVisitor<S> for SlotCollector<'_, S> {
+    fn visit_slot(&mut self, slot: S) {
+        self.0.push(slot);
+    }
+}
+
 impl<VM: VMBinding> BactrianNurseryProcessEdges<VM> {
     /// Match ProcessEdgesWork's own buffer sizing for the seed packets.
     const SEED_CAPACITY: usize = 4096;
+
+    /// UP direct-trace closure: with a single tracer inside a stopped-world
+    /// pause, consume the whole transitive closure inside THIS packet with an
+    /// explicit work list — stock oldify's todo-list discipline — instead of
+    /// bouncing every generation of the BFS through packet creation, bucket
+    /// scheduling and a fresh ProcessEdges instance. Per object this performs
+    /// exactly the packet path's protocol (support_slot_enqueuing → scan_object
+    /// → post_scan_object → process each slot), so trace semantics, line
+    /// marking at scan time, InitialMark seed collection and the FinalMark
+    /// remark all behave identically; only the scheduling round-trips go away.
+    fn drain_closure_locally(&mut self) {
+        use crate::vm::Scanning;
+        let tls = self.worker().tls;
+        let mut scratch: Vec<SlotOf<Self>> = Vec::new();
+        loop {
+            let nodes = self.pop_nodes();
+            if nodes.is_empty() {
+                break;
+            }
+            for object in nodes {
+                // The OCaml binding always supports slot enqueuing (trait
+                // default). The packet path would fall back to
+                // scan_object_and_trace_edges otherwise; this drain does not.
+                debug_assert!(<VM as VMBinding>::VMScanning::support_slot_enqueuing(
+                    tls, object
+                ));
+                {
+                    let mut collector = SlotCollector(&mut scratch);
+                    <VM as VMBinding>::VMScanning::scan_object(tls, object, &mut collector);
+                }
+                self.plan.post_scan_object(object);
+                for i in 0..scratch.len() {
+                    self.process_slot(scratch[i]);
+                }
+                scratch.clear();
+            }
+        }
+    }
 
     fn flush_mark_seed(&mut self) {
         if !self.mark_seed.is_empty() {
@@ -175,6 +222,14 @@ impl<VM: VMBinding> ProcessEdgesWork for BactrianNurseryProcessEdges<VM> {
     }
 
     fn flush(&mut self) {
+        // Single tracer: finish the whole closure here (see drain_closure_locally).
+        // Gated off when live-bytes stats are requested — the packet path is the
+        // one that accounts them.
+        if crate::util::up_trace::up()
+            && !*self.base.mmtk().get_options().count_live_bytes_in_gc
+        {
+            self.drain_closure_locally();
+        }
         self.flush_mark_seed();
         // Default flush behaviour: hand accumulated nodes to a scan-objects packet.
         let nodes = self.pop_nodes();
