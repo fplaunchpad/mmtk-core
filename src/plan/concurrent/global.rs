@@ -56,4 +56,24 @@ pub trait ConcurrentPlan: Plan {
     fn marking_confined_to_pauses(&self) -> bool {
         false
     }
+
+    /// Did the pause that JUST ENDED complete a marking cycle (`FinalMark` or
+    /// a full STW GC)? Readable after `end_of_gc` has cleared the current
+    /// pause — for end-of-collection accounting (a binding's major-cycle
+    /// pacing must treat a completed concurrent cycle exactly like a full GC,
+    /// as stock collectors do; without this a FinalMark never resets pacing
+    /// baselines and the trigger law diverges between the STW and concurrent
+    /// modes).
+    fn previous_pause_finished_mark(&self) -> bool {
+        false
+    }
+
+    /// Did the pause that JUST ENDED start a marking cycle (`InitialMark`, or
+    /// a full STW GC — which is a whole cycle in one pause)? For
+    /// allocation-denominated cycle pacing: stock-style pacing measures the
+    /// budget from cycle START to next cycle start, so allocation during the
+    /// marking window counts toward the next trigger.
+    fn previous_pause_started_cycle(&self) -> bool {
+        false
+    }
 }

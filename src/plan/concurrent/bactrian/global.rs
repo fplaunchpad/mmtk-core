@@ -605,6 +605,20 @@ impl<VM: VMBinding> ConcurrentPlan for Bactrian<VM> {
     fn marking_confined_to_pauses(&self) -> bool {
         self.sliced_marking
     }
+
+    fn previous_pause_finished_mark(&self) -> bool {
+        matches!(
+            self.previous_pause(),
+            Some(Pause::FinalMark) | Some(Pause::Full)
+        )
+    }
+
+    fn previous_pause_started_cycle(&self) -> bool {
+        matches!(
+            self.previous_pause(),
+            Some(Pause::InitialMark) | Some(Pause::Full)
+        )
+    }
 }
 
 impl<VM: VMBinding> Bactrian<VM> {
@@ -731,6 +745,16 @@ impl<VM: VMBinding> Bactrian<VM> {
                 || user_full
                 || emergency
                 || vm_exhausted;
+            if std::env::var_os("BACTRIAN_TRACE").is_some() {
+                eprintln!(
+                    "[bactrian] decide: cycle_req={} user={} emergency={} vm_exhausted={} -> {}",
+                    cycle_requested,
+                    user_triggered,
+                    emergency,
+                    vm_exhausted,
+                    if full { "Full" } else { "cycle/nursery" }
+                );
+            }
             if full {
                 Pause::Full
             } else if cycle_requested {
