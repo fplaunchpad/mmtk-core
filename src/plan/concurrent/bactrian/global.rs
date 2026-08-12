@@ -121,6 +121,11 @@ pub struct Bactrian<VM: VMBinding> {
     /// pauses that stay small at any nursery cap, so the feasibility
     /// escape's nursery gate must not degrade them to monolithic Fulls.
     cycle_tick_origin: AtomicBool,
+    /// Pending mature-compaction request (ConcurrentPlan::
+    /// request_mature_compaction — the binding's reserved-vs-live runaway
+    /// law). Consumed by decide_pause: rides the next major as a COMPACT-ALL
+    /// Full (cycles never defragment).
+    compact_requested: AtomicBool,
     previous_pause: Atomic<Option<Pause>>,
     concurrent_marking_active: AtomicBool,
 }
@@ -632,7 +637,14 @@ impl<VM: VMBinding> GenerationalPlan for Bactrian<VM> {
     }
 
     fn get_mature_reserved_pages(&self) -> usize {
+        // The pretenured medium band lives in the common nonmoving
+        // (free-list mark-sweep) space by default (round 30,
+        // MMTK_MEDIUM_TO) — it is mature and must be visible to the
+        // binding's pressure/cadence pacing, or a band-heavy workload
+        // (fragmed) never triggers the majors whose sweeps feed its free
+        // lists and runs to the space-full edge (203MB RSS, 1 GC).
         self.immix_space.reserved_pages()
+            + self.gen.common.get_nonmoving().reserved_pages()
     }
 
     fn force_full_heap_collection(&self) {
@@ -750,6 +762,18 @@ impl<VM: VMBinding> ConcurrentPlan for Bactrian<VM> {
 
     fn sweep_drained(&self) -> bool {
         !self.sweep_pending.load(Ordering::SeqCst)
+    }
+
+    fn request_mature_compaction(&self) {
+        self.compact_requested.store(true, Ordering::SeqCst);
+    }
+
+    fn mature_footprint_and_live(&self) -> Option<(usize, usize)> {
+        let pg = crate::util::constants::BYTES_IN_PAGE;
+        Some((
+            self.immix_space.reserved_pages() * pg,
+            self.immix_space.major_live_bytes(),
+        ))
     }
 
     fn set_mark_quantum_hint_ms(&self, ms: f64, tick_origin: bool) {
@@ -928,6 +952,7 @@ impl<VM: VMBinding> Bactrian<VM> {
             progress_pause_requested: AtomicBool::new(false),
             mark_quantum_hint_nanos: AtomicU64::new(0),
             cycle_tick_origin: AtomicBool::new(false),
+            compact_requested: AtomicBool::new(false),
             previous_pause: Atomic::new(None),
             concurrent_marking_active: AtomicBool::new(false),
         };
@@ -1053,6 +1078,20 @@ impl<VM: VMBinding> Bactrian<VM> {
                 }
             } else {
                 Pause::Nursery
+            };
+            // COMPACT-ALL (round 30): a pending mature-compaction request
+            // rides the next major. Cycles never defragment (SATB marking
+            // cannot move mature objects under mutator-held references), so
+            // the request upgrades a would-be InitialMark to a monolithic
+            // Full and arms every-block defrag selection on the space.
+            let decision = match decision {
+                Pause::Full | Pause::InitialMark
+                    if self.compact_requested.swap(false, Ordering::SeqCst) =>
+                {
+                    self.immix_space.request_compact_all();
+                    Pause::Full
+                }
+                d => d,
             };
             if std::env::var_os("BACTRIAN_TRACE").is_some() {
                 eprintln!(

@@ -31,7 +31,7 @@ use crate::{
     MMTK,
 };
 use atomic::Ordering;
-use std::sync::{atomic::AtomicU8, atomic::AtomicUsize, Arc};
+use std::sync::{atomic::AtomicBool, atomic::AtomicU8, atomic::AtomicUsize, Arc};
 
 pub(crate) const TRACE_KIND_FAST: TraceKind = 0;
 pub(crate) const TRACE_KIND_DEFRAG: TraceKind = 1;
@@ -97,6 +97,18 @@ pub struct ImmixSpace<VM: VMBinding> {
     pub swept_live_blocks: std::sync::atomic::AtomicUsize,
     /// Defrag utilities
     pub(super) defrag: Defrag,
+    /// COMPACT-ALL madvise scope: true from a compact-all GC's prepare until
+    /// the next major's prepare — blocks freed in that window return their
+    /// pages to the OS regardless of MMTK_RELEASE_FREED_PAGES.
+    madvise_freed_this_gc: AtomicBool,
+    /// Bytes of objects newly marked/forwarded by the CURRENT major marking
+    /// epoch (reset at each major's prepare). The truthful live measure for
+    /// the compaction law: post-sweep reserved pages cannot distinguish a
+    /// dense heap from one whose 256B lines are pinned by interleaved small
+    /// live objects (mature_mutation: 6.6MB live pinning 17-46MB), and every
+    /// line/block statistic is equally blind. ~One relaxed add per marked
+    /// object per major.
+    major_live_bytes: AtomicUsize,
     /// How many lines have been consumed since last GC?
     lines_consumed: AtomicUsize,
     /// Object mark state
@@ -524,6 +536,8 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             reusable_blocks: ReusableBlockPool::new(scheduler.num_workers()),
             swept_live_blocks: std::sync::atomic::AtomicUsize::new(0),
             defrag: Defrag::default(),
+            madvise_freed_this_gc: AtomicBool::new(false),
+            major_live_bytes: AtomicUsize::new(0),
             // Set to the correct mark state when inititialized. We cannot rely on prepare to set it (prepare may get skipped in nursery GCs).
             mark_state: Self::MARKED_STATE,
             scheduler: scheduler.clone(),
@@ -775,6 +789,9 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         // documents that and can never fire (rc_enabled always false until P3).
         debug_assert!(!self.rc_enabled);
         if major_gc {
+            // New major marking epoch: restart the live-bytes tally (see
+            // `major_live_bytes` — the compaction law's denominator).
+            self.major_live_bytes.store(0, Ordering::Relaxed);
             // Update mark_state
             if VM::VMObjectModel::LOCAL_MARK_BIT_SPEC.is_on_side() {
                 self.mark_state = Self::MARKED_STATE;
@@ -792,6 +809,11 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             let threshold = self.defrag.defrag_spill_threshold.load(Ordering::Acquire);
             // # Safety: ImmixSpace reference is always valid within this collection cycle.
             let space = unsafe { &*(self as *const Self) };
+            let compact_all = self.defrag.compact_all_active() && space.in_defrag();
+            // Arm the compaction-epoch madvise scope (cleared by the next
+            // major's prepare): covers this GC's sweep — in-pause or the
+            // deferred quanta draining across later nursery pauses.
+            self.madvise_freed_this_gc.store(compact_all, Ordering::Relaxed);
             let work_packets = self.chunk_map.generate_tasks(|chunk| {
                 Box::new(PrepareBlockState {
                     space,
@@ -801,6 +823,7 @@ impl<VM: VMBinding> ImmixSpace<VM> {
                     } else {
                         None
                     },
+                    compact_all,
                     unlog_bits_op,
                 })
             });
@@ -921,6 +944,20 @@ impl<VM: VMBinding> ImmixSpace<VM> {
 
     /// Post-sweep fragmentation: (partially-occupied live blocks, live blocks).
     /// Meaningful after the sweep (immediate or deferred) has fully drained.
+    /// Request a one-shot COMPACT-ALL: the next defrag collection treats
+    /// every in-use block as a defrag source (see `Defrag::compact_all_once`
+    /// — the remedy for intra-line waste that hole-based selection cannot
+    /// see). Also forces that collection to BE a defrag collection.
+    pub fn request_compact_all(&self) {
+        self.defrag.request_compact_all();
+    }
+
+    /// Bytes marked/forwarded by the last major marking epoch — the
+    /// truthful mature live measure (see the `major_live_bytes` field).
+    pub fn major_live_bytes(&self) -> usize {
+        self.major_live_bytes.load(Ordering::Relaxed)
+    }
+
     pub fn post_sweep_fragmentation(&self) -> (usize, usize) {
         (
             self.reusable_blocks.len(),
@@ -959,7 +996,15 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         } else {
             block.deinit();
         }
-        self.pr.release_block(block);
+        // COMPACT-ALL epoch: blocks freed by a compaction's sweep return
+        // their pages to the OS unconditionally — reclaiming residency is
+        // the compaction's purpose (mature_mutation: reserved collapsed
+        // 46→7MB but RSS stayed flat without this). Steady-state recycling
+        // between majors keeps the fast path (MMTK_RELEASE_FREED_PAGES).
+        self.pr.release_block_with(
+            block,
+            self.madvise_freed_this_gc.load(Ordering::Relaxed),
+        );
     }
 
     /// Push an already-deinitialised block back to the page resource free list (accounting +
@@ -1052,6 +1097,10 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         vo_bit::helper::on_trace_object::<VM>(object);
 
         if self.attempt_mark(object, self.mark_state) {
+            self.major_live_bytes.fetch_add(
+                VM::VMObjectModel::get_current_size(object),
+                Ordering::Relaxed,
+            );
             // lxr P2.F: under RC, a straddle continuation line carries no RC entry of its own,
             // so a marked straddle object is short-circuited before line/block marking. Gated;
             // dead for all non-RC plans (rc_enabled always false until the P3 LXR plan).
@@ -1135,7 +1184,12 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             let new_object = if self.is_pinned(object)
                 || (!nursery_collection && self.defrag.space_exhausted())
             {
-                self.attempt_mark(object, self.mark_state);
+                if self.attempt_mark(object, self.mark_state) {
+                    self.major_live_bytes.fetch_add(
+                        VM::VMObjectModel::get_current_size(object),
+                        Ordering::Relaxed,
+                    );
+                }
                 object_forwarding::clear_forwarding_bits::<VM>(object);
                 Block::containing(object).set_state(BlockState::Marked);
 
@@ -1158,6 +1212,10 @@ impl<VM: VMBinding> ImmixSpace<VM> {
                     semantics,
                     copy_context,
                     |new_object| {
+                        self.major_live_bytes.fetch_add(
+                            VM::VMObjectModel::get_current_size(new_object),
+                            Ordering::Relaxed,
+                        );
                         // post_copy should have set the unlog bit
                         // if `unlog_traced_object` is true.
                         debug_assert!(
@@ -1401,6 +1459,10 @@ pub struct PrepareBlockState<VM: VMBinding> {
     pub space: &'static ImmixSpace<VM>,
     pub chunk: Chunk,
     pub defrag_threshold: Option<usize>,
+    /// COMPACT-ALL (one-shot, see `Defrag::compact_all_once`): every in-use
+    /// block is a defrag source this GC, regardless of hole count — the
+    /// hole-bucket selection cannot see intra-line waste.
+    pub compact_all: bool,
     pub unlog_bits_op: UnlogBitsOperation,
 }
 
@@ -1430,7 +1492,7 @@ impl<VM: VMBinding> GCWork<VM> for PrepareBlockState<VM> {
             let is_defrag_source = if !self.space.is_defrag_enabled() {
                 // Do not set any block as defrag source if defrag is disabled.
                 false
-            } else if *mmtk.options.immix_defrag_every_block {
+            } else if *mmtk.options.immix_defrag_every_block || self.compact_all {
                 // Set every block as defrag source if so desired.
                 true
             } else if let Some(defrag_threshold) = self.defrag_threshold {

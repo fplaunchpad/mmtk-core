@@ -93,6 +93,26 @@ pub trait ConcurrentPlan: Plan {
     /// MMTK_MARK_SLICE_MS budget. Default: no-op for plans without sliced
     /// marking.
     ///
+    /// The mature Immix space's (post-sweep reserved bytes, live bytes
+    /// marked by the last major epoch) — the compaction law's inputs.
+    /// Immix-only on both sides so LOS residency cannot skew the ratio.
+    /// None = plan doesn't support the law. Default: None.
+    fn mature_footprint_and_live(&self) -> Option<(usize, usize)> {
+        None
+    }
+
+    /// Request a compacting major: the next STW Full evacuates EVERY in-use
+    /// mature block (bounded by copy headroom — leftovers stay in place and
+    /// later compactions converge). Called by the binding's pacing when
+    /// mature reserved pages run away from its live estimate — the
+    /// line-granular reclamation cannot free 256B lines that interleave
+    /// small dead objects with live ones, so byte-level waste is invisible
+    /// to both the normal defrag trigger and its hole-bucket candidate
+    /// selection (mature_mutation: 8MB live pinning >90MB). Stock OCaml's
+    /// analog is `Gc.max_overhead`-paced automatic compaction. Default:
+    /// no-op.
+    fn request_mature_compaction(&self) {}
+
     /// `tick_origin` says WHICH pacing site fired: `false` = the post-minor
     /// path (pause cadence = minors — a big-nursery config's minors are
     /// promotion-bound and dwarf any quantum, so slicing is pointless there:

@@ -184,6 +184,15 @@ impl<VM: VMBinding, B: Region> BlockPageResource<VM, B> {
     }
 
     pub fn release_block(&self, block: B) {
+        self.release_block_with(block, false)
+    }
+
+    /// Release a block; `force_return_pages` madvises its pages back to the
+    /// OS even when the global MMTK_RELEASE_FREED_PAGES default (off) would
+    /// not — used by the COMPACT-ALL sweep (round 30): returning memory is
+    /// the entire point of a compaction, while steady-state block recycling
+    /// keeps the fast path.
+    pub fn release_block_with(&self, block: B, force_return_pages: bool) {
         let pages = 1 << Self::LOG_PAGES;
         debug_assert!(pages as usize <= self.common().accounting.get_committed_pages());
         self.common().accounting.release(pages as _);
@@ -198,7 +207,7 @@ impl<VM: VMBinding, B: Region> BlockPageResource<VM, B> {
         // uses MonotonePageResource). MMTK_RELEASE_FREED_PAGES=0 opts out
         // (recommended for RC/LXR-style per-object block churn).
         #[cfg(target_os = "linux")]
-        if release_freed_pages() {
+        if force_return_pages || release_freed_pages() {
             unsafe {
                 libc::madvise(
                     block.start().to_mut_ptr(),
@@ -207,6 +216,8 @@ impl<VM: VMBinding, B: Region> BlockPageResource<VM, B> {
                 );
             }
         }
+        #[cfg(not(target_os = "linux"))]
+        let _ = force_return_pages;
         self.block_queue.push(block)
     }
 

@@ -76,6 +76,7 @@ impl<VM: VMBinding> Allocator<VM> for FreeListAllocator<VM> {
                         size, align, offset, cell, cell_size, res + size, cell + cell_size
                     );
                 }
+                self.allocate_black_if_needed(res);
                 return res;
             }
         }
@@ -87,7 +88,11 @@ impl<VM: VMBinding> Allocator<VM> for FreeListAllocator<VM> {
         // Try get a block from the space
         if let Some(block) = self.acquire_global_block(size, align, false) {
             let addr = self.block_alloc(block);
-            allocator::align_allocation::<VM>(addr, align, offset)
+            let res = allocator::align_allocation::<VM>(addr, align, offset);
+            if !res.is_zero() {
+                self.allocate_black_if_needed(res);
+            }
+            res
         } else {
             Address::ZERO
         }
@@ -129,6 +134,27 @@ impl<VM: VMBinding> Allocator<VM> for FreeListAllocator<VM> {
 }
 
 impl<VM: VMBinding> FreeListAllocator<VM> {
+    /// Allocate-black (OCaml Bactrian round 30): while a concurrent marking
+    /// cycle (or its deferred sweep) is in flight, objects born in this
+    /// free-list space must carry the mark bit or the cycle's sweep frees
+    /// them live — the free-list analog of the Immix allocator's
+    /// allocate-as-live path. The sweep probes
+    /// `cell + OBJECT_REF_OFFSET_LOWER_BOUND` (and every MIN_OBJECT_SIZE
+    /// step after), so marking the allocation start + that offset is found
+    /// by construction. One flag load per allocation when idle.
+    fn allocate_black_if_needed(&self, alloc_start: crate::util::Address) {
+        use crate::policy::space::Space;
+        use crate::vm::ObjectModel;
+        if self.space.should_allocate_as_live() {
+            let objref = unsafe {
+                crate::util::ObjectReference::from_raw_address_unchecked(
+                    alloc_start + VM::VMObjectModel::OBJECT_REF_OFFSET_LOWER_BOUND,
+                )
+            };
+            VM::VMObjectModel::LOCAL_MARK_BIT_SPEC
+                .mark::<VM>(objref, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
     // New free list allcoator
     pub(crate) fn new(
         tls: VMThread,

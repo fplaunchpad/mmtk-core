@@ -53,6 +53,12 @@ fn common_nonmoving_release<VM: VMBinding>(mutator: &mut Mutator<VM>) {
 // (ConcurrentImmix precedent: InitialMark schedules no mutator release and
 // FinalMark no prepare, so both hooks must invalidate the stale bump cursor).
 fn reset_pretenure_allocator<VM: VMBinding>(mutator: &mut Mutator<VM>) {
+    // In freelist mode NonMoving maps to FreeList(0) (handled by
+    // common_nonmoving_prepare/release); the reserved Immix(0) mutator
+    // allocator is then unused and needs no reset.
+    if medium_to_freelist() {
+        return;
+    }
     let immix_allocator = unsafe {
         mutator
             .allocators
@@ -123,11 +129,41 @@ const BACTRIAN_RESERVED: ReservedAllocators = ReservedAllocators {
     ..ReservedAllocators::DEFAULT
 };
 
+/// Where the pretenured >=2056B band lives (round 30). `immix` (default):
+/// the mature Immix space — the round-23..29 behaviour. EXPERIMENTAL
+/// `MMTK_MEDIUM_TO=freelist`: the common mark-sweep nonmoving space —
+/// VANILLA'S reclamation regime for exactly these objects (shared_heap.c
+/// pools: a dead cell relinks into a size-class free list and is reused in
+/// place, no mark cycle needed), the root-cause fix for fragmed's 3.06x/
+/// 189MB gap. Staged OFF because it is UNSOUND under concurrent cycles as
+/// of round 30d: the MS space's lazy sweep runs at block-acquisition time
+/// using the in-flight cycle's INCOMPLETE marks and frees not-yet-marked
+/// live cells (reproduced: fragmed segfault, a marking quantum scanning a
+/// freed cell whose header was a free-list link); the eager_sweeping
+/// feature deadlocks under Bactrian's pause schedule. The sound design
+/// (next round): mid-cycle block acquisition serves CLEAN blocks only —
+/// no sweep may consume incomplete marks — plus the allocate-black path
+/// already added to FreeListAllocator. Requires `marksweep_as_nonmoving`.
+fn medium_to_freelist() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        cfg!(feature = "marksweep_as_nonmoving")
+            && matches!(
+                std::env::var("MMTK_MEDIUM_TO").as_deref(),
+                Ok("freelist") | Ok("Freelist") | Ok("FreeList")
+            )
+    })
+}
+
 lazy_static::lazy_static! {
     static ref ALLOCATOR_MAPPING: EnumMap<AllocationSemantics, AllocatorSelector> = {
         let mut map = create_allocator_mapping(BACTRIAN_RESERVED, true);
         map[AllocationSemantics::Default] = AllocatorSelector::BumpPointer(0);
-        map[AllocationSemantics::NonMoving] = AllocatorSelector::Immix(0);
+        // freelist mode keeps the common mapping (NonMoving -> FreeList(0),
+        // the common mark-sweep nonmoving space).
+        if !medium_to_freelist() {
+            map[AllocationSemantics::NonMoving] = AllocatorSelector::Immix(0);
+        }
         map
     };
 }
