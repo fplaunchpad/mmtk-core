@@ -39,6 +39,7 @@ use crate::ObjectQueue;
 use atomic::Atomic;
 use enum_map::EnumMap;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
 use mmtk_macros::{HasSpaces, PlanTraceObject};
@@ -110,6 +111,11 @@ pub struct Bactrian<VM: VMBinding> {
     /// Set by request_progress_pause (mature-direct allocation wants the
     /// in-flight quanta to advance); consumed by collection_required.
     progress_pause_requested: AtomicBool,
+    /// Per-pause mark-quantum budget hint in nanoseconds, set by the
+    /// binding's pacing at cycle-trigger time (ConcurrentPlan::
+    /// set_mark_quantum_hint_ms — stock's slice-sizing law: mark debt over
+    /// runway pauses). 0 = use the static MMTK_MARK_SLICE_MS budget.
+    pub(in crate::plan) mark_quantum_hint_nanos: AtomicU64,
     previous_pause: Atomic<Option<Pause>>,
     concurrent_marking_active: AtomicBool,
 }
@@ -240,10 +246,19 @@ impl<VM: VMBinding> Plan for Bactrian<VM> {
                     match pause {
                         // Mid-cycle nursery pause: drain a bounded mark quantum
                         // AFTER the nursery closure (Release opens once Closure
-                        // and weak processing are done).
+                        // and weak processing are done). UNBUDGETED on a
+                        // genuine emergency (allocation failed mid-cycle: the
+                        // runway is gone, so marking must complete now — the
+                        // next pause is then FinalMark and its sweep frees the
+                        // backlog; a budgeted drain would loop failing polls).
                         Pause::Nursery if self.concurrent_marking_in_progress() => {
-                            scheduler.work_buckets[WorkBucketStage::Release]
-                                .add(BactrianMarkQuantum::budgeted(self));
+                            let emergency = self.genuine_allocation_emergency();
+                            let w = if emergency {
+                                BactrianMarkQuantum::unbudgeted(self)
+                            } else {
+                                BactrianMarkQuantum::budgeted(self)
+                            };
+                            scheduler.work_buckets[WorkBucketStage::Release].add(w);
                         }
                         // FinalMark: drain EVERYTHING parked, unbudgeted, inside
                         // the Closure stage — mutators are stopped and their
@@ -277,14 +292,7 @@ impl<VM: VMBinding> Plan for Bactrian<VM> {
                         // drain — vanilla's cycles likewise wait out the
                         // previous sweep, and an eager drain-all doubled the
                         // minor pause max (8.2 -> 14.4ms measured at bt@2M).
-                        let emergency = self
-                            .gen
-                            .common
-                            .base
-                            .global_state
-                            .cur_collection_attempts
-                            .load(Ordering::SeqCst)
-                            > 1;
+                        let emergency = self.genuine_allocation_emergency();
                         let w = if emergency {
                             BactrianSweepQuantum::unbudgeted(self)
                         } else {
@@ -739,6 +747,11 @@ impl<VM: VMBinding> ConcurrentPlan for Bactrian<VM> {
         !self.sweep_pending.load(Ordering::SeqCst)
     }
 
+    fn set_mark_quantum_hint_ms(&self, ms: f64) {
+        let ns = (ms.max(0.0) * 1e6) as u64;
+        self.mark_quantum_hint_nanos.store(ns, Ordering::Relaxed);
+    }
+
     fn request_progress_pause(&self) {
         // Only meaningful with in-flight incremental work; the flag is
         // consumed (or discarded) at the next allocation poll.
@@ -907,6 +920,7 @@ impl<VM: VMBinding> Bactrian<VM> {
             parked_sweep: crossbeam::deque::Injector::new(),
             sweep_pending: AtomicBool::new(false),
             progress_pause_requested: AtomicBool::new(false),
+            mark_quantum_hint_nanos: AtomicU64::new(0),
             previous_pause: Atomic::new(None),
             concurrent_marking_active: AtomicBool::new(false),
         };
@@ -959,14 +973,7 @@ impl<VM: VMBinding> Bactrian<VM> {
                 .load(Ordering::SeqCst);
             let user_full = user_triggered
                 && (cycle_requested || *self.gen.common.base.options.full_heap_system_gc);
-            let emergency = self
-                .gen
-                .common
-                .base
-                .global_state
-                .cur_collection_attempts
-                .load(Ordering::SeqCst)
-                > 1;
+            let emergency = self.genuine_allocation_emergency();
             let vm_exhausted = ((self.get_collection_reserved_pages() as f64
                 * VM::VMObjectModel::VM_WORST_CASE_COPY_EXPANSION)
                 as usize)
@@ -975,23 +982,41 @@ impl<VM: VMBinding> Bactrian<VM> {
                 || user_full
                 || emergency
                 || vm_exhausted;
-            if std::env::var_os("BACTRIAN_TRACE").is_some() {
-                eprintln!(
-                    "[bactrian] decide: cycle_req={} user={} emergency={} vm_exhausted={} -> {}",
-                    cycle_requested,
-                    user_triggered,
-                    emergency,
-                    vm_exhausted,
-                    if full { "Full" } else { "cycle/nursery" }
-                );
-            }
-            if full {
+            let decision = if full {
                 Pause::Full
             } else if cycle_requested {
                 // Debug bisection knob: BACTRIAN_NO_CONCURRENT=1 degrades every
                 // major-cycle request to a STW Full GC (GenImmix-equivalent
                 // behaviour), isolating the concurrent machinery when debugging.
                 if std::env::var_os("BACTRIAN_NO_CONCURRENT").is_some() {
+                    Pause::Full
+                } else if self.sliced_marking && {
+                    // FEASIBILITY escape (round 30): slicing pays only when it
+                    // can make pauses SMALL; otherwise the monolithic Full is
+                    // strictly better — the same worst-case pause at
+                    // measurably less total GC time (bt-def@192M: 2663ms Full
+                    // vs 3181ms sliced, max pause ~103-138ms either way; SATB
+                    // + floating garbage + allocate-as-live are pure overhead
+                    // when the pauses are giant anyway). Two gates:
+                    //  - nursery size (MMTK_SLICE_MAX_NURSERY_MB, default 4):
+                    //    a big-nursery config's MINOR pauses are already tens
+                    //    of ms (promotion-bound), so sliced majors cannot get
+                    //    under them — the big nursery IS the throughput dial.
+                    //    Vanilla's slices are small precisely because its
+                    //    minor heap is 2MB. And the slice-sizing estimate is
+                    //    reliable only when many pauses fit the runway: at
+                    //    n16 the debt grows faster than the 1-2 predicted
+                    //    pauses can absorb and FinalMark drains ~100ms.
+                    //  - the binding's slice-sizing hint (mark debt / runway
+                    //    pauses, MMTK_MAX_QUANTUM_MS cap, default 50): even a
+                    //    small-nursery config on a heap too tight for its
+                    //    live set cannot slice usefully.
+                    let nursery_big = self.gen.common.base.gc_trigger.get_max_nursery_pages()
+                        > slice_max_nursery_pages();
+                    let hint_ms =
+                        self.mark_quantum_hint_nanos.load(Ordering::Relaxed) as f64 / 1e6;
+                    nursery_big || hint_ms > max_quantum_ms()
+                } {
                     Pause::Full
                 } else if !self.sliced_marking
                     && self.immix_space.reserved_pages() < conc_mark_min_mature_pages()
@@ -1017,8 +1042,39 @@ impl<VM: VMBinding> Bactrian<VM> {
                 }
             } else {
                 Pause::Nursery
+            };
+            if std::env::var_os("BACTRIAN_TRACE").is_some() {
+                eprintln!(
+                    "[bactrian] decide: cycle_req={} user={} emergency={} vm_exhausted={} -> {:?}",
+                    cycle_requested, user_triggered, emergency, vm_exhausted, decision
+                );
             }
+            decision
         }
+    }
+
+    /// A GENUINE allocation-failure emergency (degrade to STW Full /
+    /// unbudgeted quanta), as opposed to mmtk-core's raw
+    /// `cur_collection_attempts > 1`. The raw counter is spuriously 2 for
+    /// every binding-forced pacing trigger honored at the first poll after
+    /// a minor: the allocation that triggered the minor retries, its TLAB
+    /// refill polls, the pending `next_gc_full_heap` blocks it again — two
+    /// GCs with no successful allocation between reads as a failed-alloc
+    /// retry loop. That hijack degraded every post-minor pressure cycle to
+    /// an emergency monolithic Full (bt@192M: all majors, 80-140ms pauses;
+    /// round 30). A real OOM loop reaches 3 on its second failed retry, one
+    /// bounded nursery-class pause later — and the mid-cycle emergency
+    /// unbudgeted mark quantum completes marking so the Full/sweep can free
+    /// the backlog. mmtk-core's own HeapOutOfMemory protocol reads its own
+    /// flag and is unaffected.
+    fn genuine_allocation_emergency(&self) -> bool {
+        self.gen
+            .common
+            .base
+            .global_state
+            .cur_collection_attempts
+            .load(Ordering::SeqCst)
+            > 2
     }
 
     /// Temporary bring-up tracing (release builds strip `log`); gated on
@@ -1125,6 +1181,36 @@ fn nursery_age() -> usize {
 /// a STW Full GC instead of concurrent marking. See the ADAPTIVE MARKING
 /// comment at the Pause decision. Bactrian-plan-local: no other plan (and not
 /// LXR) consults this.
+/// Largest nursery for which sliced major cycles pay (pages;
+/// MMTK_SLICE_MAX_NURSERY_MB overrides, default 4MB — see the feasibility
+/// escape in decide_pause). Above it, minor pauses are promotion-bound and
+/// already dwarf any quantum, so majors run monolithic.
+fn slice_max_nursery_pages() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let mb = std::env::var("MMTK_SLICE_MAX_NURSERY_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|m| *m > 0)
+            .unwrap_or(4);
+        mb * 1024 * 1024 / crate::util::constants::BYTES_IN_PAGE
+    })
+}
+
+/// Largest per-pause mark quantum worth slicing for, ms
+/// (MMTK_MAX_QUANTUM_MS overrides; see the feasibility escape in
+/// decide_pause). Above this the monolithic Full wins on both axes.
+fn max_quantum_ms() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("MMTK_MAX_QUANTUM_MS")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|ms| *ms > 0.0)
+            .unwrap_or(50.0)
+    })
+}
+
 fn conc_mark_min_mature_pages() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| {

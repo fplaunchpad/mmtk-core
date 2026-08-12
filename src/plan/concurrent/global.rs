@@ -83,6 +83,17 @@ pub trait ConcurrentPlan: Plan {
     /// collection_required at the next poll. Default: no-op.
     fn request_progress_pause(&self) {}
 
+    /// Hint the per-pause mark-quantum budget for the cycle being triggered,
+    /// in milliseconds — stock OCaml's mark-slice sizing law, computed by the
+    /// binding's pacing at cycle-trigger time: the mark debt (post-sweep
+    /// live) spread over the pauses the remaining heap runway will yield
+    /// (`debt_ms / (runway / nursery)`). A fixed small budget cannot absorb a
+    /// large live set inside a short runway — the un-absorbed remainder used
+    /// to drain in one giant FinalMark pause. 0/never-called = the static
+    /// MMTK_MARK_SLICE_MS budget. Default: no-op for plans without sliced
+    /// marking.
+    fn set_mark_quantum_hint_ms(&self, _ms: f64) {}
+
     /// Did the pause that JUST ENDED start a marking cycle (`InitialMark`, or
     /// a full STW GC — which is a whole cycle in one pause)? For
     /// allocation-denominated cycle pacing: stock-style pacing measures the
