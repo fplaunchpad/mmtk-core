@@ -699,6 +699,20 @@ impl<VM: VMBinding> ConcurrentPlan for Bactrian<VM> {
     }
 }
 
+/// Auto-compaction threshold: percentage of live blocks that may be
+/// partially occupied before a compacting Full is requested. 0 disables
+/// (the default pending calibration — see SHAPE round 29+).
+fn compact_util_threshold_pct() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("MMTK_COMPACT_UTIL_PCT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|p| *p <= 100)
+            .unwrap_or(0)
+    })
+}
+
 impl<VM: VMBinding> Bactrian<VM> {
     /// Pop one parked sweep packet (incremental sweep).
     pub(super) fn pop_sweep_packet(&self) -> Option<Box<dyn GCWork<VM>>> {
@@ -714,6 +728,33 @@ impl<VM: VMBinding> Bactrian<VM> {
     /// Called by the sweep quantum when it drains the queue empty.
     pub(super) fn sweep_queue_emptied(&self) {
         self.sweep_pending.store(false, Ordering::SeqCst);
+        // AUTO-COMPACTION (knob-gated, MMTK_COMPACT_UTIL_PCT; 0 = off):
+        // Bactrian's cycles never defragment — defrag runs only at STW Fulls,
+        // which the pacing never schedules — so a fragmented mature space
+        // (kb: ~15 MiB of partially-occupied blocks for 2.5 MiB live) holds
+        // its slack forever. Stock OCaml's analog is automatic compaction.
+        // The post-sweep metric is the honest trigger point: if more than
+        // the threshold fraction of live blocks are only partially occupied,
+        // request a Full — which (given reusable blocks exist) is already a
+        // defragmenting collection by mmtk's decide_whether_to_defrag law
+        // (!exhausted_reusable_space). Self-limiting: the compacting Full
+        // resets the fraction, so it cannot storm.
+        let threshold = compact_util_threshold_pct();
+        if threshold > 0 {
+            let (partial, live) = self.immix_space.post_sweep_fragmentation();
+            // Small-heap floor: with a handful of live blocks the fraction is
+            // meaningless (spectralnorm: 2-3 blocks, all partial -> the
+            // trigger stormed a compacting Full per cycle). Require at least
+            // 64 live blocks (2 MiB) before the law can fire.
+            if live >= 64 && partial * 100 >= live * threshold {
+                if std::env::var_os("MMTK_PACE_DEBUG").is_some() {
+                    eprintln!(
+                        "[compact] trigger: {partial}/{live} live blocks partial (>= {threshold}%)"
+                    );
+                }
+                self.gen.next_gc_full_heap.store(true, Ordering::SeqCst);
+            }
+        }
     }
 
     /// Pop one parked marking packet (sliced mode).

@@ -90,6 +90,11 @@ pub struct ImmixSpace<VM: VMBinding> {
     line_unavail_state: AtomicU8,
     /// A list of all reusable blocks
     pub reusable_blocks: ReusableBlockPool,
+    /// Live (allocated) blocks counted by the most recent sweep — reset when
+    /// sweep tasks are generated, accumulated by SweepChunk packets. With
+    /// `reusable_blocks.len()` this yields a post-sweep fragmentation metric:
+    /// the fraction of live blocks that are only partially occupied.
+    pub swept_live_blocks: std::sync::atomic::AtomicUsize,
     /// Defrag utilities
     pub(super) defrag: Defrag,
     /// How many lines have been consumed since last GC?
@@ -517,6 +522,7 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             line_unavail_state: AtomicU8::new(Line::RESET_MARK_STATE),
             lines_consumed: AtomicUsize::new(0),
             reusable_blocks: ReusableBlockPool::new(scheduler.num_workers()),
+            swept_live_blocks: std::sync::atomic::AtomicUsize::new(0),
             defrag: Defrag::default(),
             // Set to the correct mark state when inititialized. We cannot rely on prepare to set it (prepare may get skipped in nursery GCs).
             mark_state: Self::MARKED_STATE,
@@ -913,8 +919,18 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         did_defrag
     }
 
+    /// Post-sweep fragmentation: (partially-occupied live blocks, live blocks).
+    /// Meaningful after the sweep (immediate or deferred) has fully drained.
+    pub fn post_sweep_fragmentation(&self) -> (usize, usize) {
+        (
+            self.reusable_blocks.len(),
+            self.swept_live_blocks.load(Ordering::Relaxed),
+        )
+    }
+
     /// Generate chunk sweep tasks
     fn generate_sweep_tasks(&self, unlog_bits_op: UnlogBitsOperation) -> Vec<Box<dyn GCWork<VM>>> {
+        self.swept_live_blocks.store(0, Ordering::Relaxed);
         self.defrag.mark_histograms.lock().clear();
         // # Safety: ImmixSpace reference is always valid within this collection cycle.
         let space = unsafe { &*(self as *const Self) };
@@ -1496,6 +1512,11 @@ impl<VM: VMBinding> GCWork<VM> for SweepChunk<VM> {
             }
         }
         probe!(mmtk, sweep_chunk, allocated_blocks);
+        // Accumulate the live-block count for the post-sweep fragmentation
+        // metric (see `post_sweep_fragmentation`).
+        self.space
+            .swept_live_blocks
+            .fetch_add(allocated_blocks, Ordering::Relaxed);
         // Set this chunk as free if there is not live blocks.
         if allocated_blocks == 0 {
             self.space.chunk_map.set_allocated(self.chunk, false)
