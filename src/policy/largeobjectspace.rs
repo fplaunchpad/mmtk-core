@@ -29,7 +29,14 @@ pub struct LargeObjectSpace<VM: VMBinding> {
     common: CommonSpace<VM>,
     pr: FreeListPageResource<VM>,
     mark_state: u8,
-    in_nursery_gc: bool,
+    /// Latched at prepare(): true during a nursery-collecting pause. Made
+    /// atomic so a concurrent-marking drain (Bactrian's sliced quanta) can
+    /// SCOPE full-heap marking semantics over its execution — mid-cycle
+    /// marking of MATURE LOS objects must mark + treadmill-move them
+    /// regardless of the enclosing pause's kind, or FinalMark's sweep frees
+    /// live objects (the sliced-marking x LOS corruption, OCaml binding
+    /// NOTES 2026-08-12).
+    in_nursery_gc: std::sync::atomic::AtomicBool,
     treadmill: TreadMill,
     clear_log_bit_on_sweep: bool,
     /// lxr P2.I: does this LOS run the RC read-side overlays? (= constraints.rc_enabled,
@@ -336,7 +343,7 @@ impl<VM: VMBinding> LargeObjectSpace<VM> {
             pr,
             common,
             mark_state: 0,
-            in_nursery_gc: false,
+            in_nursery_gc: std::sync::atomic::AtomicBool::new(false),
             treadmill: TreadMill::new(),
             clear_log_bit_on_sweep,
             rc_enabled,
@@ -345,12 +352,21 @@ impl<VM: VMBinding> LargeObjectSpace<VM> {
         }
     }
 
+    /// Scope full-heap marking semantics over a mid-cycle marking drain (see
+    /// the `in_nursery_gc` doc). Returns the previous value; caller restores.
+    pub fn set_marking_full_semantics(&self, on: bool) -> bool {
+        self.in_nursery_gc
+            .swap(!on, Ordering::SeqCst)
+            == false
+    }
+
     pub fn prepare(&mut self, full_heap: bool) {
         if full_heap {
             self.mark_state = MARK_BIT - self.mark_state;
         }
         self.treadmill.flip(full_heap);
-        self.in_nursery_gc = !full_heap;
+        self.in_nursery_gc
+            .store(!full_heap, Ordering::SeqCst);
     }
 
     pub fn release(&mut self, full_heap: bool) {
@@ -387,7 +403,7 @@ impl<VM: VMBinding> LargeObjectSpace<VM> {
             object,
             if nursery_object { "is" } else { "is not" }
         );
-        if !self.in_nursery_gc || nursery_object {
+        if !self.in_nursery_gc.load(Ordering::Relaxed) || nursery_object {
             // Note that test_and_mark() has side effects of
             // clearing nursery bit/moving objects out of logical nursery
             if self.test_and_mark(object, self.mark_state) {
@@ -459,7 +475,7 @@ impl<VM: VMBinding> LargeObjectSpace<VM> {
     /// Otherwise, it returns false.
     fn test_and_mark(&self, object: ObjectReference, value: u8) -> bool {
         loop {
-            let mask = if self.in_nursery_gc {
+            let mask = if self.in_nursery_gc.load(Ordering::Relaxed) {
                 LOS_BIT_MASK
             } else {
                 MARK_BIT
@@ -501,7 +517,7 @@ impl<VM: VMBinding> LargeObjectSpace<VM> {
     }
 
     /// Check if a given object is in nursery
-    fn is_in_nursery(&self, object: ObjectReference) -> bool {
+    pub fn is_in_nursery(&self, object: ObjectReference) -> bool {
         VM::VMObjectModel::LOCAL_LOS_MARK_NURSERY_SPEC.load_atomic::<VM, u8>(
             object,
             None,

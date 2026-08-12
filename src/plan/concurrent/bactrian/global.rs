@@ -477,9 +477,21 @@ impl<VM: VMBinding> GenerationalPlan for Bactrian<VM> {
     fn is_object_in_nursery(&self, object: ObjectReference) -> bool {
         // The aged pair is part of the YOUNG generation: every barrier, SATB
         // young-drop, and concurrent-marking skip routes through this check.
+        //
+        // YOUNG-LOS COUNTS AS YOUNG (2026-08-12, the sliced-marking x LOS
+        // corruption): a young LOS object is post-snapshot exactly like a
+        // nursery object (everything LOS-reachable at InitialMark was
+        // in-place-promoted by that pause's trace), and it can be FREED by
+        // any subsequent minor's LOS-nursery sweep. Admitting one into the
+        // SATB/marking queues therefore dangles under sliced marking, where
+        // parked packets outlive minors (worker-concurrent mode drains in
+        // microseconds, which merely hid the same hole). Dropping it here is
+        // sound for the same reason dropping copying-nursery refs is.
         self.gen.nursery.in_space(object)
             || self.aged0.in_space(object)
             || self.aged1.in_space(object)
+            || (self.gen.common.los.in_space(object)
+                && self.gen.common.los.is_in_nursery(object))
     }
 
     fn is_address_in_nursery(&self, addr: Address) -> bool {
@@ -579,10 +591,13 @@ impl<VM: VMBinding> ConcurrentPlan for Bactrian<VM> {
     }
 
     fn should_skip_concurrent_trace(&self, object: ObjectReference) -> bool {
-        // The copying nursery is outside the snapshot: young objects are all
-        // post-snapshot (InitialMark empties the nursery) and move at every
-        // nursery pause, so the concurrent marker must never see them.
-        self.gen.nursery.in_space(object)
+        // The YOUNG generation is outside the snapshot: young objects are all
+        // post-snapshot (InitialMark empties the nursery and in-place-promotes
+        // reachable young LOS) and either move at every nursery pause (copying
+        // nursery, aged pair) or can be FREED by one (young LOS — the
+        // sliced-marking corruption, NOTES 2026-08-12), so the marker must
+        // never see any of them. One young-check for every path.
+        self.is_object_in_nursery(object)
     }
 
     fn schedule_marking_packet(&self, w: Box<dyn GCWork<VM>>) {
