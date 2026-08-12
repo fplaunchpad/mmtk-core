@@ -777,6 +777,12 @@ fn compact_util_threshold_pct() -> usize {
 }
 
 impl<VM: VMBinding> Bactrian<VM> {
+    /// Is survivor aging configured? (The oldify fast path must decline when
+    /// it is: young survivors take the aged copy path it doesn't implement.)
+    pub(super) fn aging_enabled(&self) -> bool {
+        nursery_age() >= 1
+    }
+
     /// Pop one parked sweep packet (incremental sweep).
     pub(super) fn pop_sweep_packet(&self) -> Option<Box<dyn GCWork<VM>>> {
         loop {

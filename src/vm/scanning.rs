@@ -2,6 +2,34 @@ use crate::plan::Mutator;
 use crate::scheduler::GCWorker;
 use crate::util::ObjectReference;
 use crate::util::VMWorkerThread;
+
+/// Services the core provides to a binding-implemented single-tracer oldify
+/// loop (see [`Scanning::up_oldify_packet`]).
+pub trait UpOldifyOps<VM: crate::vm::VMBinding> {
+    /// The contiguous range of the collected copying young generation
+    /// [start, end): lets the binding's hot loop test youth with two inline
+    /// compares. (Aging must be disabled — the aged pair is a second range.)
+    fn young_range(&self) -> (crate::util::Address, crate::util::Address);
+    /// Is this address inside the collected young generation?
+    fn in_young(&self, addr: crate::util::Address) -> bool;
+    /// Bump-allocate `bytes` in the mature space (copy semantics; may take
+    /// the slow path and acquire blocks, never triggers GC — the world is
+    /// stopped inside one).
+    fn alloc_mature(&mut self, bytes: usize) -> crate::util::Address;
+    /// Post-copy protocol for a promoted object: object mark state, unlog
+    /// (remembered-set) state, and line marks — everything the generic
+    /// promotion path would have done.
+    fn post_copy(&mut self, object: crate::util::ObjectReference, bytes: usize);
+    /// Is this object a YOUNG large object (LOS nursery)? Such objects are
+    /// promoted IN PLACE, never copied.
+    fn is_young_los(&self, object: crate::util::ObjectReference) -> bool;
+    /// Promote a young large object in place. Returns true if this call
+    /// performed the promotion (the caller must then scan its fields);
+    /// false if it was already promoted this pause.
+    fn promote_young_los(&mut self, object: crate::util::ObjectReference) -> bool;
+}
+
+
 use crate::vm::slot::Slot;
 use crate::vm::VMBinding;
 
@@ -170,6 +198,27 @@ pub trait Scanning<VM: VMBinding> {
     /// * `object`: The object to be scanned.
     fn support_slot_enqueuing(_tls: VMWorkerThread, _object: ObjectReference) -> bool {
         true
+    }
+
+    /// OPT-IN single-tracer oldify hook (stock-OCaml-style minor GC fast
+    /// path). When a plan drains a nursery closure under a single tracer in
+    /// a stopped world, it MAY offer each slot packet to the binding via this
+    /// hook. A binding that implements it walks the transitive closure
+    /// natively — header-discriminated forwarding, inline copy, explicit
+    /// work list — using only the [`UpOldifyOps`] services, and returns
+    /// `true`. Returning `false` (the default) keeps the generic path.
+    ///
+    /// Correctness contract for implementers: the world is stopped, exactly
+    /// one tracer runs, forwarding uses the header-sentinel protocol
+    /// (`ObjectModel::HEADER_FORWARDING_SENTINEL` must be true), every
+    /// copied object must be reported through `ops.post_copy`, and every
+    /// young reference discovered must be processed (no dropped edges).
+    fn up_oldify_packet<O: UpOldifyOps<VM>>(
+        _tls: VMWorkerThread,
+        _slots: &[VM::VMSlot],
+        _ops: &mut O,
+    ) -> bool {
+        false
     }
 
     /// Delegated scanning of a object, visiting each reference field encountered.

@@ -19,7 +19,15 @@ use crate::scheduler::ProcessEdgesWork;
 use crate::scheduler::WorkBucketStage;
 use crate::util::ObjectReference;
 use crate::vm::slot::Slot;
+use crate::vm::Scanning;
 use crate::vm::VMBinding;
+
+/// MMTK_UP_OLDIFY=1: opt-in stock-oldify fast path for plain nursery pauses
+/// under UP (see Scanning::up_oldify_packet). Default OFF.
+fn up_oldify_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("MMTK_UP_OLDIFY").map(|v| v == "1").unwrap_or(false))
+}
 use crate::MMTK;
 use std::ops::{Deref, DerefMut};
 
@@ -83,6 +91,67 @@ struct SlotCollector<'a, S: Slot>(&'a mut Vec<S>);
 impl<S: Slot> crate::vm::SlotVisitor<S> for SlotCollector<'_, S> {
     fn visit_slot(&mut self, slot: S) {
         self.0.push(slot);
+    }
+}
+
+/// Core services for the binding's oldify loop (MMTK_UP_OLDIFY): young test
+/// on the copying nursery + aged pair, mature bump-alloc through the
+/// worker's copy context, and the full promotion post-copy protocol.
+struct BactrianOldifyOps<'w, VM: VMBinding> {
+    plan: &'static Bactrian<VM>,
+    worker: &'w mut crate::scheduler::GCWorker<VM>,
+}
+
+impl<VM: VMBinding> crate::vm::UpOldifyOps<VM> for BactrianOldifyOps<'_, VM> {
+    #[inline(always)]
+    fn young_range(&self) -> (crate::util::Address, crate::util::Address) {
+        use crate::policy::space::Space;
+        let c = self.plan.gen.nursery.common();
+        (c.start, c.start + c.extent)
+    }
+
+    #[inline(always)]
+    fn in_young(&self, addr: crate::util::Address) -> bool {
+        self.plan.is_address_in_nursery(addr)
+    }
+
+    fn alloc_mature(&mut self, bytes: usize) -> crate::util::Address {
+        self.worker.get_copy_context_mut().alloc_copy(
+            unsafe {
+                crate::util::ObjectReference::from_raw_address_unchecked(
+                    crate::util::Address::from_usize(8),
+                )
+            },
+            bytes,
+            crate::util::constants::BYTES_IN_WORD,
+            0,
+            crate::util::copy::CopySemantics::PromoteToMature,
+        )
+    }
+
+    fn post_copy(&mut self, object: crate::util::ObjectReference, bytes: usize) {
+        self.worker.get_copy_context_mut().post_copy(
+            object,
+            bytes,
+            crate::util::copy::CopySemantics::PromoteToMature,
+        );
+        self.plan.post_scan_object(object);
+    }
+
+    fn is_young_los(&self, object: crate::util::ObjectReference) -> bool {
+        use crate::policy::space::Space;
+        self.plan.gen.common.los.in_space(object)
+            && self.plan.gen.common.los.is_in_nursery(object)
+    }
+
+    fn promote_young_los(&mut self, object: crate::util::ObjectReference) -> bool {
+        // LOS in-place promotion: test_and_mark clears the nursery bit and
+        // moves the treadmill entry; a newly-promoted object is enqueued for
+        // scanning — intercepted with a local queue so the caller scans it
+        // via the oldify walk instead.
+        let mut q = crate::plan::VectorObjectQueue::default();
+        self.plan.gen.common.los.trace_object(&mut q, object);
+        !q.is_empty()
     }
 }
 
@@ -380,6 +449,41 @@ impl<VM: VMBinding> ProcessEdgesWork for BactrianNurseryProcessEdges<VM> {
         debug_assert!(!self.plan.gen.nursery.in_space(new_object));
         if new_object != object {
             slot.store(new_object);
+        }
+    }
+
+    fn process_slots(&mut self) {
+        // OPT-IN oldify fast path (MMTK_UP_OLDIFY=1): plain nursery pauses
+        // only (no seed/remark logic), single tracer, world stopped. The
+        // binding walks this packet's slots and their transitive closure
+        // natively — stock minor_gc.c's structure — leaving nothing to trace
+        // or schedule for this packet. Aging must be off (young survivors
+        // would need the aged copy path, which the oldify loop doesn't know).
+        if self.pause == Pause::Nursery
+            && up_oldify_enabled()
+            && crate::util::up_trace::up()
+            && !self.plan.aging_enabled()
+            && !*self.base.mmtk().get_options().count_live_bytes_in_gc
+            && !self.base.slots.is_empty()
+        {
+            let slots = std::mem::take(&mut self.base.slots);
+            let plan = self.plan;
+            let tls = self.worker().tls;
+            let consumed = {
+                let worker = self.worker();
+                let mut ops = BactrianOldifyOps { plan, worker };
+                <VM as VMBinding>::VMScanning::up_oldify_packet::<BactrianOldifyOps<VM>>(
+                    tls, &slots, &mut ops,
+                )
+            };
+            if consumed {
+                return;
+            }
+            // Binding declined: restore and take the generic path.
+            self.base.slots = slots;
+        }
+        for i in 0..self.base.slots.len() {
+            self.process_slot(self.base.slots[i])
         }
     }
 
