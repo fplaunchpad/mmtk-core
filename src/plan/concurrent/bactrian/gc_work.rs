@@ -331,7 +331,18 @@ impl<VM: VMBinding> ProcessEdgesWork for BactrianNurseryProcessEdges<VM> {
         // returns the new copy, which post_copy born-black-marked and which this
         // trace scans transitively; an LOS "promotion" is in place and is idempotent
         // under both treatments below).
-        if new_object == object && !self.plan.is_object_in_nursery(object) {
+        //
+        // Pause gate FIRST: the seed/remark treatments below only exist for the
+        // two marking-fused pauses. A plain mid-cycle Nursery pause ran the
+        // young-check chain (4 space lookups per traced object since the
+        // young-LOS fix) for a match arm that does nothing — measured ~2-4%
+        // of bt's whole-process cycles. The chain is also SOUND to skip for
+        // the LOS side here: any LOS object this trace reaches was in-place
+        // promoted (nursery bit cleared) before this check runs.
+        if matches!(self.pause, Pause::InitialMark | Pause::FinalMark)
+            && new_object == object
+            && !self.plan.is_object_in_nursery(object)
+        {
             match self.pause {
                 Pause::InitialMark => {
                     crate::plan::concurrent::diag::SEEDED
