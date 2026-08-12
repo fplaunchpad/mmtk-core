@@ -19,6 +19,7 @@ use crate::policy::immix::ImmixSpaceArgs;
 use crate::policy::immix::{TRACE_KIND_DEFRAG, TRACE_KIND_FAST};
 use crate::policy::space::Space;
 use crate::plan::concurrent::bactrian::gc_work::BactrianMarkQuantum;
+use crate::plan::concurrent::bactrian::gc_work::BactrianSweepQuantum;
 use crate::scheduler::GCWork;
 use crate::scheduler::GCWorkScheduler;
 use crate::scheduler::GCWorker;
@@ -95,6 +96,17 @@ pub struct Bactrian<VM: VMBinding> {
     /// ProcessModBufSATB). Mutator-side SATB flushes push here between
     /// pauses; quanta pop inside pauses. MPMC-safe.
     parked_marking: crossbeam::deque::Injector<Box<dyn GCWork<VM>>>,
+    /// INCREMENTAL SWEEP (sliced mode): FinalMark defers its chunk-sweep
+    /// packets here instead of running them inside the pause — stock OCaml's
+    /// sweep slices. Budgeted BactrianSweepQuantum packets drain them in the
+    /// Release stage of subsequent nursery pauses. The next cycle/Full is
+    /// gated on drain completion (decide_pause), because the packets read
+    /// this cycle's line_mark_state/defrag histograms and the chunk map.
+    parked_sweep: crossbeam::deque::Injector<Box<dyn GCWork<VM>>>,
+    /// True from FinalMark's release until the last deferred sweep packet
+    /// has run. Read by decide_pause gating and the binding's pacing
+    /// (ConcurrentPlan::sweep_drained).
+    sweep_pending: AtomicBool,
     previous_pause: Atomic<Option<Pause>>,
     concurrent_marking_active: AtomicBool,
 }
@@ -215,6 +227,38 @@ impl<VM: VMBinding> Plan for Bactrian<VM> {
                                 .add(BactrianMarkQuantum::unbudgeted(self));
                         }
                         _ => {}
+                    }
+                    // Incremental sweep: one quantum per nursery-class pause
+                    // while packets remain. Budgeted normally; UNBUDGETED when
+                    // the pacing already wants the next cycle (next_gc_full_heap
+                    // is pending) so the cycle isn't held up by more than one
+                    // minor. Runs in Release, after this pause's own release
+                    // parked FinalMark's packets — so the first quantum can run
+                    // in the FinalMark pause itself if budget allows.
+                    if self.sweep_pending.load(Ordering::SeqCst)
+                        || pause == Pause::FinalMark
+                    {
+                        // Unbudgeted ONLY on genuine emergency (allocation
+                        // failed: the degraded-from-Full pause must free the
+                        // whole backlog now or the retry loop livelocks). A
+                        // merely-pending cycle request WAITS on the budgeted
+                        // drain — vanilla's cycles likewise wait out the
+                        // previous sweep, and an eager drain-all doubled the
+                        // minor pause max (8.2 -> 14.4ms measured at bt@2M).
+                        let emergency = self
+                            .gen
+                            .common
+                            .base
+                            .global_state
+                            .cur_collection_attempts
+                            .load(Ordering::SeqCst)
+                            > 1;
+                        let w = if emergency {
+                            BactrianSweepQuantum::unbudgeted(self)
+                        } else {
+                            BactrianSweepQuantum::budgeted(self)
+                        };
+                        scheduler.work_buckets[WorkBucketStage::Release].add(w);
                     }
                 }
             }
@@ -352,7 +396,22 @@ impl<VM: VMBinding> Plan for Bactrian<VM> {
                 // pause; everything else is untouched.
                 self.gen.nursery.release();
                 self.gen.common.release(tls, true);
-                self.immix_space.release(true, UnlogBitsOperation::NoOp);
+                if self.sliced_marking {
+                    // INCREMENTAL SWEEP: park the chunk-sweep packets; budgeted
+                    // quanta drain them across subsequent nursery pauses (stock's
+                    // sweep slices). decide_pause gates the next cycle/Full on
+                    // drain completion. LOS/common were swept above (in-pause):
+                    // only the mature Immix sweep is bulky enough to slice.
+                    let packets = self
+                        .immix_space
+                        .release_deferred_sweep(true, UnlogBitsOperation::NoOp);
+                    for w in packets {
+                        self.parked_sweep.push(w);
+                    }
+                    self.sweep_pending.store(true, Ordering::SeqCst);
+                } else {
+                    self.immix_space.release(true, UnlogBitsOperation::NoOp);
+                }
                 self.aged0.release();
                 self.aged1.release();
             }
@@ -621,6 +680,10 @@ impl<VM: VMBinding> ConcurrentPlan for Bactrian<VM> {
         self.sliced_marking
     }
 
+    fn sweep_drained(&self) -> bool {
+        !self.sweep_pending.load(Ordering::SeqCst)
+    }
+
     fn previous_pause_finished_mark(&self) -> bool {
         matches!(
             self.previous_pause(),
@@ -637,6 +700,22 @@ impl<VM: VMBinding> ConcurrentPlan for Bactrian<VM> {
 }
 
 impl<VM: VMBinding> Bactrian<VM> {
+    /// Pop one parked sweep packet (incremental sweep).
+    pub(super) fn pop_sweep_packet(&self) -> Option<Box<dyn GCWork<VM>>> {
+        loop {
+            match self.parked_sweep.steal() {
+                crossbeam::deque::Steal::Success(w) => return Some(w),
+                crossbeam::deque::Steal::Retry => continue,
+                crossbeam::deque::Steal::Empty => return None,
+            }
+        }
+    }
+
+    /// Called by the sweep quantum when it drains the queue empty.
+    pub(super) fn sweep_queue_emptied(&self) {
+        self.sweep_pending.store(false, Ordering::SeqCst);
+    }
+
     /// Pop one parked marking packet (sliced mode).
     pub(super) fn pop_marking_packet(&self) -> Option<Box<dyn GCWork<VM>>> {
         loop {
@@ -701,6 +780,8 @@ impl<VM: VMBinding> Bactrian<VM> {
                 .map(|v| v != "0")
                 .unwrap_or(true),
             parked_marking: crossbeam::deque::Injector::new(),
+            parked_sweep: crossbeam::deque::Injector::new(),
+            sweep_pending: AtomicBool::new(false),
             previous_pause: Atomic::new(None),
             concurrent_marking_active: AtomicBool::new(false),
         };
@@ -734,6 +815,15 @@ impl<VM: VMBinding> Bactrian<VM> {
             //    available-pages heuristic at end_of_gc) starts a *concurrent* major
             //    cycle — that is what a major collection IS in this design, as in
             //    stock OCaml → InitialMark.
+            // INCREMENTAL SWEEP GATE: while the previous cycle's deferred
+            // sweep is undrained, its line_mark_state / defrag histograms /
+            // chunk map are still being consumed — starting a new cycle or a
+            // Full (both re-prepare that state) would corrupt it. Stay on
+            // Nursery pauses (each drains an unbudgeted quantum when a cycle
+            // request is pending, so the delay is at most one minor).
+            if self.sliced_marking && self.sweep_pending.load(Ordering::SeqCst) {
+                return Pause::Nursery;
+            }
             let cycle_requested = self.gen.next_gc_full_heap.swap(false, Ordering::SeqCst);
             let user_triggered = self
                 .gen

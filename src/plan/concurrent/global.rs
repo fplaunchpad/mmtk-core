@@ -68,6 +68,14 @@ pub trait ConcurrentPlan: Plan {
         false
     }
 
+    /// Is the (incrementally executed) post-cycle SWEEP fully drained? For
+    /// plans that defer the mature sweep into quanta (Bactrian), the cycle is
+    /// only COMPLETE — pacing baselines valid, next cycle/full legal — once
+    /// this returns true. Plans that sweep inside the pause return true.
+    fn sweep_drained(&self) -> bool {
+        true
+    }
+
     /// Did the pause that JUST ENDED start a marking cycle (`InitialMark`, or
     /// a full STW GC — which is a whole cycle in one pause)? For
     /// allocation-denominated cycle pacing: stock-style pacing measures the

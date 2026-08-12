@@ -163,6 +163,80 @@ impl<VM: VMBinding> crate::scheduler::GCWork<VM> for BactrianMarkQuantum<VM> {
     }
 }
 
+/// Incremental-sweep quantum: pops deferred chunk-sweep packets (see
+/// `Bactrian::parked_sweep`) and executes them, world stopped, until the
+/// queue empties or the budget expires — stock OCaml's sweep slices,
+/// scheduled in the Release stage of nursery pauses after FinalMark.
+/// Unbudgeted when the pacing wants the next cycle (drain-to-completion).
+/// The freed blocks flow to the page resource per packet, so RSS falls
+/// incrementally across the minors instead of at one FinalMark cliff.
+pub(in crate::plan) struct BactrianSweepQuantum<VM: VMBinding> {
+    plan: &'static Bactrian<VM>,
+    budget: Option<std::time::Duration>,
+}
+
+/// Per-quantum sweep budget. MMTK_SWEEP_SLICE_MS overrides; default 2ms
+/// (a chunk-sweep packet is ~fast: line-mark scans over 4MB of blocks).
+fn sweep_slice_budget() -> std::time::Duration {
+    static V: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let ms = std::env::var("MMTK_SWEEP_SLICE_MS")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|ms| *ms > 0.0 && *ms <= 1000.0)
+            .unwrap_or(2.0);
+        std::time::Duration::from_secs_f64(ms / 1e3)
+    })
+}
+
+impl<VM: VMBinding> BactrianSweepQuantum<VM> {
+    pub(in crate::plan) fn budgeted(plan: &'static Bactrian<VM>) -> Self {
+        Self { plan, budget: Some(sweep_slice_budget()) }
+    }
+    pub(in crate::plan) fn unbudgeted(plan: &'static Bactrian<VM>) -> Self {
+        Self { plan, budget: None }
+    }
+}
+
+impl<VM: VMBinding> crate::scheduler::GCWork<VM> for BactrianSweepQuantum<VM> {
+    fn do_work(
+        &mut self,
+        worker: &mut crate::scheduler::GCWorker<VM>,
+        mmtk: &'static MMTK<VM>,
+    ) {
+        let deadline = self.budget.map(|b| std::time::Instant::now() + b);
+        let mut packets = 0usize;
+        loop {
+            let Some(mut w) = self.plan.pop_sweep_packet() else {
+                // Queue empty: the cycle's sweep is COMPLETE. (Single quantum
+                // per pause and quanta only run world-stopped, so this edge
+                // cannot race a concurrent producer — packets are only parked
+                // by FinalMark, which is gated on the previous drain.)
+                self.plan.sweep_queue_emptied();
+                break;
+            };
+            w.do_work(worker, mmtk);
+            packets += 1;
+            if let Some(d) = deadline {
+                if std::time::Instant::now() >= d {
+                    // Budget expired with the queue possibly non-empty: check
+                    // emptiness so a drained-on-the-last-packet quantum still
+                    // flips the flag this pause.
+                    if self.plan.pop_sweep_packet().map(|w2| {
+                        // put it back semantics unavailable on Injector; run it —
+                        // one packet of overrun keeps the logic simple.
+                        let mut w2 = w2; w2.do_work(worker, mmtk); packets += 1;
+                    }).is_none() {
+                        self.plan.sweep_queue_emptied();
+                    }
+                    break;
+                }
+            }
+        }
+        probe!(mmtk, bactrian_sweep_quantum, packets);
+    }
+}
+
 impl<VM: VMBinding> BactrianNurseryProcessEdges<VM> {
     /// Match ProcessEdgesWork's own buffer sizing for the seed packets.
     const SEED_CAPACITY: usize = 4096;

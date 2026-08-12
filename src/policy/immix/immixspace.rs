@@ -872,6 +872,37 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         self.lines_consumed.store(0, Ordering::Relaxed);
     }
 
+    /// Like [`Self::release`], but RETURNS the chunk-sweep packets instead of
+    /// scheduling them, so a plan can execute the sweep INCREMENTALLY (e.g.
+    /// Bactrian's sweep quanta inside subsequent nursery pauses — stock
+    /// OCaml's sweep slices). The caller owns correctness of the deferral:
+    /// no state the packets read (line_mark_state, defrag histograms, chunk
+    /// map) may be re-prepared until every packet has run, i.e. the next
+    /// full/cycle prepare must be gated on drain completion. Blocks freed by
+    /// a deferred packet flow to the page resource exactly as in the
+    /// immediate path; the FlushPageResource epilogue fires when the LAST
+    /// packet (whenever it runs) completes.
+    pub(crate) fn release_deferred_sweep(
+        &mut self,
+        major_gc: bool,
+        unlog_bits_op: UnlogBitsOperation,
+    ) -> Vec<Box<dyn GCWork<VM>>> {
+        debug_assert!(!self.rc_enabled);
+        if major_gc {
+            if !super::BLOCK_ONLY {
+                self.line_unavail_state.store(
+                    self.line_mark_state.load(Ordering::Acquire),
+                    Ordering::Release,
+                );
+            }
+        }
+        if !super::BLOCK_ONLY {
+            self.reusable_blocks.reset();
+        }
+        self.lines_consumed.store(0, Ordering::Relaxed);
+        self.generate_sweep_tasks(unlog_bits_op)
+    }
+
     /// This is called when a GC finished.
     /// Return whether this GC was a defrag GC, as a plan may want to know this.
     pub fn end_of_gc(&mut self) -> bool {
