@@ -107,6 +107,9 @@ pub struct Bactrian<VM: VMBinding> {
     /// has run. Read by decide_pause gating and the binding's pacing
     /// (ConcurrentPlan::sweep_drained).
     sweep_pending: AtomicBool,
+    /// Set by request_progress_pause (mature-direct allocation wants the
+    /// in-flight quanta to advance); consumed by collection_required.
+    progress_pause_requested: AtomicBool,
     previous_pause: Atomic<Option<Pause>>,
     concurrent_marking_active: AtomicBool,
 }
@@ -175,6 +178,30 @@ impl<VM: VMBinding> Plan for Bactrian<VM> {
         // next poll site. (The GC-worker side self-trigger in the scheduler covers
         // the case where no mutator polls; see Scheduler::concurrent_marking_drained.)
         if self.concurrent_marking_in_progress() && self.marking_queue_drained() {
+            return true;
+        }
+        // POLL-TIME cycle request (fragmed's discovery, SHAPE round 30): a
+        // pretenure-heavy workload allocates mature-direct with few minors,
+        // and the binding's mature-pressure law only ran POST-MINOR — mature
+        // grew to the space-full edge (187 of 192 MB) before any cycle fired,
+        // where the calibrated law wanted one at baseline x 1.14. The binding
+        // sets next_gc_full_heap from its pacing; honor it at poll time so a
+        // mature-allocating mutator starts the cycle without waiting for a
+        // minor. (Not while a cycle is in flight or sweep is draining —
+        // decide_pause would degrade it anyway.)
+        if !self.concurrent_marking_in_progress()
+            && self.sweep_drained()
+            && self.gen.next_gc_full_heap.load(Ordering::SeqCst)
+        {
+            return true;
+        }
+        // Progress pause for in-flight quanta (fragmed part 2, SHAPE round
+        // 30): a mature-direct workload opens a cycle but never minors, so
+        // marking/sweep quanta — scheduled only in nursery-class pauses —
+        // never run and the cycle floats forever (OOM at 300 waves). Stock
+        // paces its slices off major-heap allocation; the binding's
+        // mature-alloc tick requests the same via request_progress_pause.
+        if self.progress_pause_requested.swap(false, Ordering::SeqCst) {
             return true;
         }
         self.gen.collection_required(self, space_full, space)
@@ -434,11 +461,26 @@ impl<VM: VMBinding> Plan for Bactrian<VM> {
                 debug_assert!(self.concurrent_marking_in_progress());
             }
             Pause::FinalMark => {
-                // The sweep (Release) has completed; end the cycle. This is
-                // deliberately later than ConcurrentImmix's notify_mutators_paused:
-                // promotions during the FinalMark pause itself must still be born
-                // live (eager line marks) to survive this pause's sweep.
-                self.set_concurrent_marking_state(false);
+                // End the MARKING half of the cycle, but under INCREMENTAL
+                // SWEEP keep allocate-as-live armed until the deferred sweep
+                // drains: a pretenured (mature-direct) object born after this
+                // pause into a freshly-acquired block has ZEROED line marks,
+                // and a deferred SweepChunk visiting its chunk would free the
+                // live block (the fragmed corruption, SHAPE round 30 — T1 and
+                // T4, pretenure+sliced only). The sweep quantum disarms it at
+                // drain completion (allocate_as_live_until_swept). The
+                // marking flag itself must clear NOW (decide_pause,
+                // barrier state).
+                self.concurrent_marking_active
+                    .store(false, Ordering::SeqCst);
+                if self.sliced_marking && self.sweep_pending.load(Ordering::SeqCst) {
+                    // spaces stay in allocate-as-live mode
+                } else {
+                    use crate::plan::global::HasSpaces;
+                    self.for_each_space(&mut |space: &dyn Space<VM>| {
+                        space.set_allocate_as_live(false);
+                    });
+                }
             }
             Pause::Full | Pause::Nursery => (),
         }
@@ -684,6 +726,14 @@ impl<VM: VMBinding> ConcurrentPlan for Bactrian<VM> {
         !self.sweep_pending.load(Ordering::SeqCst)
     }
 
+    fn request_progress_pause(&self) {
+        // Only meaningful with in-flight incremental work; the flag is
+        // consumed (or discarded) at the next allocation poll.
+        if self.concurrent_marking_in_progress() || self.sweep_pending.load(Ordering::SeqCst) {
+            self.progress_pause_requested.store(true, Ordering::SeqCst);
+        }
+    }
+
     fn previous_pause_finished_mark(&self) -> bool {
         matches!(
             self.previous_pause(),
@@ -728,6 +778,15 @@ impl<VM: VMBinding> Bactrian<VM> {
     /// Called by the sweep quantum when it drains the queue empty.
     pub(super) fn sweep_queue_emptied(&self) {
         self.sweep_pending.store(false, Ordering::SeqCst);
+        // Deferred half of FinalMark's end_of_gc: the sweep is complete, so
+        // new allocations no longer need eager line marks (see the FinalMark
+        // arm in end_of_gc).
+        {
+            use crate::plan::global::HasSpaces;
+            self.for_each_space(&mut |space: &dyn Space<VM>| {
+                space.set_allocate_as_live(false);
+            });
+        }
         // AUTO-COMPACTION (knob-gated, MMTK_COMPACT_UTIL_PCT; 0 = off):
         // Bactrian's cycles never defragment — defrag runs only at STW Fulls,
         // which the pacing never schedules — so a fragmented mature space
@@ -823,6 +882,7 @@ impl<VM: VMBinding> Bactrian<VM> {
             parked_marking: crossbeam::deque::Injector::new(),
             parked_sweep: crossbeam::deque::Injector::new(),
             sweep_pending: AtomicBool::new(false),
+            progress_pause_requested: AtomicBool::new(false),
             previous_pause: Atomic::new(None),
             concurrent_marking_active: AtomicBool::new(false),
         };

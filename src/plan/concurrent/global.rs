@@ -76,6 +76,13 @@ pub trait ConcurrentPlan: Plan {
         true
     }
 
+    /// Request a pause to PROGRESS in-flight incremental work (marking or
+    /// sweep quanta) even though no nursery trigger fired — the analog of
+    /// stock OCaml running a major slice off major-heap allocation. Called by
+    /// bindings from mature-direct allocation paths; honored by the plan's
+    /// collection_required at the next poll. Default: no-op.
+    fn request_progress_pause(&self) {}
+
     /// Did the pause that JUST ENDED start a marking cycle (`InitialMark`, or
     /// a full STW GC — which is a whole cycle in one pause)? For
     /// allocation-denominated cycle pacing: stock-style pacing measures the
