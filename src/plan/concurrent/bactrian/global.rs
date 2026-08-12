@@ -262,9 +262,14 @@ impl<VM: VMBinding> Plan for Bactrian<VM> {
                     // minor. Runs in Release, after this pause's own release
                     // parked FinalMark's packets — so the first quantum can run
                     // in the FinalMark pause itself if budget allows.
-                    if self.sweep_pending.load(Ordering::SeqCst)
-                        || pause == Pause::FinalMark
-                    {
+                    // NOTE: FinalMark's own first quantum is scheduled from
+                    // the RELEASE arm, strictly AFTER the packets are parked —
+                    // scheduling it here raced the parking at T>1 (worker A's
+                    // quantum popped an empty queue mid-parking, declared the
+                    // sweep complete and disarmed allocate-as-live while
+                    // worker B was still parking; later real sweeps then freed
+                    // live pretenured blocks — the fragmed T4 corruption).
+                    if pause != Pause::FinalMark && self.sweep_pending.load(Ordering::SeqCst) {
                         // Unbudgeted ONLY on genuine emergency (allocation
                         // failed: the degraded-from-Full pause must free the
                         // whole backlog now or the retry loop livelocks). A
@@ -436,6 +441,14 @@ impl<VM: VMBinding> Plan for Bactrian<VM> {
                         self.parked_sweep.push(w);
                     }
                     self.sweep_pending.store(true, Ordering::SeqCst);
+                    // First quantum, scheduled only now — after parking and
+                    // the pending flag are fully published (see the
+                    // schedule_collection note). The plan is 'static in
+                    // reality (standard mmtk pattern; see ImmixSpace::release's
+                    // identical self-reference).
+                    let plan: &'static Self = unsafe { &*(self as *const Self) };
+                    self.gen.common.base.scheduler.work_buckets[WorkBucketStage::Release]
+                        .add(BactrianSweepQuantum::budgeted(plan));
                 } else {
                     self.immix_space.release(true, UnlogBitsOperation::NoOp);
                 }
@@ -775,9 +788,14 @@ impl<VM: VMBinding> Bactrian<VM> {
         }
     }
 
-    /// Called by the sweep quantum when it drains the queue empty.
+    /// Called by the sweep quantum when it drains the queue empty. Guarded:
+    /// only the true->false TRANSITION performs completion actions, so a
+    /// quantum that raced ahead of the parking (empty pop, pending still
+    /// false) cannot prematurely disarm anything.
     pub(super) fn sweep_queue_emptied(&self) {
-        self.sweep_pending.store(false, Ordering::SeqCst);
+        if !self.sweep_pending.swap(false, Ordering::SeqCst) {
+            return;
+        }
         // Deferred half of FinalMark's end_of_gc: the sweep is complete, so
         // new allocations no longer need eager line marks (see the FinalMark
         // arm in end_of_gc).
