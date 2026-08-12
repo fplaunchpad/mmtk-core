@@ -116,6 +116,11 @@ pub struct Bactrian<VM: VMBinding> {
     /// set_mark_quantum_hint_ms — stock's slice-sizing law: mark debt over
     /// runway pauses). 0 = use the static MMTK_MARK_SLICE_MS budget.
     pub(in crate::plan) mark_quantum_hint_nanos: AtomicU64,
+    /// Did the mature-direct allocation TICK fire the pending cycle (vs the
+    /// post-minor path)? Tick-paced cycles progress in near-empty nursery
+    /// pauses that stay small at any nursery cap, so the feasibility
+    /// escape's nursery gate must not degrade them to monolithic Fulls.
+    cycle_tick_origin: AtomicBool,
     previous_pause: Atomic<Option<Pause>>,
     concurrent_marking_active: AtomicBool,
 }
@@ -747,9 +752,10 @@ impl<VM: VMBinding> ConcurrentPlan for Bactrian<VM> {
         !self.sweep_pending.load(Ordering::SeqCst)
     }
 
-    fn set_mark_quantum_hint_ms(&self, ms: f64) {
+    fn set_mark_quantum_hint_ms(&self, ms: f64, tick_origin: bool) {
         let ns = (ms.max(0.0) * 1e6) as u64;
         self.mark_quantum_hint_nanos.store(ns, Ordering::Relaxed);
+        self.cycle_tick_origin.store(tick_origin, Ordering::Relaxed);
     }
 
     fn request_progress_pause(&self) {
@@ -921,6 +927,7 @@ impl<VM: VMBinding> Bactrian<VM> {
             sweep_pending: AtomicBool::new(false),
             progress_pause_requested: AtomicBool::new(false),
             mark_quantum_hint_nanos: AtomicU64::new(0),
+            cycle_tick_origin: AtomicBool::new(false),
             previous_pause: Atomic::new(None),
             concurrent_marking_active: AtomicBool::new(false),
         };
@@ -1013,9 +1020,13 @@ impl<VM: VMBinding> Bactrian<VM> {
                     //    live set cannot slice usefully.
                     let nursery_big = self.gen.common.base.gc_trigger.get_max_nursery_pages()
                         > slice_max_nursery_pages();
+                    // Tick-origin cycles (mature-direct pacing) progress in
+                    // near-empty nursery pauses — small at any nursery cap —
+                    // so the nursery gate does not apply to them.
+                    let tick_origin = self.cycle_tick_origin.load(Ordering::Relaxed);
                     let hint_ms =
                         self.mark_quantum_hint_nanos.load(Ordering::Relaxed) as f64 / 1e6;
-                    nursery_big || hint_ms > max_quantum_ms()
+                    (nursery_big && !tick_origin) || hint_ms > max_quantum_ms()
                 } {
                     Pause::Full
                 } else if !self.sliced_marking
