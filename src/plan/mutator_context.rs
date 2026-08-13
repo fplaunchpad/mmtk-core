@@ -31,14 +31,32 @@ pub(crate) fn unreachable_prepare_func<VM: VMBinding>(
 /// An mutator prepare implementation for plans that use [`crate::plan::global::CommonPlan`].
 #[allow(unused_variables)]
 pub(crate) fn common_prepare_func<VM: VMBinding>(mutator: &mut Mutator<VM>, _tls: VMWorkerThread) {
-    // Prepare the free list allocator used for non moving
+    // Prepare the free list allocator used for non moving. OCaml round 31:
+    // full-heap collections only — pairs with the gating in
+    // prepare_nonmoving_space/release_nonmoving_space (the mark-sweep
+    // nonmoving space is collected exclusively by majors; running the
+    // allocator-side release at a nursery GC freed blocks against a mark
+    // state no nursery trace rebuilds, and decremented a handshake counter
+    // the space never armed).
     #[cfg(feature = "marksweep_as_nonmoving")]
-    unsafe {
-        mutator.allocator_impl_mut_for_semantic::<crate::util::alloc::FreeListAllocator<VM>>(
-            AllocationSemantics::NonMoving,
-        )
+    if !is_nursery_gc(mutator) {
+        unsafe {
+            mutator.allocator_impl_mut_for_semantic::<crate::util::alloc::FreeListAllocator<VM>>(
+                AllocationSemantics::NonMoving,
+            )
+        }
+        .prepare();
     }
-    .prepare();
+}
+
+/// Is the current collection a nursery (minor) GC? Non-generational plans
+/// never are.
+#[allow(dead_code)]
+fn is_nursery_gc<VM: VMBinding>(mutator: &Mutator<VM>) -> bool {
+    mutator
+        .plan
+        .generational()
+        .is_some_and(|g| g.is_current_gc_nursery())
 }
 
 /// A place-holder implementation for `MutatorConfig::release_func` that should not be called.
@@ -55,10 +73,13 @@ pub(crate) fn unreachable_release_func<VM: VMBinding>(
 pub(crate) fn common_release_func<VM: VMBinding>(mutator: &mut Mutator<VM>, _tls: VMWorkerThread) {
     cfg_if::cfg_if! {
         if #[cfg(feature = "marksweep_as_nonmoving")] {
-            // Release the free list allocator used for non moving
-            unsafe { mutator.allocator_impl_mut_for_semantic::<crate::util::alloc::FreeListAllocator<VM>>(
-                AllocationSemantics::NonMoving,
-            )}.release();
+            // Release the free list allocator used for non moving.
+            // OCaml round 31: full-heap only — see common_prepare_func.
+            if !is_nursery_gc(mutator) {
+                unsafe { mutator.allocator_impl_mut_for_semantic::<crate::util::alloc::FreeListAllocator<VM>>(
+                    AllocationSemantics::NonMoving,
+                )}.release();
+            }
         } else if #[cfg(feature = "immortal_as_nonmoving")] {
             // Do nothig for the bump pointer allocator
         } else {

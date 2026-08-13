@@ -837,7 +837,17 @@ impl<VM: VMBinding> CommonPlan<VM> {
             if #[cfg(feature = "immortal_as_nonmoving")] {
                 self.nonmoving.prepare();
             } else if #[cfg(feature = "marksweep_as_nonmoving")] {
-                self.nonmoving.prepare(_full_heap);
+                // OCaml round 31: only at FULL-heap collections. The mark-
+                // sweep space is collected exclusively by majors; a nursery
+                // GC's prepare would zero its mark bits (PrepareChunkMap)
+                // without any re-marking following, and the paired release
+                // would then free every prepared-but-unmarked block — live
+                // objects included (reproduced under Bactrian with the
+                // pretenured band routed here: a marking quantum scanning a
+                // freed cell whose header had become a free-list link).
+                if _full_heap {
+                    self.nonmoving.prepare(_full_heap);
+                }
             } else {
                 self.nonmoving.prepare(_full_heap, None, UnlogBitsOperation::NoOp);
             }
@@ -855,7 +865,17 @@ impl<VM: VMBinding> CommonPlan<VM> {
                 // mutator's FreeListAllocator::release underflowed it at the
                 // first GC (epilogue assert). Call the actual release, which
                 // arms the counter and schedules ReleaseMarkSweepSpace.
-                self.nonmoving.release();
+                //
+                // OCaml round 31: full-heap collections only, and the space
+                // can additionally suppress one release (Bactrian's
+                // InitialMark: its full-flagged prepare zeroes the bits for
+                // the cycle, but marks are only complete at FinalMark —
+                // releasing at InitialMark freed every block, live cells
+                // included). See prepare_nonmoving_space and
+                // MarkSweepSpace::suppress_next_release.
+                if _full_heap {
+                    self.nonmoving.release();
+                }
             } else {
                 self.nonmoving.release(_full_heap, UnlogBitsOperation::NoOp);
             }

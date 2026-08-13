@@ -97,11 +97,18 @@ pub fn bactrian_mutator_release<VM: VMBinding>(mutator: &mut Mutator<VM>, _tls: 
     .unwrap();
     bump_allocator.reset();
 
-    #[cfg(feature = "marksweep_as_nonmoving")]
-    common_nonmoving_release(mutator);
-    reset_pretenure_allocator(mutator);
-
+    // The freelist (nonmoving MS) mutator release pairs with the SPACE-side
+    // MarkSweepSpace::release handshake (pending_release_packets =
+    // num_mutators + 1), which round 31 confines to the pauses whose marks
+    // are complete for that space: Full and FinalMark. Running it at other
+    // pauses both corrupts (it frees unmarked-since-prepare blocks) and
+    // underflows the unarmed counter.
     let current_pause = mutator.plan.concurrent().unwrap().current_pause().unwrap();
+    #[cfg(feature = "marksweep_as_nonmoving")]
+    if matches!(current_pause, Pause::Full | Pause::FinalMark) {
+        common_nonmoving_release(mutator);
+    }
+    reset_pretenure_allocator(mutator);
     // Disarm the SATB half when the marking cycle ends.
     if current_pause == Pause::FinalMark || current_pause == Pause::Full {
         mutator

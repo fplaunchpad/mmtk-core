@@ -488,7 +488,12 @@ impl<VM: VMBinding> MarkSweepSpace<VM> {
                 }
             }
 
-            {
+            // CLEAN-BLOCKS-ONLY window (OCaml Bactrian round 31): while a
+            // concurrent marking cycle is in flight this space's mark bits
+            // are mid-rebuild — handing out an unswept block would make the
+            // allocator sweep it against incomplete marks and free live
+            // cells. Unswept blocks wait for the cycle; grow instead.
+            if !self.should_allocate_as_live() {
                 let abandoned_unswept = &mut abandoned.unswept;
                 if !abandoned_unswept[bin].is_empty() {
                     let block = abandoned_unswept[bin].pop().unwrap();

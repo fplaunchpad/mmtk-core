@@ -142,6 +142,16 @@ impl<VM: VMBinding> FreeListAllocator<VM> {
     /// `cell + OBJECT_REF_OFFSET_LOWER_BOUND` (and every MIN_OBJECT_SIZE
     /// step after), so marking the allocation start + that offset is found
     /// by construction. One flag load per allocation when idle.
+    /// Is a concurrent marking/sweep window in flight for this space? While
+    /// it is, this space's mark bits are mid-rebuild and no lazy sweep may
+    /// run (see the clean-blocks-only gates). Reuses the allocate-as-live
+    /// arming, which spans exactly the unsound window (InitialMark until the
+    /// cycle's sweep completes).
+    fn marking_window_active(&self) -> bool {
+        use crate::policy::space::Space;
+        self.space.should_allocate_as_live()
+    }
+
     fn allocate_black_if_needed(&self, alloc_start: crate::util::Address) {
         use crate::policy::space::Space;
         use crate::vm::ObjectModel;
@@ -153,6 +163,14 @@ impl<VM: VMBinding> FreeListAllocator<VM> {
             };
             VM::VMObjectModel::LOCAL_MARK_BIT_SPEC
                 .mark::<VM>(objref, std::sync::atomic::Ordering::SeqCst);
+            // The BLOCK must be marked live too: release frees whole
+            // state-Unmarked blocks without consulting object bits, and a
+            // block whose only live contents are born-during-the-cycle
+            // objects (which SATB never traces — live by birth) would
+            // otherwise be freed at the cycle's release with its live cells
+            // (reproduced: fragmed's mid-window keepers in a recycled block
+            // whose pre-cycle objects had all died).
+            Block::containing(objref).set_state(BlockState::Marked);
         }
     }
     // New free list allcoator
@@ -285,6 +303,16 @@ impl<VM: VMBinding> FreeListAllocator<VM> {
     ) -> Option<Block> {
         if cfg!(feature = "eager_sweeping") {
             // We have swept blocks in the last GC. If we run out of available blocks, there is nothing we can do.
+            None
+        } else if self.marking_window_active() {
+            // CLEAN-BLOCKS-ONLY window (OCaml Bactrian round 31): a concurrent
+            // marking cycle is in flight and this space's mark bits were
+            // zeroed at the cycle's prepare — sweeping now would read the
+            // incomplete mark state and free live-but-not-yet-marked cells
+            // (reproduced: a marking quantum crashing on a freed cell whose
+            // header had become a free-list link). Unswept blocks stay parked
+            // until the cycle completes; allocation is served from
+            // already-swept blocks and fresh ones.
             None
         } else {
             // Get blocks from unswept_blocks and attempt to sweep

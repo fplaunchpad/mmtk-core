@@ -347,6 +347,14 @@ impl<VM: VMBinding> Plan for Bactrian<VM> {
                 self.gen
                     .nursery
                     .set_copy_for_sft_trace(Some(CopySemantics::PromoteToMature));
+                // The common (full-flagged) prepare zeroes the nonmoving
+                // mark-sweep space's bits for the cycle. This pause's own
+                // release must NOT consume that incomplete state — and does
+                // not: InitialMark is nursery-flagged (gc_full_heap is Full-
+                // only), so gen.release passes full=false and the round-31
+                // gate in release_nonmoving_space skips the space. Marks
+                // complete at FinalMark, whose release (explicit full=true)
+                // sweeps it.
                 self.gen.common.prepare(tls, true);
                 self.immix_space.prepare(
                     true,
