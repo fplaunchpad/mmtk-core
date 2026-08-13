@@ -958,6 +958,19 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         self.major_live_bytes.load(Ordering::Relaxed)
     }
 
+    /// Add to the major live tally. UP window: plain read-add-store (a
+    /// relaxed fetch_add is still a LOCK XADD, paid per marked object).
+    fn add_major_live_bytes(&self, bytes: usize) {
+        if crate::util::up_trace::up() {
+            self.major_live_bytes.store(
+                self.major_live_bytes.load(Ordering::Relaxed) + bytes,
+                Ordering::Relaxed,
+            );
+        } else {
+            self.major_live_bytes.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
     pub fn post_sweep_fragmentation(&self) -> (usize, usize) {
         (
             self.reusable_blocks.len(),
@@ -1097,10 +1110,7 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         vo_bit::helper::on_trace_object::<VM>(object);
 
         if self.attempt_mark(object, self.mark_state) {
-            self.major_live_bytes.fetch_add(
-                VM::VMObjectModel::get_current_size(object),
-                Ordering::Relaxed,
-            );
+            self.add_major_live_bytes(VM::VMObjectModel::get_current_size(object));
             // lxr P2.F: under RC, a straddle continuation line carries no RC entry of its own,
             // so a marked straddle object is short-circuited before line/block marking. Gated;
             // dead for all non-RC plans (rc_enabled always false until the P3 LXR plan).
@@ -1185,10 +1195,7 @@ impl<VM: VMBinding> ImmixSpace<VM> {
                 || (!nursery_collection && self.defrag.space_exhausted())
             {
                 if self.attempt_mark(object, self.mark_state) {
-                    self.major_live_bytes.fetch_add(
-                        VM::VMObjectModel::get_current_size(object),
-                        Ordering::Relaxed,
-                    );
+                    self.add_major_live_bytes(VM::VMObjectModel::get_current_size(object));
                 }
                 object_forwarding::clear_forwarding_bits::<VM>(object);
                 Block::containing(object).set_state(BlockState::Marked);
@@ -1212,10 +1219,7 @@ impl<VM: VMBinding> ImmixSpace<VM> {
                     semantics,
                     copy_context,
                     |new_object| {
-                        self.major_live_bytes.fetch_add(
-                            VM::VMObjectModel::get_current_size(new_object),
-                            Ordering::Relaxed,
-                        );
+                        self.add_major_live_bytes(VM::VMObjectModel::get_current_size(new_object));
                         // post_copy should have set the unlog bit
                         // if `unlog_traced_object` is true.
                         debug_assert!(
@@ -1276,6 +1280,19 @@ impl<VM: VMBinding> ImmixSpace<VM> {
 
     /// Atomically mark an object.
     fn attempt_mark(&self, object: ObjectReference, mark_state: u8) -> bool {
+        // UP window (round 32): a single stopped-world tracer needs no CAS —
+        // plain load/test/store. Major marking pays this per marked object
+        // (a SeqCst load + SeqCst compare-exchange otherwise).
+        if crate::util::up_trace::up() {
+            let side = VM::VMObjectModel::LOCAL_MARK_BIT_SPEC.extract_side_spec();
+            let addr = object.to_raw_address();
+            let old: u8 = unsafe { side.load::<u8>(addr) };
+            if old == mark_state {
+                return false;
+            }
+            unsafe { side.store::<u8>(addr, mark_state) };
+            return true;
+        }
         loop {
             let old_value = VM::VMObjectModel::LOCAL_MARK_BIT_SPEC.load_atomic::<VM, u8>(
                 object,
@@ -1422,13 +1439,23 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         if self.rc_enabled {
             return;
         }
-        // Mark the object
-        VM::VMObjectModel::LOCAL_MARK_BIT_SPEC.store_atomic::<VM, u8>(
-            object,
-            self.mark_state,
-            None,
-            Ordering::SeqCst,
-        );
+        // Mark the object. UP window (round 32): one tracer, world stopped —
+        // the SeqCst store compiles to a full-fence XCHG on x86, paid per
+        // promoted object (binarytrees: 19.7M of them). A plain side-table
+        // store is sound under the single-tracer invariant (same argument as
+        // UP-trace); the pause's release lock sequences publish it before
+        // any mutator or second worker runs.
+        if crate::util::up_trace::up() {
+            let side = VM::VMObjectModel::LOCAL_MARK_BIT_SPEC.extract_side_spec();
+            unsafe { side.store::<u8>(object.to_raw_address(), self.mark_state) };
+        } else {
+            VM::VMObjectModel::LOCAL_MARK_BIT_SPEC.store_atomic::<VM, u8>(
+                object,
+                self.mark_state,
+                None,
+                Ordering::SeqCst,
+            );
+        }
         // Mark the line
         if !super::MARK_LINE_AT_SCAN_TIME {
             self.mark_lines(object);
