@@ -106,6 +106,21 @@ impl<VM: VMBinding> CommonGenPlan<VM> {
         let cur_nursery = self.nursery.reserved_pages();
         let max_nursery = self.common.base.gc_trigger.get_max_nursery_pages();
         let nursery_full = cur_nursery >= max_nursery;
+        // MMTK_NURSERY_DEBUG: decompose the trigger point (effective-capacity
+        // audit, round 33: at Fixed:2M the panel measured ~1.56MB of
+        // allocation per minor — where do the other ~0.4MB of "reserved"
+        // pages come from?).
+        if nursery_full && std::env::var_os("MMTK_NURSERY_DEBUG").is_some() {
+            use crate::policy::space::Space;
+            let data = self.nursery.get_page_resource().reserved_pages();
+            eprintln!(
+                "[nursery] trigger: reserved={}p (data={}p meta={}p) max={}p",
+                cur_nursery,
+                data,
+                cur_nursery - data,
+                max_nursery
+            );
+        }
         trace!(
             "nursery_full = {:?} (nursery = {}, max_nursery = {})",
             nursery_full,
