@@ -299,14 +299,23 @@ impl<VM: VMBinding> crate::scheduler::GCWork<VM> for BactrianSweepQuantum<VM> {
             packets += 1;
             if let Some(d) = deadline {
                 if std::time::Instant::now() >= d {
-                    // Budget expired with the queue possibly non-empty: check
-                    // emptiness so a drained-on-the-last-packet quantum still
-                    // flips the flag this pause.
-                    if self.plan.pop_sweep_packet().map(|w2| {
-                        // put it back semantics unavailable on Injector; run it —
-                        // one packet of overrun keeps the logic simple.
-                        let mut w2 = w2; w2.do_work(worker, mmtk); packets += 1;
-                    }).is_none() {
+                    // Budget expired. If the queue emptied on this very
+                    // packet, still flip the flag in THIS pause — a one-pause
+                    // delay would hold the sweep gate (no new cycle or Full)
+                    // and the post-sweep baseline latch for one extra minor.
+                    //
+                    // is_empty() is an exact test here, but ONLY under two
+                    // invariants of the drain design: (a) no producers — all
+                    // packets are parked by FinalMark before the first
+                    // quantum is scheduled (see the schedule_collection
+                    // ordering note); (b) no packet in flight — one quantum
+                    // per pause, and every popped packet was executed to
+                    // completion above. If either breaks, an empty-looking
+                    // queue can coexist with an unswept packet and this
+                    // reverts to the false-sweep-complete class (fragmed T4,
+                    // NOTES 2026-08-12) — switch back to a steal-based
+                    // emptiness test in that world.
+                    if self.plan.sweep_queue_is_empty() {
                         self.plan.sweep_queue_emptied();
                     }
                     break;

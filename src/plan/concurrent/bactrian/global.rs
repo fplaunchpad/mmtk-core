@@ -845,6 +845,13 @@ impl<VM: VMBinding> Bactrian<VM> {
         }
     }
 
+    /// Is the parked sweep queue empty? Injector::is_empty is momentary under
+    /// concurrency; this is an EXACT test only under the drain invariants
+    /// documented at the budget-expiry check in `BactrianSweepQuantum`.
+    pub(super) fn sweep_queue_is_empty(&self) -> bool {
+        self.parked_sweep.is_empty()
+    }
+
     /// Called by the sweep quantum when it drains the queue empty. Guarded:
     /// only the true->false TRANSITION performs completion actions, so a
     /// quantum that raced ahead of the parking (empty pop, pending still
