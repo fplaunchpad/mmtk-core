@@ -998,8 +998,11 @@ impl<VM: VMBinding> Bactrian<VM> {
             // sweep is undrained, its line_mark_state / defrag histograms /
             // chunk map are still being consumed — starting a new cycle or a
             // Full (both re-prepare that state) would corrupt it. Stay on
-            // Nursery pauses (each drains an unbudgeted quantum when a cycle
-            // request is pending, so the delay is at most one minor).
+            // Nursery pauses; a pending cycle request stays latched
+            // (next_gc_full_heap is consumed below this gate) and waits out
+            // the BUDGETED drain — see schedule_collection: only a genuine
+            // allocation emergency drains unbudgeted (eager drain-all
+            // measured 8.2 -> 14.4ms minor max at bt@2M and was rejected).
             if self.sliced_marking && self.sweep_pending.load(Ordering::SeqCst) {
                 return Pause::Nursery;
             }
