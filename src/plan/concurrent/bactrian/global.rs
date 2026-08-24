@@ -207,7 +207,7 @@ impl<VM: VMBinding> Plan for Bactrian<VM> {
         // decide_pause would degrade it anyway.)
         if !self.concurrent_marking_in_progress()
             && self.sweep_drained()
-            && self.gen.next_gc_full_heap.load(Ordering::SeqCst)
+            && self.major_request_pending()
         {
             return true;
         }
@@ -834,6 +834,32 @@ impl<VM: VMBinding> Bactrian<VM> {
         nursery_age() >= 1
     }
 
+    /// Is a major collection pending? This reads the generational module's
+    /// `next_gc_full_heap` flag, whose name describes SCOPE (whole-heap),
+    /// not pause shape: under Bactrian the request is normally executed as
+    /// an InitialMark->FinalMark cycle, and only becomes `Pause::Full` when
+    /// a forced-Full condition or a slicing feasibility gate applies (see
+    /// decide_pause). Read-only: the request is consumed by
+    /// [`Self::take_major_request`].
+    fn major_request_pending(&self) -> bool {
+        self.gen.next_gc_full_heap.load(Ordering::SeqCst)
+    }
+
+    /// Consume the pending major-collection request (see
+    /// [`Self::major_request_pending`] for the naming note). Returns whether
+    /// one was pending. Called exactly once per pause decision, in
+    /// decide_pause, below the mid-cycle and sweep gates — so a request
+    /// arriving while a cycle or sweep drain is in flight stays latched.
+    fn take_major_request(&self) -> bool {
+        self.gen.next_gc_full_heap.swap(false, Ordering::SeqCst)
+    }
+
+    /// Request a major collection (the same flag the binding's pacing sets
+    /// through `force_full_heap_collection`).
+    fn set_major_request(&self) {
+        self.gen.next_gc_full_heap.store(true, Ordering::SeqCst);
+    }
+
     /// Pop one parked sweep packet (incremental sweep).
     pub(super) fn pop_sweep_packet(&self) -> Option<Box<dyn GCWork<VM>>> {
         loop {
@@ -893,7 +919,7 @@ impl<VM: VMBinding> Bactrian<VM> {
                         "[compact] trigger: {partial}/{live} live blocks partial (>= {threshold}%)"
                     );
                 }
-                self.gen.next_gc_full_heap.store(true, Ordering::SeqCst);
+                self.set_major_request();
             }
         }
     }
@@ -1013,7 +1039,7 @@ impl<VM: VMBinding> Bactrian<VM> {
             if self.sliced_marking && self.sweep_pending.load(Ordering::SeqCst) {
                 return Pause::Nursery;
             }
-            let cycle_requested = self.gen.next_gc_full_heap.swap(false, Ordering::SeqCst);
+            let cycle_requested = self.take_major_request();
             let user_triggered = self
                 .gen
                 .common

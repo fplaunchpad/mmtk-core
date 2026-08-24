@@ -33,7 +33,12 @@ pub struct CommonGenPlan<VM: VMBinding> {
     pub common: CommonPlan<VM>,
     /// Is this GC full heap?
     pub gc_full_heap: AtomicBool,
-    /// Is next GC full heap?
+    /// Is next GC full heap? "Full heap" is the collection's SCOPE (trace the
+    /// whole heap, i.e. a major collection), not a pause shape: the
+    /// single-pause generational plans (GenCopy/GenImmix/StickyImmix) execute
+    /// it as one STW full-heap GC, while Bactrian's decide_pause may execute
+    /// it as an InitialMark->FinalMark cycle instead of `Pause::Full` — see
+    /// `Bactrian::take_major_request`.
     pub next_gc_full_heap: AtomicBool,
     pub full_heap_gc_count: Arc<Mutex<EventCounter>>,
 }
