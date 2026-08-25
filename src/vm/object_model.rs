@@ -446,19 +446,16 @@ pub trait ObjectModel<VM: VMBinding> {
     /// if any assertion catches this error, but may also fail silently.
     const UNIFIED_OBJECT_REFERENCE_ADDRESS: bool = false;
 
-    /// If true, the binding guarantees that the value of the header word addressed by
-    /// `LOCAL_FORWARDING_POINTER_SPEC` (which must be in-header) discriminates forwarding
-    /// state BY VALUE RANGE during a stopped-world single-tracer pause (`up_trace::up()`):
-    /// every unforwarded object's word there is numerically BELOW the heap's start address,
-    /// and a stored forwarding pointer is necessarily inside the heap, i.e. >= heap start.
-    /// (For OCaml: a header is `(wosize << 10) | colour | tag`, below 2^41 for any real
-    /// object, while `vm_layout().heap_start` is 0x200_0000_0000 = 2^41 — stock OCaml's own
-    /// minor-GC protocol, which overwrites the header with the forwarding pointer and
-    /// discriminates on the value.) When active, the forwarding fast path performs NO side
-    /// metadata accesses at all: status = one header load; forward = the header-pointer
-    /// store it already does; the fresh copy's header is a small value, so it reads
-    /// unforwarded without an explicit clear. Multi-tracer (non-UP) pauses are unaffected
-    /// and keep using `LOCAL_FORWARDING_BITS_SPEC`.
+    /// If true, the binding guarantees that during a stopped-world single-tracer pause
+    /// (`up_trace::up()`), the in-header word addressed by `LOCAL_FORWARDING_POINTER_SPEC`
+    /// tells the forwarding state by its value alone: if we see a header with a small
+    /// value (an ordinary size+tag header), the object is not forwarded yet; if we see a
+    /// value that looks like a heap pointer (>= heap start), the object is forwarded and
+    /// that value is the forwarding pointer — a real header could only look like that if
+    /// the object were larger than 16GB. When active, the forwarding fast path performs
+    /// no side-metadata accesses: status is one header load, and the forwarding-pointer
+    /// store itself is the state change. Multi-tracer (non-UP) pauses are unaffected and
+    /// keep using `LOCAL_FORWARDING_BITS_SPEC`.
     const HEADER_FORWARDING_SENTINEL: bool = false;
 
     /// For our allocation result (object_start), the binding may have an offset between the allocation result

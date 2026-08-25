@@ -213,14 +213,9 @@ impl<VM: VMBinding> crate::scheduler::GCWork<VM> for BactrianMarkQuantum<VM> {
     ) {
         let deadline = self.budget.map(|b| std::time::Instant::now() + b);
         let mut packets = 0usize;
-        // Mid-cycle marking marks MATURE objects; the enclosing pause is a
-        // NURSERY pause whose prepare latched the LOS space to nursery
-        // semantics, under which los.trace_object SKIPS mature objects — the
-        // quantum would silently drop them from the cycle and FinalMark's
-        // sweep would free them live (NOTES 2026-08-12). Scope full-heap LOS
-        // semantics over the drain; restore after. Treadmill ops are
-        // internally locked, and the pause's own LOS work (nursery sweep in
-        // Release) touches the disjoint nursery lists.
+        // Run the drain under full-heap LOS semantics (mid-cycle marking must
+        // mark mature LOS objects even when the enclosing pause latched
+        // nursery semantics); restore the previous mode after.
         let was_full = mmtk
             .get_plan()
             .common()

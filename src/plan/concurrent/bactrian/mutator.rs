@@ -15,16 +15,6 @@ use crate::util::{VMMutatorThread, VMWorkerThread};
 use crate::vm::VMBinding;
 use crate::MMTK;
 
-// NB: we deliberately do NOT call common_prepare_func/common_release_func here.
-// Under the `marksweep_as_nonmoving` feature they do a typed FreeListAllocator
-// downcast keyed by AllocationSemantics::NonMoving — but Bactrian remaps
-// NonMoving to Immix(0) (pretenuring), so that downcast panics. The common
-// mark-sweep nonmoving space's FreeList allocator still exists and still
-// participates in the release-packet handshake (MarkSweepSpace::release arms
-// pending_release_packets = num_mutators + 1; the per-mutator decrement lives
-// in FreeListAllocator::release), so we reach it BY SELECTOR instead:
-// BACTRIAN_RESERVED reserves no free-list allocators, so the common space owns
-// FreeList(0).
 #[cfg(feature = "marksweep_as_nonmoving")]
 fn common_nonmoving_prepare<VM: VMBinding>(mutator: &mut Mutator<VM>) {
     unsafe {
@@ -183,11 +173,6 @@ pub fn create_bactrian_mutator<VM: VMBinding>(
     let config = MutatorConfig {
         allocator_mapping: &ALLOCATOR_MAPPING,
         space_mapping: Box::new({
-            // Must be built with the SAME reserved set as ALLOCATOR_MAPPING:
-            // reserving an extra Immix allocator shifts the common spaces'
-            // selector indices, so reusing the generational space mapping
-            // here leaves a mapped selector with no space (worker copy-context
-            // construction unwraps None).
             let mut vec = crate::plan::mutator_context::create_space_mapping(
                 BACTRIAN_RESERVED,
                 true,

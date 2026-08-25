@@ -179,9 +179,7 @@ impl<VM: VMBinding> Plan for Bactrian<VM> {
     }
 
     fn prepare_worker(&self, worker: &mut GCWorker<Self::VM>) {
-        // Keep the CopySpace copy context bound to the current aged to-space
-        // (GenCopy's rebind pattern); harmless when aging is off — the
-        // CopySemantics::Nursery mapping is simply never exercised.
+        // Keep the CopySpace copy context bound to the current aged to-space.
         unsafe { worker.get_copy_context_mut().copy[0].assume_init_mut() }
             .rebind(self.aged_to());
     }
@@ -615,18 +613,9 @@ impl<VM: VMBinding> GenerationalPlan for Bactrian<VM> {
     }
 
     fn is_object_in_nursery(&self, object: ObjectReference) -> bool {
-        // The aged pair is part of the YOUNG generation: every barrier, SATB
-        // young-drop, and concurrent-marking skip routes through this check.
-        //
-        // YOUNG-LOS COUNTS AS YOUNG (2026-08-12, the sliced-marking x LOS
-        // corruption): a young LOS object is post-snapshot exactly like a
-        // nursery object (everything LOS-reachable at InitialMark was
-        // in-place-promoted by that pause's trace), and it can be FREED by
-        // any subsequent minor's LOS-nursery sweep. Admitting one into the
-        // SATB/marking queues therefore dangles under sliced marking, where
-        // parked packets outlive minors (worker-concurrent mode drains in
-        // microseconds, which merely hid the same hole). Dropping it here is
-        // sound for the same reason dropping copying-nursery refs is.
+        // The aged pair and young-LOS objects are part of the YOUNG
+        // generation: every barrier, SATB young-drop, and concurrent-marking
+        // skip routes through this check.
         self.gen.nursery.in_space(object)
             || self.aged0.in_space(object)
             || self.aged1.in_space(object)
@@ -738,12 +727,6 @@ impl<VM: VMBinding> ConcurrentPlan for Bactrian<VM> {
     }
 
     fn should_skip_concurrent_trace(&self, object: ObjectReference) -> bool {
-        // The YOUNG generation is outside the snapshot: young objects are all
-        // post-snapshot (InitialMark empties the nursery and in-place-promotes
-        // reachable young LOS) and either move at every nursery pause (copying
-        // nursery, aged pair) or can be FREED by one (young LOS — the
-        // sliced-marking corruption, NOTES 2026-08-12), so the marker must
-        // never see any of them. One young-check for every path.
         self.is_object_in_nursery(object)
     }
 
@@ -1067,26 +1050,21 @@ impl<VM: VMBinding> Bactrian<VM> {
                 if std::env::var_os("BACTRIAN_NO_CONCURRENT").is_some() {
                     Pause::Full
                 } else if self.sliced_marking && {
-                    // FEASIBILITY escape (round 30): slicing pays only when it
-                    // can make pauses SMALL; otherwise the monolithic Full is
-                    // strictly better — the same worst-case pause at
-                    // measurably less total GC time (bt-def@192M: 2663ms Full
-                    // vs 3181ms sliced, max pause ~103-138ms either way; SATB
-                    // + floating garbage + allocate-as-live are pure overhead
-                    // when the pauses are giant anyway). Two gates:
+                    // Slicing is only worth running when it can make pauses
+                    // small. Otherwise a monolithic Full has the same
+                    // worst-case pause and costs less total GC time
+                    // (bt-def@192M: 2663ms as Fulls vs 3181ms sliced,
+                    // ~103-138ms max pause either way). Two checks:
                     //  - nursery size (MMTK_SLICE_MAX_NURSERY_MB, default 4):
-                    //    a big-nursery config's MINOR pauses are already tens
-                    //    of ms (promotion-bound), so sliced majors cannot get
-                    //    under them — the big nursery IS the throughput dial.
-                    //    Vanilla's slices are small precisely because its
-                    //    minor heap is 2MB. And the slice-sizing estimate is
-                    //    reliable only when many pauses fit the runway: at
-                    //    n16 the debt grows faster than the 1-2 predicted
-                    //    pauses can absorb and FinalMark drains ~100ms.
-                    //  - the binding's slice-sizing hint (mark debt / runway
-                    //    pauses, MMTK_MAX_QUANTUM_MS cap, default 50): even a
-                    //    small-nursery config on a heap too tight for its
-                    //    live set cannot slice usefully.
+                    //    with a big nursery, the minor pause alone is already
+                    //    tens of milliseconds, so slicing cannot make pauses
+                    //    small. Tick-origin cycles are exempt below: their
+                    //    pauses are near-empty minors, small at any nursery
+                    //    size.
+                    //  - the slice-sizing hint (MMTK_MAX_QUANTUM_MS, default
+                    //    50): if each slice would need more than this much
+                    //    marking time, the runway cannot be covered by small
+                    //    pauses at all.
                     let nursery_big = self.gen.common.base.gc_trigger.get_max_nursery_pages()
                         > slice_max_nursery_pages();
                     // Tick-origin cycles (mature-direct pacing) progress in
@@ -1101,21 +1079,11 @@ impl<VM: VMBinding> Bactrian<VM> {
                 } else if !self.sliced_marking
                     && self.immix_space.reserved_pages() < conc_mark_min_mature_pages()
                 {
-                    // (The adaptive-STW escape below exists for WORKER-concurrent
-                    // marking's cross-core interference; sliced quanta have no
-                    // simultaneity, so sliced mode always takes the cycle path.)
-                    // ADAPTIVE MARKING (W-night 2026-08-08, binding SHAPE.md):
-                    // a concurrent marker streaming a small live set through
-                    // the shared LLC while the mutator runs costs more in
-                    // mutator stalls + SATB barrier activity than it saves in
-                    // pause time. Measured on binarytrees-20 (~100 MB live,
-                    // 1 worker): mutator 7.84G -> 6.78G cycles and 14.17G ->
-                    // 13.40G instructions with STW marking, whole-process
-                    // within 3% of stock OCaml. Small live sets mark fast
-                    // enough that the pause is acceptable; large ones (where
-                    // pauses actually hurt) keep the concurrent path.
-                    // MMTK_CONC_MARK_MIN_MATURE_MB tunes the threshold
-                    // (default 256; 0 = always concurrent, the old behaviour).
+                    // Prefer a Full pause instead of concurrent GC worker +
+                    // mutator working if the mature space is smaller than a
+                    // given threshold. This avoids LLC contention between the
+                    // GC worker and the mutator, and the mutator does not
+                    // have to go through the write barrier on each write.
                     Pause::Full
                 } else {
                     Pause::InitialMark
@@ -1271,10 +1239,6 @@ fn nursery_age() -> usize {
     })
 }
 
-/// Mature-size floor (in pages) below which a requested major cycle is run as
-/// a STW Full GC instead of concurrent marking. See the ADAPTIVE MARKING
-/// comment at the Pause decision. Bactrian-plan-local: no other plan (and not
-/// LXR) consults this.
 /// Largest nursery for which sliced major cycles pay (pages;
 /// MMTK_SLICE_MAX_NURSERY_MB overrides, default 4MB — see the feasibility
 /// escape in decide_pause). Above it, minor pauses are promotion-bound and
@@ -1305,6 +1269,9 @@ fn max_quantum_ms() -> f64 {
     })
 }
 
+/// Mature-size floor (in pages) below which a requested major cycle runs as a
+/// STW Full GC instead of concurrent marking. MMTK_CONC_MARK_MIN_MATURE_MB
+/// overrides; 256 MB is the default (0 = always concurrent).
 fn conc_mark_min_mature_pages() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| {

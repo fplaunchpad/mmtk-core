@@ -859,20 +859,6 @@ impl<VM: VMBinding> CommonPlan<VM> {
             if #[cfg(feature = "immortal_as_nonmoving")] {
                 self.nonmoving.release();
             } else if #[cfg(feature = "marksweep_as_nonmoving")] {
-                // Upstream 0.32 bug: this called `self.nonmoving.prepare(..)`
-                // (a copy-paste of prepare_nonmoving_space), so the
-                // pending_release_packets counter was never armed and every
-                // mutator's FreeListAllocator::release underflowed it at the
-                // first GC (epilogue assert). Call the actual release, which
-                // arms the counter and schedules ReleaseMarkSweepSpace.
-                //
-                // OCaml round 31: full-heap collections only, and the space
-                // can additionally suppress one release (Bactrian's
-                // InitialMark: its full-flagged prepare zeroes the bits for
-                // the cycle, but marks are only complete at FinalMark —
-                // releasing at InitialMark freed every block, live cells
-                // included). See prepare_nonmoving_space and
-                // MarkSweepSpace::suppress_next_release.
                 if _full_heap {
                     self.nonmoving.release();
                 }

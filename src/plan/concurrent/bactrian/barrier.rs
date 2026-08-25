@@ -149,11 +149,6 @@ impl<VM: VMBinding> BactrianBarrier<VM> {
             || self.plan.current_pause() == Some(Pause::FinalMark)
     }
 
-    /// Hand a SATB packet to its executor. Mid-window the packet is marking
-    /// work: route via the plan (sliced mode parks it for an in-pause quantum;
-    /// worker-concurrent mode feeds the Concurrent bucket). Outside a window
-    /// (pause-time flushes at FinalMark/Full) it must run inside the CURRENT
-    /// pause: the Closure bucket.
     fn dispatch_satb_packet(&self, w: ProcessModBufSATB<VM, Bactrian<VM>, TRACE_KIND_FAST>) {
         if self.plan.concurrent_work_in_progress() {
             self.plan.schedule_marking_packet(Box::new(w));

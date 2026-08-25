@@ -149,8 +149,9 @@ pub fn forward_object<VM: VMBinding>(
         )
     } else {
         write_forwarding_pointer::<VM>(object, new_object);
-        // Sentinel mode: the header-pointer store above IS the state change
-        // (word >= heap start now reads FORWARDED); no side bits to set.
+        // Sentinel mode: a clever trick to know whether the object has been
+        // forwarded yet — the header-pointer store above IS the state change
+        // (a word >= heap start now reads FORWARDED); no side bits to set.
         if !header_sentinel_active::<VM>() {
             VM::VMObjectModel::LOCAL_FORWARDING_BITS_SPEC.store_atomic::<VM, u8>(
                 object,
