@@ -253,8 +253,15 @@ impl<VM: VMBinding> Plan for Bactrian<VM> {
                 if self.sliced_marking {
                     match pause {
                         // Mid-cycle nursery pause: drain a bounded mark quantum
-                        // AFTER the nursery closure (Release opens once Closure
-                        // and weak processing are done). UNBUDGETED on a
+                        // AFTER the nursery closure AND after release. The
+                        // quanta go in the Final bucket, not Release: packets
+                        // in one bucket may run concurrently, and Release<C>
+                        // (scheduled by schedule_common_work into Release)
+                        // holds an exclusive &mut Plan while the quanta read
+                        // the plan. Final opens only once Release has fully
+                        // drained, and still precedes end_of_gc, so
+                        // decide_pause sees the quantum's outcome as before.
+                        // UNBUDGETED on a
                         // genuine emergency (allocation failed mid-cycle: the
                         // runway is gone, so marking must complete now — the
                         // next pause is then FinalMark and its sweep frees the
@@ -266,7 +273,7 @@ impl<VM: VMBinding> Plan for Bactrian<VM> {
                             } else {
                                 BactrianMarkQuantum::budgeted(self)
                             };
-                            scheduler.work_buckets[WorkBucketStage::Release].add(w);
+                            scheduler.work_buckets[WorkBucketStage::Final].add(w);
                         }
                         // FinalMark: drain EVERYTHING parked, unbudgeted, inside
                         // the Closure stage — mutators are stopped and their
@@ -282,9 +289,10 @@ impl<VM: VMBinding> Plan for Bactrian<VM> {
                     // while packets remain. Budgeted normally; UNBUDGETED when
                     // the pacing already wants the next cycle (next_gc_full_heap
                     // is pending) so the cycle isn't held up by more than one
-                    // minor. Runs in Release, after this pause's own release
-                    // parked FinalMark's packets — so the first quantum can run
-                    // in the FinalMark pause itself if budget allows.
+                    // minor. Runs in Final (see the mark-quantum note above:
+                    // never in Release alongside Release<C>'s &mut Plan), i.e.
+                    // strictly after this pause's release has parked any
+                    // FinalMark packets.
                     // NOTE: FinalMark's own first quantum is scheduled from
                     // the RELEASE arm, strictly AFTER the packets are parked —
                     // scheduling it here raced the parking at T>1 (worker A's
@@ -306,7 +314,7 @@ impl<VM: VMBinding> Plan for Bactrian<VM> {
                         } else {
                             BactrianSweepQuantum::budgeted(self)
                         };
-                        scheduler.work_buckets[WorkBucketStage::Release].add(w);
+                        scheduler.work_buckets[WorkBucketStage::Final].add(w);
                     }
                 }
             }
@@ -467,11 +475,14 @@ impl<VM: VMBinding> Plan for Bactrian<VM> {
                     self.sweep_pending.store(true, Ordering::SeqCst);
                     // First quantum, scheduled only now — after parking and
                     // the pending flag are fully published (see the
-                    // schedule_collection note). The plan is 'static in
-                    // reality (standard mmtk pattern; see ImmixSpace::release's
-                    // identical self-reference).
+                    // schedule_collection note). It goes in the Final bucket,
+                    // which cannot open until this Release<C> packet (and the
+                    // whole Release bucket) has drained: no worker can pick it
+                    // up while release() is still executing under &mut Plan.
+                    // The plan is 'static in reality (standard mmtk pattern;
+                    // see ImmixSpace::release's identical self-reference).
                     let plan: &'static Self = unsafe { &*(self as *const Self) };
-                    self.gen.common.base.scheduler.work_buckets[WorkBucketStage::Release]
+                    self.gen.common.base.scheduler.work_buckets[WorkBucketStage::Final]
                         .add(BactrianSweepQuantum::budgeted(plan));
                 } else {
                     self.immix_space.release(true, UnlogBitsOperation::NoOp);
