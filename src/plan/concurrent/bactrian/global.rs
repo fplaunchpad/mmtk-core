@@ -62,7 +62,9 @@ pub struct Bactrian<VM: VMBinding> {
     /// instead of being promoted; the pair flips each aging minor and the old
     /// to-space's residents (age 1) promote to mature. Both spaces are part of
     /// the young generation for every barrier/SATB/marking young-check (see
-    /// is_object_in_nursery). Empty and inert when aging is off (the default).
+    /// is_object_in_nursery). Currently always empty and inert: aging is
+    /// disabled pending a persistent remembered set (nursery_age() yields 0;
+    /// see its docs). The machinery stays for that follow-up.
     /// Full-heap traces evacuate them to mature via the derive attribute below.
     #[space]
     #[copy_semantics(CopySemantics::PromoteToMature)]
@@ -1236,17 +1238,30 @@ impl<VM: VMBinding> Bactrian<VM> {
     }
 }
 
-/// MMTK_NURSERY_AGE: >= 1 enables survivor aging (one extra minor to die before
-/// promotion — the semispace pair gives exactly one age step today; values > 1
-/// are accepted but behave as 1 until per-object age bits exist). Default 0
-/// (off): behaviour is identical to the pre-aging plan.
+/// MMTK_NURSERY_AGE: survivor aging (one extra minor to die before promotion;
+/// the semispace pair gives exactly one age step). DISABLED: the knob is
+/// parsed but always yields 0, so behaviour is identical to the pre-aging plan.
+///
+/// Aging is unsound until the mature-to-young remembered set persists across
+/// aging minors.
 fn nursery_age() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
-        std::env::var("MMTK_NURSERY_AGE")
+        let requested = std::env::var("MMTK_NURSERY_AGE")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(0)
+            .unwrap_or(0);
+        if requested >= 1 {
+            // eprintln!, not warn!: the workspace keeps mmtk-core's default
+            // `log/release_max_level_off`, which compiles warn! out of release
+            // builds. Same style as options.rs's "Warn: unable to set ..." notices.
+            eprintln!(
+                "Warn: MMTK_NURSERY_AGE={} ignored: survivor aging is disabled until \
+                 the remembered set persists across aging minors",
+                requested
+            );
+        }
+        0
     })
 }
 
