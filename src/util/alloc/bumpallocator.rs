@@ -10,8 +10,32 @@ use crate::util::opaque_pointer::*;
 use crate::vm::VMBinding;
 
 /// Size of a bump allocator block. Currently it is set to 32 KB.
-const BLOCK_SIZE: usize = 8 << crate::util::constants::LOG_BYTES_IN_PAGE;
-const BLOCK_MASK: usize = BLOCK_SIZE - 1;
+/// Bump acquisition granule. Default 32KB (8 pages); MMTK_BUMP_BLOCK_KB
+/// overrides (power of two, 32..4096). Larger granules serve two measured
+/// purposes for the OCaml binding (see its SHAPE.md): (1) medium objects
+/// bump-allocated at size-pitch stop suffering the per-32KB tail-skip that
+/// phase-locks their cache-set placement (matmul's 739/903M LLC-load
+/// regimes); (2) TLAB refills become proportionally rarer.
+fn block_size() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let kb = std::env::var("MMTK_BUMP_BLOCK_KB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|kb| kb.is_power_of_two() && (32..=4096).contains(kb))
+            // Default 512KB (measured, OCaml binding SHAPE.md round 13): the
+            // 32KB granule's tail-skip phase-locks medium-object placement
+            // (matmul 213-903M LLC-loads vs vanilla's 57M floor, reached at
+            // 512KB) and its refill rate costs every allocating bench 2-10%
+            // of mutator cycles (bt 7.02->6.66G, LU 6.93->6.21G, kb below
+            // vanilla at 3.86G). Upstream default was 32.
+            .unwrap_or(512);
+        kb * 1024
+    })
+}
+fn block_mask() -> usize {
+    block_size() - 1
+}
 
 /// A bump pointer allocator. It keeps a thread local allocation buffer,
 /// and bumps a cursor to allocate from the buffer.
@@ -95,7 +119,7 @@ impl<VM: VMBinding> Allocator<VM> for BumpAllocator<VM> {
     }
 
     fn get_thread_local_buffer_granularity(&self) -> usize {
-        BLOCK_SIZE
+        block_size()
     }
 
     fn alloc(&mut self, size: usize, align: usize, offset: usize) -> Address {
@@ -202,7 +226,7 @@ impl<VM: VMBinding> BumpAllocator<VM> {
             return Address::ZERO;
         }
 
-        let block_size = (size + BLOCK_MASK) & (!BLOCK_MASK);
+        let block_size = (size + block_mask()) & (!block_mask());
         let acquired_start = self.space.acquire(
             self.tls,
             bytes_to_pages_up(block_size),

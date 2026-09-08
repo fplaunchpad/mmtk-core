@@ -254,6 +254,10 @@ impl<VM: VMBinding> GCWorker<VM> {
             std::hint::black_box(unsafe { *(typename.as_ptr()) });
 
             probe!(mmtk, work, typename.as_ptr(), typename.len());
+            // Refresh this worker's view of the instance's single-tracer flag
+            // (util::up_trace): the hot paths read a thread-local, never a
+            // process-global.
+            crate::util::up_trace::sync_worker(mmtk);
             work.do_work_with_stat(&mut self, mmtk);
         }
         debug!(

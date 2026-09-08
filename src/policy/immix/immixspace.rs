@@ -31,7 +31,7 @@ use crate::{
     MMTK,
 };
 use atomic::Ordering;
-use std::sync::{atomic::AtomicU8, atomic::AtomicUsize, Arc};
+use std::sync::{atomic::AtomicBool, atomic::AtomicU8, atomic::AtomicUsize, Arc};
 
 pub(crate) const TRACE_KIND_FAST: TraceKind = 0;
 pub(crate) const TRACE_KIND_DEFRAG: TraceKind = 1;
@@ -90,8 +90,25 @@ pub struct ImmixSpace<VM: VMBinding> {
     line_unavail_state: AtomicU8,
     /// A list of all reusable blocks
     pub reusable_blocks: ReusableBlockPool,
+    /// Live (allocated) blocks counted by the most recent sweep — reset when
+    /// sweep tasks are generated, accumulated by SweepChunk packets. With
+    /// `reusable_blocks.len()` this yields a post-sweep fragmentation metric:
+    /// the fraction of live blocks that are only partially occupied.
+    pub swept_live_blocks: std::sync::atomic::AtomicUsize,
     /// Defrag utilities
     pub(super) defrag: Defrag,
+    /// COMPACT-ALL madvise scope: true from a compact-all GC's prepare until
+    /// the next major's prepare — blocks freed in that window return their
+    /// pages to the OS regardless of MMTK_RELEASE_FREED_PAGES.
+    madvise_freed_this_gc: AtomicBool,
+    /// Bytes of objects newly marked/forwarded by the CURRENT major marking
+    /// epoch (reset at each major's prepare). The truthful live measure for
+    /// the compaction law: post-sweep reserved pages cannot distinguish a
+    /// dense heap from one whose 256B lines are pinned by interleaved small
+    /// live objects (mature_mutation: 6.6MB live pinning 17-46MB), and every
+    /// line/block statistic is equally blind. ~One relaxed add per marked
+    /// object per major.
+    major_live_bytes: AtomicUsize,
     /// How many lines have been consumed since last GC?
     lines_consumed: AtomicUsize,
     /// Object mark state
@@ -517,7 +534,10 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             line_unavail_state: AtomicU8::new(Line::RESET_MARK_STATE),
             lines_consumed: AtomicUsize::new(0),
             reusable_blocks: ReusableBlockPool::new(scheduler.num_workers()),
+            swept_live_blocks: std::sync::atomic::AtomicUsize::new(0),
             defrag: Defrag::default(),
+            madvise_freed_this_gc: AtomicBool::new(false),
+            major_live_bytes: AtomicUsize::new(0),
             // Set to the correct mark state when inititialized. We cannot rely on prepare to set it (prepare may get skipped in nursery GCs).
             mark_state: Self::MARKED_STATE,
             scheduler: scheduler.clone(),
@@ -769,6 +789,9 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         // documents that and can never fire (rc_enabled always false until P3).
         debug_assert!(!self.rc_enabled);
         if major_gc {
+            // New major marking epoch: restart the live-bytes tally (see
+            // `major_live_bytes` — the compaction law's denominator).
+            self.major_live_bytes.store(0, Ordering::Relaxed);
             // Update mark_state
             if VM::VMObjectModel::LOCAL_MARK_BIT_SPEC.is_on_side() {
                 self.mark_state = Self::MARKED_STATE;
@@ -786,6 +809,11 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             let threshold = self.defrag.defrag_spill_threshold.load(Ordering::Acquire);
             // # Safety: ImmixSpace reference is always valid within this collection cycle.
             let space = unsafe { &*(self as *const Self) };
+            let compact_all = self.defrag.compact_all_active() && space.in_defrag();
+            // Arm the compaction-epoch madvise scope (cleared by the next
+            // major's prepare): covers this GC's sweep — in-pause or the
+            // deferred quanta draining across later nursery pauses.
+            self.madvise_freed_this_gc.store(compact_all, Ordering::Relaxed);
             let work_packets = self.chunk_map.generate_tasks(|chunk| {
                 Box::new(PrepareBlockState {
                     space,
@@ -795,6 +823,7 @@ impl<VM: VMBinding> ImmixSpace<VM> {
                     } else {
                         None
                     },
+                    compact_all,
                     unlog_bits_op,
                 })
             });
@@ -872,6 +901,37 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         self.lines_consumed.store(0, Ordering::Relaxed);
     }
 
+    /// Like [`Self::release`], but RETURNS the chunk-sweep packets instead of
+    /// scheduling them, so a plan can execute the sweep INCREMENTALLY (e.g.
+    /// Bactrian's sweep quanta inside subsequent nursery pauses — stock
+    /// OCaml's sweep slices). The caller owns correctness of the deferral:
+    /// no state the packets read (line_mark_state, defrag histograms, chunk
+    /// map) may be re-prepared until every packet has run, i.e. the next
+    /// full/cycle prepare must be gated on drain completion. Blocks freed by
+    /// a deferred packet flow to the page resource exactly as in the
+    /// immediate path; the FlushPageResource epilogue fires when the LAST
+    /// packet (whenever it runs) completes.
+    pub(crate) fn release_deferred_sweep(
+        &mut self,
+        major_gc: bool,
+        unlog_bits_op: UnlogBitsOperation,
+    ) -> Vec<Box<dyn GCWork<VM>>> {
+        debug_assert!(!self.rc_enabled);
+        if major_gc {
+            if !super::BLOCK_ONLY {
+                self.line_unavail_state.store(
+                    self.line_mark_state.load(Ordering::Acquire),
+                    Ordering::Release,
+                );
+            }
+        }
+        if !super::BLOCK_ONLY {
+            self.reusable_blocks.reset();
+        }
+        self.lines_consumed.store(0, Ordering::Relaxed);
+        self.generate_sweep_tasks(unlog_bits_op)
+    }
+
     /// This is called when a GC finished.
     /// Return whether this GC was a defrag GC, as a plan may want to know this.
     pub fn end_of_gc(&mut self) -> bool {
@@ -882,8 +942,45 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         did_defrag
     }
 
+    /// Post-sweep fragmentation: (partially-occupied live blocks, live blocks).
+    /// Meaningful after the sweep (immediate or deferred) has fully drained.
+    /// Request a one-shot COMPACT-ALL: the next defrag collection treats
+    /// every in-use block as a defrag source (see `Defrag::compact_all_once`
+    /// — the remedy for intra-line waste that hole-based selection cannot
+    /// see). Also forces that collection to BE a defrag collection.
+    pub fn request_compact_all(&self) {
+        self.defrag.request_compact_all();
+    }
+
+    /// Bytes marked/forwarded by the last major marking epoch — the
+    /// truthful mature live measure (see the `major_live_bytes` field).
+    pub fn major_live_bytes(&self) -> usize {
+        self.major_live_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Add to the major live tally. UP window: plain read-add-store (a
+    /// relaxed fetch_add is still a LOCK XADD, paid per marked object).
+    fn add_major_live_bytes(&self, bytes: usize) {
+        if crate::util::up_trace::up() {
+            self.major_live_bytes.store(
+                self.major_live_bytes.load(Ordering::Relaxed) + bytes,
+                Ordering::Relaxed,
+            );
+        } else {
+            self.major_live_bytes.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
+    pub fn post_sweep_fragmentation(&self) -> (usize, usize) {
+        (
+            self.reusable_blocks.len(),
+            self.swept_live_blocks.load(Ordering::Relaxed),
+        )
+    }
+
     /// Generate chunk sweep tasks
     fn generate_sweep_tasks(&self, unlog_bits_op: UnlogBitsOperation) -> Vec<Box<dyn GCWork<VM>>> {
+        self.swept_live_blocks.store(0, Ordering::Relaxed);
         self.defrag.mark_histograms.lock().clear();
         // # Safety: ImmixSpace reference is always valid within this collection cycle.
         let space = unsafe { &*(self as *const Self) };
@@ -912,7 +1009,15 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         } else {
             block.deinit();
         }
-        self.pr.release_block(block);
+        // COMPACT-ALL epoch: blocks freed by a compaction's sweep return
+        // their pages to the OS unconditionally — reclaiming residency is
+        // the compaction's purpose (mature_mutation: reserved collapsed
+        // 46→7MB but RSS stayed flat without this). Steady-state recycling
+        // between majors keeps the fast path (MMTK_RELEASE_FREED_PAGES).
+        self.pr.release_block_with(
+            block,
+            self.madvise_freed_this_gc.load(Ordering::Relaxed),
+        );
     }
 
     /// Push an already-deinitialised block back to the page resource free list (accounting +
@@ -1005,6 +1110,7 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         vo_bit::helper::on_trace_object::<VM>(object);
 
         if self.attempt_mark(object, self.mark_state) {
+            self.add_major_live_bytes(VM::VMObjectModel::get_current_size(object));
             // lxr P2.F: under RC, a straddle continuation line carries no RC entry of its own,
             // so a marked straddle object is short-circuited before line/block marking. Gated;
             // dead for all non-RC plans (rc_enabled always false until the P3 LXR plan).
@@ -1088,7 +1194,9 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             let new_object = if self.is_pinned(object)
                 || (!nursery_collection && self.defrag.space_exhausted())
             {
-                self.attempt_mark(object, self.mark_state);
+                if self.attempt_mark(object, self.mark_state) {
+                    self.add_major_live_bytes(VM::VMObjectModel::get_current_size(object));
+                }
                 object_forwarding::clear_forwarding_bits::<VM>(object);
                 Block::containing(object).set_state(BlockState::Marked);
 
@@ -1111,6 +1219,7 @@ impl<VM: VMBinding> ImmixSpace<VM> {
                     semantics,
                     copy_context,
                     |new_object| {
+                        self.add_major_live_bytes(VM::VMObjectModel::get_current_size(new_object));
                         // post_copy should have set the unlog bit
                         // if `unlog_traced_object` is true.
                         debug_assert!(
@@ -1171,6 +1280,19 @@ impl<VM: VMBinding> ImmixSpace<VM> {
 
     /// Atomically mark an object.
     fn attempt_mark(&self, object: ObjectReference, mark_state: u8) -> bool {
+        // UP window (round 32): a single stopped-world tracer needs no CAS —
+        // plain load/test/store. Major marking pays this per marked object
+        // (a SeqCst load + SeqCst compare-exchange otherwise).
+        if crate::util::up_trace::up() {
+            let side = VM::VMObjectModel::LOCAL_MARK_BIT_SPEC.extract_side_spec();
+            let addr = object.to_raw_address();
+            let old: u8 = unsafe { side.load::<u8>(addr) };
+            if old == mark_state {
+                return false;
+            }
+            unsafe { side.store::<u8>(addr, mark_state) };
+            return true;
+        }
         loop {
             let old_value = VM::VMObjectModel::LOCAL_MARK_BIT_SPEC.load_atomic::<VM, u8>(
                 object,
@@ -1317,13 +1439,23 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         if self.rc_enabled {
             return;
         }
-        // Mark the object
-        VM::VMObjectModel::LOCAL_MARK_BIT_SPEC.store_atomic::<VM, u8>(
-            object,
-            self.mark_state,
-            None,
-            Ordering::SeqCst,
-        );
+        // Mark the object. UP window (round 32): one tracer, world stopped —
+        // the SeqCst store compiles to a full-fence XCHG on x86, paid per
+        // promoted object (binarytrees: 19.7M of them). A plain side-table
+        // store is sound under the single-tracer invariant (same argument as
+        // UP-trace); the pause's release lock sequences publish it before
+        // any mutator or second worker runs.
+        if crate::util::up_trace::up() {
+            let side = VM::VMObjectModel::LOCAL_MARK_BIT_SPEC.extract_side_spec();
+            unsafe { side.store::<u8>(object.to_raw_address(), self.mark_state) };
+        } else {
+            VM::VMObjectModel::LOCAL_MARK_BIT_SPEC.store_atomic::<VM, u8>(
+                object,
+                self.mark_state,
+                None,
+                Ordering::SeqCst,
+            );
+        }
         // Mark the line
         if !super::MARK_LINE_AT_SCAN_TIME {
             self.mark_lines(object);
@@ -1354,6 +1486,10 @@ pub struct PrepareBlockState<VM: VMBinding> {
     pub space: &'static ImmixSpace<VM>,
     pub chunk: Chunk,
     pub defrag_threshold: Option<usize>,
+    /// COMPACT-ALL (one-shot, see `Defrag::compact_all_once`): every in-use
+    /// block is a defrag source this GC, regardless of hole count — the
+    /// hole-bucket selection cannot see intra-line waste.
+    pub compact_all: bool,
     pub unlog_bits_op: UnlogBitsOperation,
 }
 
@@ -1383,7 +1519,7 @@ impl<VM: VMBinding> GCWork<VM> for PrepareBlockState<VM> {
             let is_defrag_source = if !self.space.is_defrag_enabled() {
                 // Do not set any block as defrag source if defrag is disabled.
                 false
-            } else if *mmtk.options.immix_defrag_every_block {
+            } else if *mmtk.options.immix_defrag_every_block || self.compact_all {
                 // Set every block as defrag source if so desired.
                 true
             } else if let Some(defrag_threshold) = self.defrag_threshold {
@@ -1465,6 +1601,11 @@ impl<VM: VMBinding> GCWork<VM> for SweepChunk<VM> {
             }
         }
         probe!(mmtk, sweep_chunk, allocated_blocks);
+        // Accumulate the live-block count for the post-sweep fragmentation
+        // metric (see `post_sweep_fragmentation`).
+        self.space
+            .swept_live_blocks
+            .fetch_add(allocated_blocks, Ordering::Relaxed);
         // Set this chunk as free if there is not live blocks.
         if allocated_blocks == 0 {
             self.space.chunk_map.set_allocated(self.chunk, false)

@@ -76,6 +76,7 @@ impl<VM: VMBinding> Allocator<VM> for FreeListAllocator<VM> {
                         size, align, offset, cell, cell_size, res + size, cell + cell_size
                     );
                 }
+                self.allocate_black_if_needed(res);
                 return res;
             }
         }
@@ -87,7 +88,11 @@ impl<VM: VMBinding> Allocator<VM> for FreeListAllocator<VM> {
         // Try get a block from the space
         if let Some(block) = self.acquire_global_block(size, align, false) {
             let addr = self.block_alloc(block);
-            allocator::align_allocation::<VM>(addr, align, offset)
+            let res = allocator::align_allocation::<VM>(addr, align, offset);
+            if !res.is_zero() {
+                self.allocate_black_if_needed(res);
+            }
+            res
         } else {
             Address::ZERO
         }
@@ -129,6 +134,45 @@ impl<VM: VMBinding> Allocator<VM> for FreeListAllocator<VM> {
 }
 
 impl<VM: VMBinding> FreeListAllocator<VM> {
+    /// Allocate-black (OCaml Bactrian round 30): while a concurrent marking
+    /// cycle (or its deferred sweep) is in flight, objects born in this
+    /// free-list space must carry the mark bit or the cycle's sweep frees
+    /// them live — the free-list analog of the Immix allocator's
+    /// allocate-as-live path. The sweep probes
+    /// `cell + OBJECT_REF_OFFSET_LOWER_BOUND` (and every MIN_OBJECT_SIZE
+    /// step after), so marking the allocation start + that offset is found
+    /// by construction. One flag load per allocation when idle.
+    /// Is a concurrent marking/sweep window in flight for this space? While
+    /// it is, this space's mark bits are mid-rebuild and no lazy sweep may
+    /// run (see the clean-blocks-only gates). Reuses the allocate-as-live
+    /// arming, which spans exactly the unsound window (InitialMark until the
+    /// cycle's sweep completes).
+    fn marking_window_active(&self) -> bool {
+        use crate::policy::space::Space;
+        self.space.should_allocate_as_live()
+    }
+
+    fn allocate_black_if_needed(&self, alloc_start: crate::util::Address) {
+        use crate::policy::space::Space;
+        use crate::vm::ObjectModel;
+        if self.space.should_allocate_as_live() {
+            let objref = unsafe {
+                crate::util::ObjectReference::from_raw_address_unchecked(
+                    alloc_start + VM::VMObjectModel::OBJECT_REF_OFFSET_LOWER_BOUND,
+                )
+            };
+            VM::VMObjectModel::LOCAL_MARK_BIT_SPEC
+                .mark::<VM>(objref, std::sync::atomic::Ordering::SeqCst);
+            // The BLOCK must be marked live too: release frees whole
+            // state-Unmarked blocks without consulting object bits, and a
+            // block whose only live contents are born-during-the-cycle
+            // objects (which SATB never traces — live by birth) would
+            // otherwise be freed at the cycle's release with its live cells
+            // (reproduced: fragmed's mid-window keepers in a recycled block
+            // whose pre-cycle objects had all died).
+            Block::containing(objref).set_state(BlockState::Marked);
+        }
+    }
     // New free list allcoator
     pub(crate) fn new(
         tls: VMThread,
@@ -259,6 +303,16 @@ impl<VM: VMBinding> FreeListAllocator<VM> {
     ) -> Option<Block> {
         if cfg!(feature = "eager_sweeping") {
             // We have swept blocks in the last GC. If we run out of available blocks, there is nothing we can do.
+            None
+        } else if self.marking_window_active() {
+            // CLEAN-BLOCKS-ONLY window (OCaml Bactrian round 31): a concurrent
+            // marking cycle is in flight and this space's mark bits were
+            // zeroed at the cycle's prepare — sweeping now would read the
+            // incomplete mark state and free live-but-not-yet-marked cells
+            // (reproduced: a marking quantum crashing on a freed cell whose
+            // header had become a free-list link). Unswept blocks stay parked
+            // until the cycle completes; allocation is served from
+            // already-swept blocks and fresh ones.
             None
         } else {
             // Get blocks from unswept_blocks and attempt to sweep

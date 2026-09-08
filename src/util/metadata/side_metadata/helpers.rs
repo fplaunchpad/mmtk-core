@@ -161,6 +161,7 @@ pub(super) fn try_mmap_contiguous_metadata_space(
 }
 
 /// Performs the translation of data address (`data_addr`) to metadata address for the specified metadata (`metadata_spec`).
+#[inline(always)]
 pub(crate) fn address_to_meta_address(
     metadata_spec: &SideMetadataSpec,
     data_addr: Address,
@@ -224,6 +225,7 @@ pub(super) const fn metadata_address_range_size(metadata_spec: &SideMetadataSpec
     1usize << (VMLayout::LOG_ARCH_ADDRESS_SPACE - log_data_meta_ratio(metadata_spec))
 }
 
+#[inline(always)]
 pub(super) fn meta_byte_lshift(metadata_spec: &SideMetadataSpec, data_addr: Address) -> u8 {
     let bits_num_log = metadata_spec.log_num_of_bits as i32;
     if bits_num_log >= 3 {
@@ -234,6 +236,7 @@ pub(super) fn meta_byte_lshift(metadata_spec: &SideMetadataSpec, data_addr: Addr
         as u8
 }
 
+#[inline(always)]
 pub(super) fn meta_byte_mask(metadata_spec: &SideMetadataSpec) -> u8 {
     let bits_num_log = metadata_spec.log_num_of_bits;
     ((1usize << (1usize << bits_num_log)) - 1) as u8

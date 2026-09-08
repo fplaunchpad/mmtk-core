@@ -7,6 +7,7 @@ use crate::plan::generational::global::GenerationalPlanExt;
 use crate::plan::global::PlanTraceObject;
 use crate::plan::VectorObjectQueue;
 use crate::policy::gc_work::TraceKind;
+use crate::policy::space::Space;
 use crate::policy::gc_work::DEFAULT_TRACE;
 use crate::policy::immix::TRACE_KIND_FAST;
 use crate::scheduler::gc_work::PlanProcessEdges;
@@ -18,7 +19,15 @@ use crate::scheduler::ProcessEdgesWork;
 use crate::scheduler::WorkBucketStage;
 use crate::util::ObjectReference;
 use crate::vm::slot::Slot;
+use crate::vm::Scanning;
 use crate::vm::VMBinding;
+
+/// MMTK_UP_OLDIFY=1: opt-in stock-oldify fast path for plain nursery pauses
+/// under UP (see Scanning::up_oldify_packet). Default OFF.
+fn up_oldify_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("MMTK_UP_OLDIFY").map(|v| v == "1").unwrap_or(false))
+}
 use crate::MMTK;
 use std::ops::{Deref, DerefMut};
 
@@ -76,9 +85,297 @@ pub(in crate::plan) struct BactrianNurseryProcessEdges<VM: VMBinding> {
     mark_seed: Vec<ObjectReference>,
 }
 
+/// Slot visitor that just collects slots into a scratch buffer, for the UP
+/// direct-trace drain below.
+struct SlotCollector<'a, S: Slot>(&'a mut Vec<S>);
+impl<S: Slot> crate::vm::SlotVisitor<S> for SlotCollector<'_, S> {
+    fn visit_slot(&mut self, slot: S) {
+        self.0.push(slot);
+    }
+}
+
+/// Core services for the binding's oldify loop (MMTK_UP_OLDIFY): young test
+/// on the copying nursery + aged pair, mature bump-alloc through the
+/// worker's copy context, and the full promotion post-copy protocol.
+struct BactrianOldifyOps<'w, VM: VMBinding> {
+    plan: &'static Bactrian<VM>,
+    worker: &'w mut crate::scheduler::GCWorker<VM>,
+}
+
+impl<VM: VMBinding> crate::vm::UpOldifyOps<VM> for BactrianOldifyOps<'_, VM> {
+    #[inline(always)]
+    fn young_range(&self) -> (crate::util::Address, crate::util::Address) {
+        use crate::policy::space::Space;
+        let c = self.plan.gen.nursery.common();
+        (c.start, c.start + c.extent)
+    }
+
+    #[inline(always)]
+    fn in_young(&self, addr: crate::util::Address) -> bool {
+        self.plan.is_address_in_nursery(addr)
+    }
+
+    fn alloc_mature(&mut self, bytes: usize) -> crate::util::Address {
+        self.worker.get_copy_context_mut().alloc_copy(
+            unsafe {
+                crate::util::ObjectReference::from_raw_address_unchecked(
+                    crate::util::Address::from_usize(8),
+                )
+            },
+            bytes,
+            crate::util::constants::BYTES_IN_WORD,
+            0,
+            crate::util::copy::CopySemantics::PromoteToMature,
+        )
+    }
+
+    fn post_copy(&mut self, object: crate::util::ObjectReference, bytes: usize) {
+        self.worker.get_copy_context_mut().post_copy(
+            object,
+            bytes,
+            crate::util::copy::CopySemantics::PromoteToMature,
+        );
+        self.plan.post_scan_object(object);
+    }
+
+    fn is_young_los(&self, object: crate::util::ObjectReference) -> bool {
+        use crate::policy::space::Space;
+        self.plan.gen.common.los.in_space(object)
+            && self.plan.gen.common.los.is_in_nursery(object)
+    }
+
+    fn promote_young_los(&mut self, object: crate::util::ObjectReference) -> bool {
+        // LOS in-place promotion: test_and_mark clears the nursery bit and
+        // moves the treadmill entry; a newly-promoted object is enqueued for
+        // scanning — intercepted with a local queue so the caller scans it
+        // via the oldify walk instead.
+        let mut q = crate::plan::VectorObjectQueue::default();
+        self.plan.gen.common.los.trace_object(&mut q, object);
+        !q.is_empty()
+    }
+}
+
+/// Sliced-STW mark quantum: pops parked marking packets (see
+/// `Bactrian::parked_marking`) and executes them on this worker, world
+/// stopped, until the queue empties or the budget expires. Scheduled in the
+/// Release stage of mid-cycle Nursery pauses (budgeted — stock OCaml's
+/// allocation-paced mark slice, one per minor) and in the Closure stage of
+/// FinalMark (unbudgeted — drain everything, including SATB flushes parked
+/// during StopMutators).
+pub(in crate::plan) struct BactrianMarkQuantum<VM: VMBinding> {
+    plan: &'static Bactrian<VM>,
+    budget: Option<std::time::Duration>,
+}
+
+/// Per-quantum budget. MMTK_MARK_SLICE_MS overrides (fractional ok);
+/// default 2ms — comparable to a nursery pause at the stock-parity 2 MiB
+/// nursery, so mid-cycle pauses stay in vanilla's slice-pause class.
+fn mark_slice_budget() -> std::time::Duration {
+    static V: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let ms = std::env::var("MMTK_MARK_SLICE_MS")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|ms| *ms > 0.0 && *ms <= 1000.0)
+            .unwrap_or(2.0);
+        std::time::Duration::from_secs_f64(ms / 1e3)
+    })
+}
+
+impl<VM: VMBinding> BactrianMarkQuantum<VM> {
+    pub(in crate::plan) fn budgeted(plan: &'static Bactrian<VM>) -> Self {
+        // Per-cycle hint (ConcurrentPlan::set_mark_quantum_hint_ms — the
+        // binding's slice-sizing law: mark debt spread over the runway's
+        // pauses) overrides the static budget; 0 = never hinted.
+        let hint = plan
+            .mark_quantum_hint_nanos
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let budget = if hint > 0 {
+            std::time::Duration::from_nanos(hint)
+        } else {
+            mark_slice_budget()
+        };
+        Self {
+            plan,
+            budget: Some(budget),
+        }
+    }
+    pub(in crate::plan) fn unbudgeted(plan: &'static Bactrian<VM>) -> Self {
+        Self { plan, budget: None }
+    }
+}
+
+impl<VM: VMBinding> crate::scheduler::GCWork<VM> for BactrianMarkQuantum<VM> {
+    fn do_work(
+        &mut self,
+        worker: &mut crate::scheduler::GCWorker<VM>,
+        mmtk: &'static MMTK<VM>,
+    ) {
+        let deadline = self.budget.map(|b| std::time::Instant::now() + b);
+        let mut packets = 0usize;
+        // Run the drain under full-heap LOS semantics (mid-cycle marking must
+        // mark mature LOS objects even when the enclosing pause latched
+        // nursery semantics); restore the previous mode after.
+        let was_full = mmtk
+            .get_plan()
+            .common()
+            .los
+            .set_marking_full_semantics(true);
+        while let Some(mut w) = self.plan.pop_marking_packet() {
+            w.do_work(worker, mmtk);
+            packets += 1;
+            if let Some(d) = deadline {
+                if std::time::Instant::now() >= d {
+                    break;
+                }
+            }
+        }
+        mmtk.get_plan()
+            .common()
+            .los
+            .set_marking_full_semantics(was_full);
+        probe!(mmtk, bactrian_mark_quantum, packets);
+    }
+}
+
+/// Incremental-sweep quantum: pops deferred chunk-sweep packets (see
+/// `Bactrian::parked_sweep`) and executes them, world stopped, until the
+/// queue empties or the budget expires — stock OCaml's sweep slices,
+/// scheduled in the Release stage of nursery pauses after FinalMark.
+/// Unbudgeted when the pacing wants the next cycle (drain-to-completion).
+/// The freed blocks flow to the page resource per packet, so RSS falls
+/// incrementally across the minors instead of at one FinalMark cliff.
+pub(in crate::plan) struct BactrianSweepQuantum<VM: VMBinding> {
+    plan: &'static Bactrian<VM>,
+    budget: Option<std::time::Duration>,
+}
+
+/// Per-quantum sweep budget. MMTK_SWEEP_SLICE_MS overrides; default 2ms
+/// (a chunk-sweep packet is ~fast: line-mark scans over 4MB of blocks).
+fn sweep_slice_budget() -> std::time::Duration {
+    static V: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let ms = std::env::var("MMTK_SWEEP_SLICE_MS")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|ms| *ms > 0.0 && *ms <= 1000.0)
+            .unwrap_or(2.0);
+        std::time::Duration::from_secs_f64(ms / 1e3)
+    })
+}
+
+impl<VM: VMBinding> BactrianSweepQuantum<VM> {
+    pub(in crate::plan) fn budgeted(plan: &'static Bactrian<VM>) -> Self {
+        Self { plan, budget: Some(sweep_slice_budget()) }
+    }
+    pub(in crate::plan) fn unbudgeted(plan: &'static Bactrian<VM>) -> Self {
+        Self { plan, budget: None }
+    }
+}
+
+impl<VM: VMBinding> crate::scheduler::GCWork<VM> for BactrianSweepQuantum<VM> {
+    fn do_work(
+        &mut self,
+        worker: &mut crate::scheduler::GCWorker<VM>,
+        mmtk: &'static MMTK<VM>,
+    ) {
+        let deadline = self.budget.map(|b| std::time::Instant::now() + b);
+        let mut packets = 0usize;
+        loop {
+            let Some(mut w) = self.plan.pop_sweep_packet() else {
+                // Queue empty: the cycle's sweep is COMPLETE. (Single quantum
+                // per pause and quanta only run world-stopped, so this edge
+                // cannot race a concurrent producer — packets are only parked
+                // by FinalMark, which is gated on the previous drain.)
+                self.plan.sweep_queue_emptied();
+                break;
+            };
+            w.do_work(worker, mmtk);
+            packets += 1;
+            if let Some(d) = deadline {
+                if std::time::Instant::now() >= d {
+                    // Budget expired. If the queue emptied on this very
+                    // packet, still flip the flag in THIS pause — a one-pause
+                    // delay would hold the sweep gate (no new cycle or Full)
+                    // and the post-sweep baseline latch for one extra minor.
+                    //
+                    // is_empty() is an exact test here, but ONLY under two
+                    // invariants of the drain design: (a) no producers — all
+                    // packets are parked by FinalMark before the first
+                    // quantum is scheduled (see the schedule_collection
+                    // ordering note); (b) no packet in flight — one quantum
+                    // per pause, and every popped packet was executed to
+                    // completion above. If either breaks, an empty-looking
+                    // queue can coexist with an unswept packet and this
+                    // reverts to the false-sweep-complete class (fragmed T4,
+                    // NOTES 2026-08-12) — switch back to a steal-based
+                    // emptiness test in that world.
+                    if self.plan.sweep_queue_is_empty() {
+                        self.plan.sweep_queue_emptied();
+                    }
+                    break;
+                }
+            }
+        }
+        probe!(mmtk, bactrian_sweep_quantum, packets);
+    }
+}
+
 impl<VM: VMBinding> BactrianNurseryProcessEdges<VM> {
     /// Match ProcessEdgesWork's own buffer sizing for the seed packets.
     const SEED_CAPACITY: usize = 4096;
+
+    /// UP direct-trace closure: with a single tracer inside a stopped-world
+    /// pause, consume the whole transitive closure inside THIS packet with an
+    /// explicit work list — stock oldify's todo-list discipline — instead of
+    /// bouncing every generation of the BFS through packet creation, bucket
+    /// scheduling and a fresh ProcessEdges instance. Per object this performs
+    /// exactly the packet path's protocol (support_slot_enqueuing → scan_object
+    /// → post_scan_object → process each slot), so trace semantics, line
+    /// marking at scan time, InitialMark seed collection and the FinalMark
+    /// remark all behave identically; only the scheduling round-trips go away.
+    fn drain_closure_locally(&mut self) {
+        use crate::vm::Scanning;
+        let tls = self.worker().tls;
+        let mut scratch: Vec<SlotOf<Self>> = Vec::new();
+        // Objects the VM cannot expose as slots: Scanning::support_slot_enqueuing
+        // may answer false per object, and the packet path then scans them with
+        // scan_object_and_trace_edges. This drain cannot do that inline (the
+        // tracer context needs the worker while we hold self), so such objects
+        // are diverted to the normal packet path below instead of being
+        // asserted away. The OCaml binding answers true for every object (trait
+        // default), so for it this vector stays empty.
+        let mut fallback: Vec<ObjectReference> = Vec::new();
+        loop {
+            let nodes = self.pop_nodes();
+            if nodes.is_empty() {
+                break;
+            }
+            for object in nodes {
+                if !<VM as VMBinding>::VMScanning::support_slot_enqueuing(tls, object) {
+                    fallback.push(object);
+                    continue;
+                }
+                {
+                    let mut collector = SlotCollector(&mut scratch);
+                    <VM as VMBinding>::VMScanning::scan_object(tls, object, &mut collector);
+                }
+                self.plan.post_scan_object(object);
+                for i in 0..scratch.len() {
+                    self.process_slot(scratch[i]);
+                }
+                scratch.clear();
+            }
+        }
+        if !fallback.is_empty() {
+            // Same packet flush() uses for un-drained nodes: PlanScanObjects with
+            // the plan's post_scan hook. Its scan_object_and_trace_edges path
+            // traces these objects' fields through a fresh ProcessEdges instance,
+            // whose own flush drains locally again, so closure completeness is
+            // unchanged; only these objects skip the local work list.
+            self.start_or_dispatch_scan_work(self.create_scan_work(fallback));
+        }
+    }
 
     fn flush_mark_seed(&mut self) {
         if !self.mark_seed.is_empty() {
@@ -87,10 +384,10 @@ impl<VM: VMBinding> BactrianNurseryProcessEdges<VM> {
                 objects,
                 self.base.mmtk(),
             );
-            // Like ProcessRootSlots: park the packets in the Concurrent bucket
-            // without notifying — the scheduler opens the bucket (and wakes workers)
-            // when the pause ends.
-            self.base.mmtk().scheduler.work_buckets[WorkBucketStage::Concurrent].add_no_notify(w);
+            // Route via the plan: worker-concurrent mode parks in the Concurrent
+            // bucket without notifying (the scheduler opens it when the pause
+            // ends); sliced mode parks in the plan queue for in-pause quanta.
+            self.plan.schedule_marking_packet(Box::new(w));
         }
     }
 }
@@ -132,7 +429,18 @@ impl<VM: VMBinding> ProcessEdgesWork for BactrianNurseryProcessEdges<VM> {
         // returns the new copy, which post_copy born-black-marked and which this
         // trace scans transitively; an LOS "promotion" is in place and is idempotent
         // under both treatments below).
-        if new_object == object && !self.plan.is_object_in_nursery(object) {
+        //
+        // Pause gate FIRST: the seed/remark treatments below only exist for the
+        // two marking-fused pauses. A plain mid-cycle Nursery pause ran the
+        // young-check chain (4 space lookups per traced object since the
+        // young-LOS fix) for a match arm that does nothing — measured ~2-4%
+        // of bt's whole-process cycles. The chain is also SOUND to skip for
+        // the LOS side here: any LOS object this trace reaches was in-place
+        // promoted (nursery bit cleared) before this check runs.
+        if matches!(self.pause, Pause::InitialMark | Pause::FinalMark)
+            && new_object == object
+            && !self.plan.is_object_in_nursery(object)
+        {
             match self.pause {
                 Pause::InitialMark => {
                     crate::plan::concurrent::diag::SEEDED
@@ -165,13 +473,58 @@ impl<VM: VMBinding> ProcessEdgesWork for BactrianNurseryProcessEdges<VM> {
             return;
         };
         let new_object = self.trace_object(object);
-        debug_assert!(!self.plan.is_object_in_nursery(new_object));
+        // With survivor aging, a trace result may legitimately be YOUNG (in the
+        // aged to-space); it must only never remain in the nursery proper.
+        debug_assert!(!self.plan.gen.nursery.in_space(new_object));
         if new_object != object {
             slot.store(new_object);
         }
     }
 
+    fn process_slots(&mut self) {
+        // OPT-IN oldify fast path (MMTK_UP_OLDIFY=1): plain nursery pauses
+        // only (no seed/remark logic), single tracer, world stopped. The
+        // binding walks this packet's slots and their transitive closure
+        // natively — stock minor_gc.c's structure — leaving nothing to trace
+        // or schedule for this packet. Aging must be off (young survivors
+        // would need the aged copy path, which the oldify loop doesn't know).
+        if self.pause == Pause::Nursery
+            && up_oldify_enabled()
+            && crate::util::up_trace::up()
+            && !self.plan.aging_enabled()
+            && !*self.base.mmtk().get_options().count_live_bytes_in_gc
+            && !self.base.slots.is_empty()
+        {
+            let slots = std::mem::take(&mut self.base.slots);
+            let plan = self.plan;
+            let tls = self.worker().tls;
+            let consumed = {
+                let worker = self.worker();
+                let mut ops = BactrianOldifyOps { plan, worker };
+                <VM as VMBinding>::VMScanning::up_oldify_packet::<BactrianOldifyOps<VM>>(
+                    tls, &slots, &mut ops,
+                )
+            };
+            if consumed {
+                return;
+            }
+            // Binding declined: restore and take the generic path.
+            self.base.slots = slots;
+        }
+        for i in 0..self.base.slots.len() {
+            self.process_slot(self.base.slots[i])
+        }
+    }
+
     fn flush(&mut self) {
+        // Single tracer: finish the whole closure here (see drain_closure_locally).
+        // Gated off when live-bytes stats are requested — the packet path is the
+        // one that accounts them.
+        if crate::util::up_trace::up()
+            && !*self.base.mmtk().get_options().count_live_bytes_in_gc
+        {
+            self.drain_closure_locally();
+        }
         self.flush_mark_seed();
         // Default flush behaviour: hand accumulated nodes to a scan-objects packet.
         let nodes = self.pop_nodes();

@@ -204,6 +204,13 @@ impl HeaderMetadataSpec {
         optional_mask: Option<T>,
         ordering: Ordering,
     ) {
+        // UP-trace: non-atomic store path (single tracer; see util::up_trace).
+        // store_inner with ordering=None uses plain ops, including for masked
+        // (sub-word) updates that otherwise take the CAS busy-loop.
+        if crate::util::up_trace::up() {
+            return self.store_inner::<T>(header, val, optional_mask, None);
+        }
+
         self.store_inner::<T>(header, val, optional_mask, Some(ordering))
     }
 

@@ -23,6 +23,18 @@ pub struct Defrag {
     pub defrag_spill_threshold: AtomicUsize,
     /// The number of remaining clean pages in defrag space.
     available_clean_pages_for_defrag: AtomicUsize,
+    /// One-shot COMPACT-ALL request (OCaml round 30): the next defrag GC
+    /// treats EVERY in-use block as a defrag source, bounded as always by
+    /// the copy headroom (objects that do not fit stay in place, so
+    /// successive compactions converge). Needed because both the normal
+    /// defrag trigger and its hole-bucket candidate selection are
+    /// LINE-granular: small dead objects interleaved with live ones on the
+    /// same 256B lines (mature_mutation's random-overwrite pattern) leave
+    /// zero holes — blocks look fully occupied while true byte occupancy
+    /// is ~10%, and reclamation stalls at any threshold. Set via
+    /// [`Self::request_compact_all`]; consumed by the next collection's
+    /// prepare and cleared at its release.
+    compact_all_once: AtomicBool,
 }
 
 pub struct StatsForDefrag {
@@ -84,6 +96,7 @@ impl Defrag {
                 || (collection_attempts > 1)
                 || !exhausted_reusable_space
                 || stress_defrag
+                || self.compact_all_once.load(Ordering::Acquire)
                 || (collect_whole_heap && user_triggered && full_heap_system_gc));
         info!("Defrag: {}", in_defrag);
         probe!(mmtk, immix_defrag, in_defrag);
@@ -217,5 +230,19 @@ impl Defrag {
     /// Reset the in-defrag state.
     pub fn reset_in_defrag(&self) {
         self.in_defrag_collection.store(false, Ordering::Release);
+        // The one-shot compact-all request is consumed by the GC that just
+        // ran (its prepare marked every block a defrag source).
+        self.compact_all_once.store(false, Ordering::Release);
+    }
+
+    /// Request that the NEXT defrag collection treat every in-use block as
+    /// a defrag source (bounded by copy headroom) — see `compact_all_once`.
+    pub fn request_compact_all(&self) {
+        self.compact_all_once.store(true, Ordering::Release);
+    }
+
+    /// Is a compact-all request pending/active?
+    pub fn compact_all_active(&self) -> bool {
+        self.compact_all_once.load(Ordering::Acquire)
     }
 }

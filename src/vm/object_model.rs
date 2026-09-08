@@ -446,6 +446,18 @@ pub trait ObjectModel<VM: VMBinding> {
     /// if any assertion catches this error, but may also fail silently.
     const UNIFIED_OBJECT_REFERENCE_ADDRESS: bool = false;
 
+    /// If true, the binding guarantees that during a stopped-world single-tracer pause
+    /// (`up_trace::up()`), the in-header word addressed by `LOCAL_FORWARDING_POINTER_SPEC`
+    /// tells the forwarding state by its value alone: if we see a header with a small
+    /// value (an ordinary size+tag header), the object is not forwarded yet; if we see a
+    /// value that looks like a heap pointer (>= heap start), the object is forwarded and
+    /// that value is the forwarding pointer — a real header could only look like that if
+    /// the object were larger than 16GB. When active, the forwarding fast path performs
+    /// no side-metadata accesses: status is one header load, and the forwarding-pointer
+    /// store itself is the state change. Multi-tracer (non-UP) pauses are unaffected and
+    /// keep using `LOCAL_FORWARDING_BITS_SPEC`.
+    const HEADER_FORWARDING_SENTINEL: bool = false;
+
     /// For our allocation result (object_start), the binding may have an offset between the allocation result
     /// and the raw address of their object reference, i.e. object ref's raw address = object_start + offset.
     /// The offset could be zero. The offset is not necessary to be

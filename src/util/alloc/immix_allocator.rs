@@ -34,6 +34,33 @@ pub struct ImmixAllocator<VM: VMBinding> {
     request_for_large: bool,
     /// Hole-searching cursor
     line: Option<Line>,
+    /// Rotating line-phase for fresh overflow blocks (mutator allocators
+    /// only). A clean block's overflow cursor otherwise always starts at the
+    /// 32KB-aligned block start, so a stream of same-sized medium objects
+    /// (larger than a line, at most MAX_IMMIX_OBJECT_SIZE) re-enters the same
+    /// cache-set phase in every block: with only ~4-5 objects per block, a
+    /// column walk over such objects lands in a handful of L2 set clusters
+    /// (measured on OCaml matmul-768 rows: 904M LLC-loads unjittered, 205M
+    /// with object pads, 57M contiguous floor). Starting block b's overflow
+    /// cursor at ((b*step) % range) lines desynchronizes the per-block phase
+    /// — the layout a contiguous malloc arena produces naturally. The skipped
+    /// lines are reclaimed as ordinary holes at the next sweep.
+    overflow_phase: usize,
+}
+
+/// Overflow phase rotation range in lines (0 or 1 disables). Default 16
+/// (max skip 15 lines = 3840B per fresh overflow block, avg ~1.9KB ≈ 6%;
+/// 15*256B + MAX_IMMIX_OBJECT_SIZE = 16KB always fits a 32KB block).
+/// Override with MMTK_OVERFLOW_PHASE_LINES (2..=64).
+fn overflow_phase_range() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("MMTK_OVERFLOW_PHASE_LINES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n <= 64)
+            .unwrap_or(16)
+    })
 }
 
 impl<VM: VMBinding> ImmixAllocator<VM> {
@@ -183,6 +210,7 @@ impl<VM: VMBinding> ImmixAllocator<VM> {
             large_bump_pointer: BumpPointer::default(),
             request_for_large: false,
             line: None,
+            overflow_phase: 0,
         }
     }
 
@@ -323,7 +351,16 @@ impl<VM: VMBinding> ImmixAllocator<VM> {
                     Line::eager_mark_lines::<VM>(state, block.start_line()..block.end_line());
                 }
                 if self.request_for_large {
-                    self.large_bump_pointer.cursor = block.start();
+                    let mut start = block.start();
+                    let range = overflow_phase_range();
+                    if !self.copy && range > 1 {
+                        let skip = self.overflow_phase * Line::BYTES;
+                        self.overflow_phase = (self.overflow_phase + 1) % range;
+                        if start + skip + size + align <= block.end() {
+                            start += skip;
+                        }
+                    }
+                    self.large_bump_pointer.cursor = start;
                     self.large_bump_pointer.limit = block.end();
                 } else {
                     self.bump_pointer.cursor = block.start();
