@@ -338,18 +338,24 @@ impl<VM: VMBinding> BactrianNurseryProcessEdges<VM> {
         use crate::vm::Scanning;
         let tls = self.worker().tls;
         let mut scratch: Vec<SlotOf<Self>> = Vec::new();
+        // Objects the VM cannot expose as slots: Scanning::support_slot_enqueuing
+        // may answer false per object, and the packet path then scans them with
+        // scan_object_and_trace_edges. This drain cannot do that inline (the
+        // tracer context needs the worker while we hold self), so such objects
+        // are diverted to the normal packet path below instead of being
+        // asserted away. The OCaml binding answers true for every object (trait
+        // default), so for it this vector stays empty.
+        let mut fallback: Vec<ObjectReference> = Vec::new();
         loop {
             let nodes = self.pop_nodes();
             if nodes.is_empty() {
                 break;
             }
             for object in nodes {
-                // The OCaml binding always supports slot enqueuing (trait
-                // default). The packet path would fall back to
-                // scan_object_and_trace_edges otherwise; this drain does not.
-                debug_assert!(<VM as VMBinding>::VMScanning::support_slot_enqueuing(
-                    tls, object
-                ));
+                if !<VM as VMBinding>::VMScanning::support_slot_enqueuing(tls, object) {
+                    fallback.push(object);
+                    continue;
+                }
                 {
                     let mut collector = SlotCollector(&mut scratch);
                     <VM as VMBinding>::VMScanning::scan_object(tls, object, &mut collector);
@@ -360,6 +366,14 @@ impl<VM: VMBinding> BactrianNurseryProcessEdges<VM> {
                 }
                 scratch.clear();
             }
+        }
+        if !fallback.is_empty() {
+            // Same packet flush() uses for un-drained nodes: PlanScanObjects with
+            // the plan's post_scan hook. Its scan_object_and_trace_edges path
+            // traces these objects' fields through a fresh ProcessEdges instance,
+            // whose own flush drains locally again, so closure completeness is
+            // unchanged; only these objects skip the local work list.
+            self.start_or_dispatch_scan_work(self.create_scan_work(fallback));
         }
     }
 
