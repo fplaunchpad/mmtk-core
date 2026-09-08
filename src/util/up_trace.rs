@@ -9,25 +9,49 @@
 //! cycles/object gap against stock OCaml's domain-private minor collector
 //! (SHAPE.md 2026-08-10).
 //!
-//! The flag is set by the VM binding at stop-the-world begin when it can
-//! prove the conditions (worker count == 1, mutators quiesced, no concurrent
-//! marking window in flight) and cleared before any mutator resumes; the
-//! pause-ending lock/unlock provides the publication barrier for the plain
-//! writes. Off by default; all paths keep their atomic behaviour unless the
-//! binding opts in per pause. LXR/RC paths never consult this flag.
+//! The flag is per MMTk instance (`MMTK::set_up_trace`), set by the VM binding
+//! at stop-the-world begin when it can prove the conditions (worker count == 1,
+//! mutators quiesced, no concurrent marking window in flight) and cleared
+//! before any mutator resumes; the pause-ending lock/unlock provides the
+//! publication barrier for the plain writes. Off by default; all paths keep
+//! their atomic behaviour unless the binding opts in per pause. LXR/RC paths
+//! never consult this flag.
+//!
+//! Hot paths read a thread-local mirror (`up()`), refreshed by each GC worker
+//! before every work packet, rather than a process-global: the soundness
+//! argument is per tracer, so the state is per tracer. A process-wide bit
+//! would leak one instance's single-worker mode into the workers of another
+//! instance collecting concurrently (MMTk permits independent instances),
+//! switching their metadata operations to the non-atomic paths.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::cell::Cell;
 
-static UP_TRACE: AtomicBool = AtomicBool::new(false);
+use crate::mmtk::MMTK;
+use crate::vm::VMBinding;
 
-/// Is single-tracer mode active for the current pause?
-#[inline(always)]
-pub fn up() -> bool {
-    UP_TRACE.load(Ordering::Relaxed)
+thread_local! {
+    /// This thread's view of the instance flag. Only GC worker threads ever
+    /// set it (mirrored from `MMTK::up_trace` before each work packet, and by
+    /// `MMTK::set_up_trace` on the calling thread), so mutator threads and the
+    /// workers of any other MMTk instance always read `false` and keep the
+    /// atomic paths.
+    static UP_LOCAL: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Binding-facing setter. See module docs for the soundness conditions the
-/// caller must establish.
-pub fn set_up_trace(enabled: bool) {
-    UP_TRACE.store(enabled, Ordering::SeqCst);
+/// Is single-tracer mode active for the current thread's pause?
+#[inline(always)]
+pub fn up() -> bool {
+    UP_LOCAL.with(|c| c.get())
+}
+
+/// Mirror the instance's flag into this worker thread's view. Called by
+/// `GCWorker::run` before every work packet; one relaxed load.
+#[inline]
+pub(crate) fn sync_worker<VM: VMBinding>(mmtk: &MMTK<VM>) {
+    UP_LOCAL.with(|c| c.set(mmtk.up_trace_enabled()));
+}
+
+/// Set the calling thread's own view (see `MMTK::set_up_trace`).
+pub(crate) fn set_local(enabled: bool) {
+    UP_LOCAL.with(|c| c.set(enabled));
 }
