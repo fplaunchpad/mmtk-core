@@ -121,7 +121,14 @@ impl<VM: VMBinding> Allocator<VM> for FreeListAllocator<VM> {
         // mimic what fastpath allocation does, except that we allocate from available_blocks_stress.
         if let Some(block) = self.find_free_block_stress(size, align) {
             let cell = self.block_alloc(block);
-            allocator::align_allocation::<VM>(cell, align, offset)
+            let res = allocator::align_allocation::<VM>(cell, align, offset);
+            // Same allocate-black rule as `alloc` and `alloc_slow_once`: a cell
+            // handed out during a concurrent marking window must be born marked,
+            // in a Marked block, or the cycle's sweep frees it live.
+            if !res.is_zero() {
+                self.allocate_black_if_needed(res);
+            }
+            res
         } else {
             Address::ZERO
         }
