@@ -455,4 +455,14 @@ impl<VM: VMBinding> ConcurrentPlan for ConcurrentImmix<VM> {
     fn concurrent_work_in_progress(&self) -> bool {
         self.concurrent_marking_in_progress()
     }
+
+    fn previous_pause_finished_mark(&self) -> bool {
+        // FinalMark completes a concurrent cycle; a Full is a whole STW GC.
+        // ConcurrentImmix sweeps inside those pauses, so the cycle is complete
+        // once either ends (the default `sweep_drained` is right here).
+        matches!(
+            self.previous_pause(),
+            Some(Pause::FinalMark) | Some(Pause::Full)
+        )
+    }
 }
