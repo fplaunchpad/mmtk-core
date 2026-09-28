@@ -244,14 +244,17 @@ impl<VM: VMBinding> GCTrigger<VM> {
                 // the floor, zero progress). Cap the budget at a quarter of the
                 // CURRENT heap unconditionally: under the growable triggers the
                 // cap relaxes as the heap grows, so a warmed-up heap still gets
-                // the full scaled budget. The scaled `min` stays the floor so the
-                // Bounded min..max contract (min <= max) holds at any heap size.
+                // the full scaled budget. The (capped) scaled `min` stays the floor
+                // so the Bounded min..max contract (min <= max) holds at any heap
+                // size.
                 let scale = self.nursery_scale.load(Ordering::Relaxed);
                 let scaled = max.saturating_mul(scale);
-                let scaled_min = min.saturating_mul(scale);
                 let quarter_heap =
                     conversions::pages_to_bytes(self.policy.get_current_heap_size_in_pages()) / 4;
-                std::cmp::max(scaled_min, std::cmp::min(scaled, quarter_heap))
+                std::cmp::max(
+                    self.scaled_bounded_min(min),
+                    std::cmp::min(scaled, quarter_heap),
+                )
             }
             NurserySize::ProportionalBounded { min: _, max } => {
                 let heap_size_bytes =
@@ -267,6 +270,26 @@ impl<VM: VMBinding> GCTrigger<VM> {
             }
             NurserySize::Fixed(sz) => self.clamp_fixed_nursery(sz),
         }
+    }
+
+    /// The Bounded nursery's lower bound scaled by the domain count. When the
+    /// heap cannot grow (a fixed heap, or a growable one at its maximum) it is
+    /// capped at a quarter of the heap, never below the unscaled `min`. Without
+    /// the cap the scaled minimum overrode the quarter-heap guard on the maximum:
+    /// 27 domains under the default 2 MiB minimum asked for a 54 MiB nursery in a
+    /// 64 MiB fixed heap, leaving the mature space almost nothing, and bytecode
+    /// spawn-heavy programs ran out of memory. A heap that can still grow makes
+    /// room instead, and capping there shrank the nursery of multi-domain
+    /// programs early in the run (CLBG binarytrees, 16 domains, GenImmix: 0.87 s
+    /// to 1.24 s), so growable heaps keep the uncapped scaled minimum.
+    fn scaled_bounded_min(&self, min: usize) -> usize {
+        let scaled_min = min.saturating_mul(self.nursery_scale.load(Ordering::Relaxed));
+        if self.policy.can_heap_size_grow() {
+            return scaled_min;
+        }
+        let quarter_heap =
+            conversions::pages_to_bytes(self.policy.get_current_heap_size_in_pages()) / 4;
+        std::cmp::min(scaled_min, std::cmp::max(quarter_heap, min))
     }
 
     // An explicit Fixed nursery gets the same quarter-heap guard as Bounded: a
@@ -285,9 +308,7 @@ impl<VM: VMBinding> GCTrigger<VM> {
         use crate::util::options::NurserySize;
         debug_assert!(self.plan().generational().is_some());
         match *self.options.nursery {
-            NurserySize::Bounded { min, max: _ } => {
-                min.saturating_mul(self.nursery_scale.load(Ordering::Relaxed))
-            }
+            NurserySize::Bounded { min, max: _ } => self.scaled_bounded_min(min),
             NurserySize::ProportionalBounded { min, max: _ } => {
                 let min_bytes =
                     conversions::pages_to_bytes(self.policy.get_current_heap_size_in_pages())
