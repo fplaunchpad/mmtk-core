@@ -2,7 +2,7 @@ use crate::plan::barriers::ObjectBarrier;
 use crate::plan::generational::barrier::GenObjectBarrierSemantics;
 use crate::plan::immix;
 use crate::plan::mutator_context::{
-    common_prepare_func, common_release_func, create_space_mapping, MutatorBuilder, MutatorConfig,
+    common_prepare_func, create_space_mapping, MutatorBuilder, MutatorConfig,
 };
 use crate::plan::sticky::immix::global::StickyImmix;
 use crate::util::alloc::AllocatorSelector;
@@ -12,8 +12,12 @@ use crate::vm::VMBinding;
 use crate::{Mutator, MMTK};
 
 pub fn stickyimmix_mutator_release<VM: VMBinding>(mutator: &mut Mutator<VM>, tls: VMWorkerThread) {
+    // immix_mutator_release already ends with common_release_func. Calling it
+    // again released the mark-sweep nonmoving allocator twice per mutator
+    // (marksweep_as_nonmoving), one more release_packet_done than
+    // MarkSweepSpace::release arms per mutator, so pending_release_packets
+    // wrapped at the first full-heap collection.
     immix::mutator::immix_mutator_release(mutator, tls);
-    common_release_func(mutator, tls);
 }
 
 pub use immix::mutator::ALLOCATOR_MAPPING;
