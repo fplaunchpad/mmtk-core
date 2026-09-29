@@ -448,17 +448,13 @@ pub struct SpaceOverheadTrigger {
     /// A sliced cycle's FinalMark ran with its sweep deferred: resize from the
     /// cycle's marked bytes at the first GC end whose sweep has drained.
     resize_after_sweep: AtomicBool,
-    /// Peak reserved pages observed while the heap was over its limit, since
-    /// the last resize. At poll time `get_reserved_pages()` INCLUDES the
-    /// pending reservation of the allocation that forced the poll, but that
-    /// reservation is cleared from the page resource before the GC runs — so
-    /// `on_gc_end` computing the new limit from live pages alone can never
-    /// admit a single allocation larger than (limit - live). Without this
-    /// channel such a request livelocks: the GC frees nothing relevant, the
-    /// limit recomputes from live-only, the retry re-polls, forever (observed:
-    /// macro-bench decompress's first ~256 MB payload allocation against the
-    /// 32 MB floor sat at 2 MB RSS indefinitely).
-    pending_demand_pages: AtomicUsize,
+    /// Largest allocation request waiting for a GC, including its side metadata.
+    /// The page resource clears a failed request before collection, so post-GC
+    /// reservations alone cannot admit a request larger than the current limit.
+    /// Keep the maximum actual request rather than pre-GC heap occupancy: dead
+    /// objects must not become demand. A maximum also makes repeated retries
+    /// idempotent. Several domains may need further GCs to admit all requests.
+    pending_allocation_pages: AtomicUsize,
 }
 impl SpaceOverheadTrigger {
     fn new(min_heap_pages: usize, max_heap_pages: usize, overhead: f64) -> Self {
@@ -467,12 +463,17 @@ impl SpaceOverheadTrigger {
             max_heap_pages,
             overhead,
             current_heap_pages: AtomicUsize::new(min_heap_pages),
-            pending_demand_pages: AtomicUsize::new(0),
+            pending_allocation_pages: AtomicUsize::new(0),
             resize_after_sweep: AtomicBool::new(false),
         }
     }
 }
 impl<VM: VMBinding> GCTriggerPolicy<VM> for SpaceOverheadTrigger {
+    fn on_pending_allocation(&self, pages: usize) {
+        self.pending_allocation_pages
+            .fetch_max(pages, Ordering::Relaxed);
+    }
+
     fn is_gc_required(
         &self,
         space_full: bool,
@@ -520,14 +521,34 @@ impl<VM: VMBinding> GCTriggerPolicy<VM> for SpaceOverheadTrigger {
         } else {
             0
         };
-        let target = ((live as f64) * (1.0 + self.overhead)) as usize + nursery_headroom_pages;
-        // Admit the demand recorded at poll time (live-then + the pending
-        // request): size it with the same overhead factor so the retry both
-        // fits and has working room. In the normal regime demand ≈ live, so
-        // this is a no-op; it only bites when a request outsized the limit.
-        let demand = self.pending_demand_pages.swap(0, Ordering::Relaxed);
-        let demand_target = ((demand as f64) * (1.0 + self.overhead)) as usize;
-        let target = std::cmp::max(target, demand_target);
+        let live_target = ((live as f64) * (1.0 + self.overhead)) as usize + nursery_headroom_pages;
+        // Admit the largest actual pending request, on top of what remains
+        // reserved after collection. Moving plans may need a copy of its pages
+        // too; retain that admission floor with little or no configured overhead.
+        let demand = self.pending_allocation_pages.swap(0, Ordering::Relaxed);
+        // A generational plan also needs room for its minimum nursery; less
+        // headroom would force a full collection after nearly every refill.
+        let allocation_pages = if mmtk.get_plan().generational().is_some() {
+            std::cmp::max(demand, mmtk.gc_trigger.get_min_nursery_pages())
+        } else {
+            demand
+        };
+        let copy_expansion = if mmtk.get_plan().constraints().moves_objects {
+            VM::VMObjectModel::VM_WORST_CASE_COPY_EXPANSION
+        } else {
+            0.0
+        };
+        let admission =
+            live.saturating_add(((allocation_pages as f64) * (1.0 + copy_expansion)).ceil() as usize);
+        let demand_target = if demand > 0 {
+            std::cmp::max(
+                ((live.saturating_add(demand) as f64) * (1.0 + self.overhead)) as usize,
+                admission,
+            )
+        } else {
+            0
+        };
+        let target = std::cmp::max(live_target, demand_target);
         let clamped = target.clamp(self.min_heap_pages, self.max_heap_pages);
         if let Some(c) = mmtk.get_plan().concurrent() {
             // Plans with sliced/concurrent major cycles. "reserved pages after
@@ -587,8 +608,11 @@ impl<VM: VMBinding> GCTriggerPolicy<VM> for SpaceOverheadTrigger {
                 self.current_heap_pages.fetch_max(floor, Ordering::Relaxed);
             }
             if demand > 0 {
+                // During an unfinished cycle, reserved includes unswept garbage.
+                // Admit the request without multiplying that occupancy and
+                // overriding the cycle's frozen/marked-live sizing policy.
                 self.current_heap_pages.fetch_max(
-                    demand_target.clamp(self.min_heap_pages, self.max_heap_pages),
+                    admission.clamp(self.min_heap_pages, self.max_heap_pages),
                     Ordering::Relaxed,
                 );
             }
@@ -601,15 +625,7 @@ impl<VM: VMBinding> GCTriggerPolicy<VM> for SpaceOverheadTrigger {
     }
 
     fn is_heap_full(&self, plan: &dyn Plan<VM = VM>) -> bool {
-        let reserved = plan.get_reserved_pages();
-        let full = reserved > self.current_heap_pages.load(Ordering::Relaxed);
-        if full {
-            // Reserved still includes the pending reservation here; remember it
-            // for the post-GC resize (see field doc).
-            self.pending_demand_pages
-                .fetch_max(reserved, Ordering::Relaxed);
-        }
-        full
+        plan.get_reserved_pages() > self.current_heap_pages.load(Ordering::Relaxed)
     }
 
     fn get_current_heap_size_in_pages(&self) -> usize {
