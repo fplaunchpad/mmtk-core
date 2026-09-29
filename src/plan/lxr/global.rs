@@ -226,6 +226,18 @@ impl<VM: VMBinding> Plan for LXR<VM> {
         // are RC-managed). The Full backup trace marks the immix graph; the common spaces don't need
         // the mark-based prepare.
         self.common.prepare(tls, false);
+        // marksweep_as_nonmoving: the mark-sweep NonMoving space is the exception. It is not
+        // RC-managed; only the Full pause's backup trace marks it (`PlanTraceObject` falls through
+        // to `CommonPlan::trace_object`), so prepare (zero its marks) and release (sweep) it at
+        // Full only -- as a full-heap collection of that space, the same pairing round 31 gives the
+        // generational plans. At a RefCount pause nothing re-marks it, so preparing it there would
+        // let the release free live cells. `lxr_mutator_release` gates the mutator-side free-list
+        // release on the same condition, so `pending_release_packets` is armed exactly when it is
+        // decremented.
+        #[cfg(feature = "marksweep_as_nonmoving")]
+        if pause == Pause::Full {
+            self.common.prepare_nonmoving_space(true);
+        }
         self.immix_space.prepare_rc(pause);
     }
 
@@ -233,6 +245,13 @@ impl<VM: VMBinding> Plan for LXR<VM> {
         let pause = self.current_pause().unwrap();
         debug_assert!(pause == Pause::RefCount || pause == Pause::Full);
         self.common.release(tls, false);
+        // marksweep_as_nonmoving: sweep the mark-sweep NonMoving space after the Full backup trace
+        // marked it; this arms `pending_release_packets` for the mutators' free-list release (see
+        // `prepare` and `lxr_mutator_release`).
+        #[cfg(feature = "marksweep_as_nonmoving")]
+        if pause == Pause::Full {
+            self.common.release_nonmoving_space(true);
+        }
         self.immix_space.release_rc(pause);
         // Swap roots: this GC's collected roots become next GC's prev_roots (to be decremented).
         {

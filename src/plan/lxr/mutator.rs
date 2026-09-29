@@ -1,4 +1,6 @@
 use super::barrier::LXRFieldBarrierSemantics;
+#[cfg(feature = "marksweep_as_nonmoving")]
+use super::Pause;
 use super::LXR;
 use crate::plan::barriers::FieldBarrier;
 use crate::plan::mutator_context::common_prepare_func;
@@ -29,7 +31,26 @@ pub fn lxr_mutator_release<VM: VMBinding>(mutator: &mut Mutator<VM>, tls: VMWork
     .unwrap();
     immix_allocator.reset();
 
-    common_release_func(mutator, tls);
+    // marksweep_as_nonmoving: common_release_func releases the NonMoving free-list allocator,
+    // which ends in MarkSweepSpace::release_packet_done. That pairs with the SPACE-side
+    // MarkSweepSpace::release handshake (pending_release_packets = num_mutators + 1), which
+    // LXR::release arms only at a Full pause (the only pause whose backup trace marks the space).
+    // is_nursery_gc() cannot gate it here -- LXR is not generational -- so running it at a
+    // RefCount pause both frees blocks against marks no trace rebuilt and underflows the unarmed
+    // counter (the `pending_release_packets is still 18446744073709551615` abort,
+    // https://github.com/fplaunchpad/ocaml-mmtk/issues/25).
+    #[cfg(feature = "marksweep_as_nonmoving")]
+    let release_common = mutator
+        .plan
+        .downcast_ref::<LXR<VM>>()
+        .unwrap()
+        .current_pause()
+        == Some(Pause::Full);
+    #[cfg(not(feature = "marksweep_as_nonmoving"))]
+    let release_common = true;
+    if release_common {
+        common_release_func(mutator, tls);
+    }
 }
 
 pub(in crate::plan) const RESERVED_ALLOCATORS: ReservedAllocators = ReservedAllocators {

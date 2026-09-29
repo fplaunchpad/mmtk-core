@@ -828,7 +828,7 @@ impl<VM: VMBinding> CommonPlan<VM> {
         }
     }
 
-    fn prepare_nonmoving_space(&mut self, _full_heap: bool) {
+    pub(crate) fn prepare_nonmoving_space(&mut self, _full_heap: bool) {
         cfg_if::cfg_if! {
             if #[cfg(feature = "immortal_as_nonmoving")] {
                 self.nonmoving.prepare();
@@ -850,7 +850,7 @@ impl<VM: VMBinding> CommonPlan<VM> {
         }
     }
 
-    fn release_nonmoving_space(&mut self, _full_heap: bool) {
+    pub(crate) fn release_nonmoving_space(&mut self, _full_heap: bool) {
         cfg_if::cfg_if! {
             if #[cfg(feature = "immortal_as_nonmoving")] {
                 self.nonmoving.release();
