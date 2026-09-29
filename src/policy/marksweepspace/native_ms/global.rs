@@ -434,6 +434,18 @@ impl<VM: VMBinding> MarkSweepSpace<VM> {
     }
 
     pub fn release(&mut self) {
+        // Arm the release handshake at most once per GC. MarkCompact resets
+        // the common spaces between its two transitive closures by calling
+        // the plan-level release() and prepare() again from UpdateReferences,
+        // so with `marksweep_as_nonmoving` this runs twice in one GC. The
+        // ReleaseMarkSweepSpace packet queued by the first call runs at the
+        // Release stage either way; a second arm would queue a second packet,
+        // one more decrement than the counter expects: it wraps to usize::MAX
+        // (end_of_gc's assertion) or recycle_blocks runs while a
+        // ReleaseMutator still holds the abandoned lists (try_lock panic).
+        if self.pending_release_packets.load(Ordering::SeqCst) != 0 {
+            return;
+        }
         let num_mutators = VM::VMActivePlan::number_of_mutators();
         // all ReleaseMutator work packets plus the ReleaseMarkSweepSpace packet
         self.pending_release_packets
@@ -488,7 +500,12 @@ impl<VM: VMBinding> MarkSweepSpace<VM> {
                 }
             }
 
-            {
+            // CLEAN-BLOCKS-ONLY window (OCaml Bactrian round 31): while a
+            // concurrent marking cycle is in flight this space's mark bits
+            // are mid-rebuild — handing out an unswept block would make the
+            // allocator sweep it against incomplete marks and free live
+            // cells. Unswept blocks wait for the cycle; grow instead.
+            if !self.should_allocate_as_live() {
                 let abandoned_unswept = &mut abandoned.unswept;
                 if !abandoned_unswept[bin].is_empty() {
                     let block = abandoned_unswept[bin].pop().unwrap();

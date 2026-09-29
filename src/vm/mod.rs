@@ -33,6 +33,7 @@ pub use self::scanning::ObjectTracerContext;
 pub use self::scanning::RootsWorkFactory;
 pub use self::scanning::Scanning;
 pub use self::scanning::SlotVisitor;
+pub use self::scanning::UpOldifyOps;
 
 #[cfg(test)]
 mod tests;

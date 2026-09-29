@@ -512,8 +512,20 @@ impl<VM: VMBinding> GCWorkScheduler<VM> {
         let Some(concurrent) = worker.mmtk.get_plan().concurrent() else {
             return false;
         };
-        concurrent.concurrent_work_in_progress()
-            && self.work_buckets[WorkBucketStage::Concurrent].is_drained()
+        // Sliced-STW marking never needs this self-request: marking can only
+        // finish INSIDE a pause (a quantum drained the queue), and the next
+        // allocation-paced pause schedules FinalMark via collection_required.
+        // Worse, firing here races the marking-state clear at FinalMark's end
+        // and requests a zero-allocation second collection — which
+        // set_collection_kind reads as an EMERGENCY (allocation never
+        // succeeded since the last GC) and escalates to a spurious STW Full.
+        if concurrent.marking_confined_to_pauses() {
+            return false;
+        }
+        // marking_queue_drained consults wherever the plan parks marking work:
+        // the Concurrent bucket (worker-concurrent) or the plan-owned sliced
+        // queue (sliced-STW quanta).
+        concurrent.concurrent_work_in_progress() && concurrent.marking_queue_drained()
     }
 
     /// Respond to a worker reqeust.
@@ -672,8 +684,7 @@ impl<VM: VMBinding> GCWorkScheduler<VM> {
             .get_plan()
             .concurrent()
             .is_some_and(|c| c.concurrent_work_in_progress());
-        let concurrent_work_scheduled =
-            self.schedule_concurrent_packets(concurrent_marking_active);
+        let concurrent_work_scheduled = self.schedule_concurrent_packets(concurrent_marking_active);
         self.debug_assert_all_stw_buckets_closed();
 
         // Set to NotInGC after everything, and right before resuming mutators.

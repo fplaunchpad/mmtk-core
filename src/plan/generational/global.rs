@@ -33,7 +33,12 @@ pub struct CommonGenPlan<VM: VMBinding> {
     pub common: CommonPlan<VM>,
     /// Is this GC full heap?
     pub gc_full_heap: AtomicBool,
-    /// Is next GC full heap?
+    /// Is next GC full heap? "Full heap" is the collection's SCOPE (trace the
+    /// whole heap, i.e. a major collection), not a pause shape: the
+    /// single-pause generational plans (GenCopy/GenImmix/StickyImmix) execute
+    /// it as one STW full-heap GC, while Bactrian's decide_pause may execute
+    /// it as an InitialMark->FinalMark cycle instead of `Pause::Full` — see
+    /// `Bactrian::take_major_request`.
     pub next_gc_full_heap: AtomicBool,
     pub full_heap_gc_count: Arc<Mutex<EventCounter>>,
 }
@@ -106,6 +111,21 @@ impl<VM: VMBinding> CommonGenPlan<VM> {
         let cur_nursery = self.nursery.reserved_pages();
         let max_nursery = self.common.base.gc_trigger.get_max_nursery_pages();
         let nursery_full = cur_nursery >= max_nursery;
+        // MMTK_NURSERY_DEBUG: decompose the trigger point (effective-capacity
+        // audit, round 33: at Fixed:2M the panel measured ~1.56MB of
+        // allocation per minor — where do the other ~0.4MB of "reserved"
+        // pages come from?).
+        if nursery_full && std::env::var_os("MMTK_NURSERY_DEBUG").is_some() {
+            use crate::policy::space::Space;
+            let data = self.nursery.get_page_resource().reserved_pages();
+            eprintln!(
+                "[nursery] trigger: reserved={}p (data={}p meta={}p) max={}p",
+                cur_nursery,
+                data,
+                cur_nursery - data,
+                max_nursery
+            );
+        }
         trace!(
             "nursery_full = {:?} (nursery = {}, max_nursery = {})",
             nursery_full,
@@ -307,6 +327,16 @@ pub trait GenerationalPlan: Plan {
 
     /// Force the next collection to be full heap.
     fn force_full_heap_collection(&self);
+
+    /// True while the CURRENT nursery GC may leave live young objects behind
+    /// (moved but still young — e.g. survivor aging), so "survived a minor"
+    /// no longer implies "mature and immobile at the next minor". Machinery
+    /// that skips previously-scanned entries on nursery GCs (e.g. the
+    /// finalizable processor's nursery_index) must rescan under this mode.
+    /// Default false: every stock generational plan promotes all survivors.
+    fn nursery_keeps_movable_survivors(&self) -> bool {
+        false
+    }
 }
 
 /// This trait is the extension trait for [`GenerationalPlan`] (see Rust's extension trait pattern).

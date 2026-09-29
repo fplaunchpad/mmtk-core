@@ -451,6 +451,7 @@ impl SideMetadataSpec {
     /// * check if the side metadata memory is mapped.
     /// * check if the side metadata content is correct based on a sanity map (only for extreme assertions).
     #[allow(unused_variables)] // data_addr/input is not used in release build
+    #[inline(always)]
     fn side_metadata_access<
         const CHECK_VALUE: bool,
         T: MetadataValue,
@@ -501,6 +502,7 @@ impl SideMetadataSpec {
     ///
     /// 1. Concurrent access to this operation is undefined behaviour.
     /// 2. Interleaving Non-atomic and atomic operations is undefined behaviour.
+    #[inline(always)]
     pub unsafe fn load<T: MetadataValue>(&self, data_addr: Address) -> T {
         self.side_metadata_access::<true, T, _, _, _>(
             data_addr,
@@ -533,6 +535,7 @@ impl SideMetadataSpec {
     ///
     /// 1. Concurrent access to this operation is undefined behaviour.
     /// 2. Interleaving Non-atomic and atomic operations is undefined behaviour.
+    #[inline(always)]
     pub unsafe fn store<T: MetadataValue>(&self, data_addr: Address, metadata: T) {
         self.side_metadata_access::<true, T, _, _, _>(
             data_addr,
@@ -560,6 +563,7 @@ impl SideMetadataSpec {
 
     /// Loads a value from the side metadata for the given address.
     /// This method has similar semantics to `store` in Rust atomics.
+    #[inline(always)]
     pub fn load_atomic<T: MetadataValue>(&self, data_addr: Address, order: Ordering) -> T {
         self.side_metadata_access::<true, T, _, _, _>(
             data_addr,
@@ -585,7 +589,14 @@ impl SideMetadataSpec {
 
     /// Store the given value to the side metadata for the given address.
     /// This method has similar semantics to `store` in Rust atomics.
+    #[inline(always)]
     pub fn store_atomic<T: MetadataValue>(&self, data_addr: Address, metadata: T, order: Ordering) {
+        // UP-trace: a single tracer in a stopped world needs no atomicity
+        // (see util::up_trace); the plain twin also skips the RMW for
+        // sub-byte specs' fetch_update loop.
+        if crate::util::up_trace::up() {
+            return unsafe { self.store(data_addr, metadata) };
+        }
         self.side_metadata_access::<true, T, _, _, _>(
             data_addr,
             Some(metadata),
@@ -657,6 +668,7 @@ impl SideMetadataSpec {
     /// # Safety
     /// This method _may_ corrupt and set adjacent bits in the side metadata as a side effect. The user must
     /// make sure that this behavior is correct and must not rely on the side effect of this method to set bits.
+    #[inline(always)]
     pub unsafe fn set_raw_byte_atomic(&self, data_addr: Address, order: Ordering) {
         debug_assert!(self.log_num_of_bits < 3);
         cfg_if::cfg_if! {
@@ -723,6 +735,7 @@ impl SideMetadataSpec {
     /// This method has similar semantics to `compare_exchange` in Rust atomics.
     /// The return value is a result indicating whether the new value was written and containing the previous value.
     /// On success this value is guaranteed to be equal to current.
+    #[inline(always)]
     pub fn compare_exchange_atomic<T: MetadataValue>(
         &self,
         data_addr: Address,
@@ -731,6 +744,16 @@ impl SideMetadataSpec {
         success_order: Ordering,
         failure_order: Ordering,
     ) -> std::result::Result<T, T> {
+        // UP-trace: plain read-compare-write (single tracer; see util::up_trace).
+        if crate::util::up_trace::up() {
+            let old = unsafe { self.load::<T>(data_addr) };
+            return if old == old_metadata {
+                unsafe { self.store(data_addr, new_metadata) };
+                Ok(old)
+            } else {
+                Err(old)
+            };
+        }
         self.side_metadata_access::<true, T, _, _, _>(
             data_addr,
             Some(new_metadata),
@@ -880,6 +903,7 @@ impl SideMetadataSpec {
     /// Bitwise 'and' the value with the current value for this side metadata for the given address.
     /// This method has similar semantics to `fetch_and` in Rust atomics.
     /// Returns the previous value.
+    #[inline(always)]
     pub fn fetch_and_atomic<T: MetadataValue>(
         &self,
         data_addr: Address,
@@ -914,12 +938,19 @@ impl SideMetadataSpec {
     /// Bitwise 'or' the value with the current value for this side metadata for the given address.
     /// This method has similar semantics to `fetch_or` in Rust atomics.
     /// Returns the previous value.
+    #[inline(always)]
     pub fn fetch_or_atomic<T: MetadataValue>(
         &self,
         data_addr: Address,
         val: T,
         order: Ordering,
     ) -> T {
+        // UP-trace: plain load-or-store (single tracer; see util::up_trace).
+        if crate::util::up_trace::up() {
+            let old = unsafe { self.load::<T>(data_addr) };
+            unsafe { self.store(data_addr, old.bitor(val)) };
+            return old;
+        }
         self.side_metadata_access::<true, T, _, _, _>(
             data_addr,
             Some(val),

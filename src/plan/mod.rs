@@ -45,7 +45,9 @@ mod generational;
 mod sticky;
 
 mod compressor;
-mod concurrent;
+/// Concurrent-plan machinery (public in this fork so VM bindings can query
+/// the pause type / marking state — e.g. the OCaml binding's UP-trace gate).
+pub mod concurrent;
 mod immix;
 /// LXR — reference counting on a hierarchical Immix heap (P3, minimal single-domain).
 /// `pub(crate)` because the RC machinery is cross-cutting (plan/lxr + policy/immix + LOS).

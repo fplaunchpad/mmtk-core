@@ -107,16 +107,12 @@ pub fn create_plan<VM: VMBinding>(
             Box::new(crate::plan::concurrent::immix::ConcurrentImmix::new(args))
                 as Box<dyn Plan<VM = VM>>
         }
-        PlanSelector::Bactrian => {
-            Box::new(crate::plan::concurrent::bactrian::Bactrian::new(args))
-                as Box<dyn Plan<VM = VM>>
-        }
+        PlanSelector::Bactrian => Box::new(crate::plan::concurrent::bactrian::Bactrian::new(args))
+            as Box<dyn Plan<VM = VM>>,
         PlanSelector::Compressor => {
             Box::new(crate::plan::compressor::Compressor::new(args)) as Box<dyn Plan<VM = VM>>
         }
-        PlanSelector::LXR => {
-            Box::new(crate::plan::lxr::LXR::new(args)) as Box<dyn Plan<VM = VM>>
-        }
+        PlanSelector::LXR => Box::new(crate::plan::lxr::LXR::new(args)) as Box<dyn Plan<VM = VM>>,
     };
 
     // We have created Plan in the heap, and we won't explicitly move it.
@@ -837,7 +833,17 @@ impl<VM: VMBinding> CommonPlan<VM> {
             if #[cfg(feature = "immortal_as_nonmoving")] {
                 self.nonmoving.prepare();
             } else if #[cfg(feature = "marksweep_as_nonmoving")] {
-                self.nonmoving.prepare(_full_heap);
+                // OCaml round 31: only at FULL-heap collections. The mark-
+                // sweep space is collected exclusively by majors; a nursery
+                // GC's prepare would zero its mark bits (PrepareChunkMap)
+                // without any re-marking following, and the paired release
+                // would then free every prepared-but-unmarked block — live
+                // objects included (reproduced under Bactrian with the
+                // pretenured band routed here: a marking quantum scanning a
+                // freed cell whose header had become a free-list link).
+                if _full_heap {
+                    self.nonmoving.prepare(_full_heap);
+                }
             } else {
                 self.nonmoving.prepare(_full_heap, None, UnlogBitsOperation::NoOp);
             }
@@ -849,7 +855,9 @@ impl<VM: VMBinding> CommonPlan<VM> {
             if #[cfg(feature = "immortal_as_nonmoving")] {
                 self.nonmoving.release();
             } else if #[cfg(feature = "marksweep_as_nonmoving")] {
-                self.nonmoving.prepare(_full_heap);
+                if _full_heap {
+                    self.nonmoving.release();
+                }
             } else {
                 self.nonmoving.release(_full_heap, UnlogBitsOperation::NoOp);
             }

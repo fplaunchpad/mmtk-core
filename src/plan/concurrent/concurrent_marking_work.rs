@@ -56,7 +56,9 @@ impl<VM: VMBinding, P: ConcurrentPlan<VM = VM> + PlanTraceObject<VM>, const KIND
             let objects = self.next_objects.take();
             let worker = self.worker();
             let w = Self::new(objects, worker.mmtk);
-            worker.add_work(WorkBucketStage::Concurrent, w);
+            // Route via the plan: sliced mode parks for in-pause quanta,
+            // worker-concurrent mode feeds the Concurrent bucket.
+            self.plan.schedule_marking_packet(Box::new(w));
         }
     }
 
@@ -87,6 +89,10 @@ impl<VM: VMBinding, P: ConcurrentPlan<VM = VM> + PlanTraceObject<VM>, const KIND
     }
 
     fn scan_and_enqueue(&mut self, object: ObjectReference) {
+        crate::plan::concurrent::diag::MARKED_BYTES.fetch_add(
+            VM::VMObjectModel::get_current_size(object),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         crate::plan::tracing::SlotIterator::<VM>::iterate_fields(
             object,
             self.worker().tls.0,
@@ -200,6 +206,8 @@ impl<VM: VMBinding, P: ConcurrentPlan<VM = VM> + PlanTraceObject<VM>, const KIND
             if nodes.is_empty() {
                 return;
             }
+            crate::plan::concurrent::diag::SATB_RUN
+                .fetch_add(nodes.len(), std::sync::atomic::Ordering::Relaxed);
 
             ConcurrentTraceObjects::<VM, P, KIND>::new(nodes, mmtk)
         } else {
@@ -227,11 +235,12 @@ impl<VM: VMBinding, P: ConcurrentPlan<VM = VM> + PlanTraceObject<VM>, const KIND
     ProcessRootSlots<VM, P, KIND>
 {
     fn create_and_schedule_concurrent_trace_objects_work(&self, objects: Vec<ObjectReference>) {
-        let worker = self.worker();
         let mmtk = self.mmtk();
         let w = ConcurrentTraceObjects::<VM, P, KIND>::new(objects.clone(), mmtk);
-
-        worker.scheduler().work_buckets[WorkBucketStage::Concurrent].add_no_notify(w);
+        // Route via the plan (sliced mode parks; worker-concurrent mode feeds
+        // the Concurrent bucket without notifying).
+        let plan = self.base.plan().downcast_ref::<P>().unwrap();
+        plan.schedule_marking_packet(Box::new(w));
     }
 }
 

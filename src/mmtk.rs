@@ -28,7 +28,6 @@ use crate::vm::VMBinding;
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::default::Default;
-#[cfg(feature = "sanity")]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -123,6 +122,10 @@ pub struct MMTK<VM: VMBinding> {
     pub(crate) slot_logger: SlotLogger<VM::VMSlot>,
     pub(crate) gc_trigger: Arc<GCTrigger<VM>>,
     pub(crate) stats: Arc<Stats>,
+    /// Single-tracer (UP) mode for this instance's current pause; see
+    /// `util::up_trace`. Read by GC workers into a thread-local before each
+    /// work packet.
+    pub(crate) up_trace: AtomicBool,
     #[cfg(feature = "sanity")]
     inside_sanity: AtomicBool,
     /// Analysis counters. The feature analysis allows us to periodically stop the world and collect some statistics.
@@ -134,6 +137,12 @@ unsafe impl<VM: VMBinding> Sync for MMTK<VM> {}
 unsafe impl<VM: VMBinding> Send for MMTK<VM> {}
 
 impl<VM: VMBinding> MMTK<VM> {
+    /// Number of GC worker threads (fork addition: lets VM bindings gate
+    /// single-tracer fast paths — see util::up_trace).
+    pub fn worker_count(&self) -> usize {
+        self.scheduler.num_workers()
+    }
+
     /// Create an MMTK instance. This is not public. Bindings should use [`MMTKBuilder::build`].
     pub(crate) fn new(options: Arc<Options>) -> Self {
         // Verify the Mmapper can handle the required address space size.
@@ -226,6 +235,7 @@ impl<VM: VMBinding> MMTK<VM> {
             analysis_manager: Arc::new(AnalysisManager::new(stats.clone())),
             gc_trigger,
             stats,
+            up_trace: AtomicBool::new(false),
         }
     }
 
@@ -453,6 +463,20 @@ impl<VM: VMBinding> MMTK<VM> {
     /// Get the run time options.
     pub fn get_options(&self) -> &Options {
         &self.options
+    }
+
+    /// Arm or disarm single-tracer (UP) mode for this instance. The binding
+    /// must establish the soundness conditions (see `util::up_trace`). The
+    /// calling thread's own view is updated immediately; other GC workers of
+    /// this instance pick the change up before their next work packet.
+    pub fn set_up_trace(&self, enabled: bool) {
+        self.up_trace.store(enabled, Ordering::SeqCst);
+        crate::util::up_trace::set_local(enabled);
+    }
+
+    /// Is single-tracer (UP) mode armed for this instance?
+    pub fn up_trace_enabled(&self) -> bool {
+        self.up_trace.load(Ordering::Relaxed)
     }
 
     /// Enumerate objects in all spaces in this MMTK instance.

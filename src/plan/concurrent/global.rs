@@ -1,5 +1,6 @@
 use crate::plan::concurrent::Pause;
 use crate::plan::Plan;
+use crate::scheduler::{GCWork, WorkBucketStage};
 use crate::util::ObjectReference;
 
 /// Trait for a concurrent plan.
@@ -28,5 +29,125 @@ pub trait ConcurrentPlan: Plan {
             self.current_pause(),
             Some(Pause::FinalMark) | Some(Pause::Full)
         )
+    }
+
+    /// Route a marking work packet (`ConcurrentTraceObjects` /
+    /// `ProcessModBufSATB` / marking seeds). Default: park it in the
+    /// `Concurrent` bucket for background execution by GC workers — the
+    /// worker-concurrent design. A plan running SLICED marking (see
+    /// [`Self::marking_confined_to_pauses`]) overrides this to park the packet
+    /// in a plan-owned queue that is only drained in budgeted quanta inside
+    /// stopped-world pauses.
+    fn schedule_marking_packet(&self, w: Box<dyn GCWork<Self::VM>>) {
+        self.base().scheduler.work_buckets[WorkBucketStage::Concurrent].add_boxed_no_notify(w);
+    }
+
+    /// Is the marking work queue fully drained (cycle ready for `FinalMark`)?
+    /// Must agree with wherever [`Self::schedule_marking_packet`] parks work.
+    fn marking_queue_drained(&self) -> bool {
+        self.base().scheduler.work_buckets[WorkBucketStage::Concurrent].is_drained()
+    }
+
+    /// Return `true` if this plan executes ALL marking work inside
+    /// stopped-world pauses (sliced-STW marking): no marking packet ever runs
+    /// while mutators run. Bindings may use this to keep single-tracer
+    /// (plain-op) tracing modes armed across the marking window — with one
+    /// worker and a stopped world, the tracer is single even mid-cycle.
+    fn marking_confined_to_pauses(&self) -> bool {
+        false
+    }
+
+    /// Did the pause that JUST ENDED complete a marking cycle (`FinalMark` or
+    /// a full STW GC)? Readable after `end_of_gc` has cleared the current
+    /// pause — for end-of-collection accounting (a binding's major-cycle
+    /// pacing must treat a completed concurrent cycle exactly like a full GC,
+    /// as stock collectors do; without this a FinalMark never resets pacing
+    /// baselines and the trigger law diverges between the STW and concurrent
+    /// modes).
+    fn previous_pause_finished_mark(&self) -> bool {
+        false
+    }
+
+    /// Is the (incrementally executed) post-cycle SWEEP fully drained? For
+    /// plans that defer the mature sweep into quanta (Bactrian), the cycle is
+    /// only COMPLETE — pacing baselines valid, next cycle/full legal — once
+    /// this returns true. Plans that sweep inside the pause return true.
+    fn sweep_drained(&self) -> bool {
+        true
+    }
+
+    /// Bytes marked by the most recently COMPLETED sliced/concurrent marking
+    /// cycle (its live set at the snapshot), or 0 when the last whole-heap
+    /// collection was a STW Full (whose swept reserved pages are already an
+    /// honest live size) or the plan does not track it. Heap sizing and the
+    /// binding's cycle-start baseline use this instead of reserved pages
+    /// after a FinalMark, where reserved still contains the unswept garbage
+    /// and everything promoted (born black) during the cycle.
+    fn last_cycle_marked_bytes(&self) -> usize {
+        0
+    }
+
+    /// Heap limit (pages) latched when the in-flight or most recent sliced
+    /// cycle started; the runway the cycle's quanta are paced against. The
+    /// live limit may be nudged up during the cycle so allocation never
+    /// fails, but the pacing budget stays frozen. 0 = none.
+    fn cycle_start_heap_pages(&self) -> usize {
+        0
+    }
+
+    /// Request a pause to PROGRESS in-flight incremental work (marking or
+    /// sweep quanta) even though no nursery trigger fired — the analog of
+    /// stock OCaml running a major slice off major-heap allocation. Called by
+    /// bindings from mature-direct allocation paths; honored by the plan's
+    /// collection_required at the next poll. Default: no-op.
+    fn request_progress_pause(&self) {}
+
+    /// Hint the per-pause mark-quantum budget for the cycle being triggered,
+    /// in milliseconds — stock OCaml's mark-slice sizing law, computed by the
+    /// binding's pacing at cycle-trigger time: the mark debt (post-sweep
+    /// live) spread over the pauses the remaining heap runway will yield
+    /// (`debt_ms / (runway / nursery)`). A fixed small budget cannot absorb a
+    /// large live set inside a short runway — the un-absorbed remainder used
+    /// to drain in one giant FinalMark pause. 0/never-called = the static
+    /// MMTK_MARK_SLICE_MS budget. Default: no-op for plans without sliced
+    /// marking.
+    ///
+    /// The mature Immix space's (post-sweep reserved bytes, live bytes
+    /// marked by the last major epoch) — the compaction law's inputs.
+    /// Immix-only on both sides so LOS residency cannot skew the ratio.
+    /// None = plan doesn't support the law. Default: None.
+    fn mature_footprint_and_live(&self) -> Option<(usize, usize)> {
+        None
+    }
+
+    /// Request a compacting major: the next STW Full evacuates EVERY in-use
+    /// mature block (bounded by copy headroom — leftovers stay in place and
+    /// later compactions converge). Called by the binding's pacing when
+    /// mature reserved pages run away from its live estimate — the
+    /// line-granular reclamation cannot free 256B lines that interleave
+    /// small dead objects with live ones, so byte-level waste is invisible
+    /// to both the normal defrag trigger and its hole-bucket candidate
+    /// selection (mature_mutation: 8MB live pinning >90MB). Stock OCaml's
+    /// analog is `Gc.max_overhead`-paced automatic compaction. Default:
+    /// no-op.
+    fn request_mature_compaction(&self) {}
+
+    /// Record WHICH pacing site fired the cycle being requested: `false` =
+    /// the post-minor path, `true` = the mature-direct allocation tick (pause
+    /// cadence = tick batches — near-empty nursery collections that stay
+    /// small at any nursery cap, so the slicing gate must not degrade such a
+    /// cycle to a monolithic Full; fragmed flipped from cycles to 11 Fulls,
+    /// D1 3.4→5.0×, when it did). Slice sizing itself is the plan's: it
+    /// paces from the runway frozen at InitialMark and its measured mark
+    /// rate, so the binding passes no quantum or debt estimate.
+    fn set_cycle_tick_origin(&self, _tick_origin: bool) {}
+
+    /// Did the pause that JUST ENDED start a marking cycle (`InitialMark`, or
+    /// a full STW GC — which is a whole cycle in one pause)? For
+    /// allocation-denominated cycle pacing: stock-style pacing measures the
+    /// budget from cycle START to next cycle start, so allocation during the
+    /// marking window counts toward the next trigger.
+    fn previous_pause_started_cycle(&self) -> bool {
+        false
     }
 }
