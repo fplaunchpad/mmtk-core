@@ -31,16 +31,23 @@ use crate::util::{metadata::side_metadata::SideMetadataSpec, Address, ObjectRefe
 use crate::vm::*;
 use atomic::Ordering;
 
-/// log2 of the number of RC bits per object. LXR default = 1 (=> 2 bits, values 0..3).
+/// log2 of the number of RC bits per object. Default = 2 (=> 4 bits, values 0..15, 15 sticky).
+///
+/// The reference LXR defaults to 2-bit counts (sticky at 3). On OCaml that sticks too many
+/// ordinary mature objects: in an effects-heavy scheduler (chameneos_redux) chains of popped
+/// `Queue` cells reached the sticky count, were never decremented again, and pinned 10-20 MiB
+/// per epoch until a Full (backup-trace) pause. 4-bit counts removed that retention in our
+/// measurements. The cost is the RC side table, one entry per 8-byte granule:
+/// 1/16 of the covered heap instead of 1/32 (32 MiB instead of 16 MiB for a 512 MiB heap).
+///
+/// `lxr_rc_bits_2` / `lxr_rc_bits_8` select 2- or 8-bit counts; `lxr_rc_bits_4` is the default.
 pub const LOG_REF_COUNT_BITS: usize = {
     if cfg!(feature = "lxr_rc_bits_2") {
         1
-    } else if cfg!(feature = "lxr_rc_bits_4") {
-        2
     } else if cfg!(feature = "lxr_rc_bits_8") {
         3
     } else {
-        1
+        2
     }
 };
 pub const REF_COUNT_BITS: u8 = 1 << LOG_REF_COUNT_BITS;
