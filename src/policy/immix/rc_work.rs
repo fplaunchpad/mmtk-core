@@ -155,6 +155,14 @@ impl<VM: VMBinding> SweepDeadCycles<VM> {
                 .fetch_add(VM::VMObjectModel::get_current_size(o), Ordering::Relaxed);
             let hdr: usize = unsafe { VM::VMObjectModel::ref_to_object_start(o).load() };
             crate::plan::lxr::rc::RC_CYCLE_DEAD_TAGS[hdr & 0xff].fetch_add(1, Ordering::Relaxed);
+            let c = self.rc.count(o) as usize;
+            crate::plan::lxr::rc::RC_CYCLE_DEAD_RC[c.clamp(1, 3) - 1].fetch_add(1, Ordering::Relaxed);
+            if hdr & 0xff == 245 {
+                let f0: usize = unsafe { o.to_raw_address().load() };
+                if f0 & !1usize != 0 {
+                    crate::plan::lxr::rc::RC_CYCLE_DEAD_SUSPENDED_CONTS.fetch_add(1, Ordering::Relaxed);
+                }
+            }
         }
         if !crate::args::BLOCK_ONLY {
             self.rc.unmark_straddle_object(o);

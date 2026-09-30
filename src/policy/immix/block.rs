@@ -510,10 +510,24 @@ impl Block {
     /// phase). No actual locking (STW: uncontended).
     fn lock_skip_reusing_or_unallocated(&self) -> bool {
         let state = self.get_state();
-        if state == BlockState::Unallocated || (Self::in_mutatar_phase() && self.is_reusing()) {
+        if state == BlockState::Unallocated {
+            return false;
+        }
+        if Self::in_mutatar_phase() && self.is_reusing() && !Self::reuse_guard_off() {
+            if crate::plan::lxr::rc::rc_retain_on() {
+                crate::plan::lxr::rc::RC_SWEEP_REFUSED_REUSING
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             return false;
         }
         true
+    }
+
+    /// `MMTK_RC_NO_REUSE_GUARD`: drop the "mutator is reusing this block" refusal in the STW
+    /// sweeps (experiment).
+    fn reuse_guard_off() -> bool {
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *OFF.get_or_init(|| std::env::var_os("MMTK_RC_NO_REUSE_GUARD").is_some())
     }
 
     pub fn unlock(&self) {}
@@ -541,7 +555,9 @@ impl Block {
     /// reusing it. Returns true iff the block was deallocated.
     fn attempt_dealloc(&self) -> bool {
         self.fetch_update_state(|s| {
-            if (Self::in_mutatar_phase() && self.is_reusing()) || s == BlockState::Unallocated {
+            if (Self::in_mutatar_phase() && self.is_reusing() && !Self::reuse_guard_off())
+                || s == BlockState::Unallocated
+            {
                 None
             } else {
                 Some(BlockState::Unallocated)

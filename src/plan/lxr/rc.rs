@@ -73,6 +73,14 @@ pub static RC_CYCLE_DEAD_TAGS: [AtomicUsize; 256] = [const { AtomicUsize::new(0)
 /// Increments generated from slots OUTSIDE the MMTk spaces while scanning a promoted object: the
 /// suspended fiber-stack slots of a promoted continuation. Diagnostic only.
 pub static RC_STACK_SLOT_INCS: AtomicUsize = AtomicUsize::new(0);
+/// Decrements issued for the stack referents of a promoted continuation when it is resumed.
+pub static RC_CONT_RESUME_DECS: AtomicUsize = AtomicUsize::new(0);
+/// Dead mature blocks the sweep refused because the block looked "being reused" this phase.
+pub static RC_SWEEP_REFUSED_REUSING: AtomicUsize = AtomicUsize::new(0);
+/// Cycle-dead objects by count: [rc==1, rc==2, rc>=3 (incl. sticky)]; and cycle-dead
+/// continuations that still hold a suspended stack. Diagnostic only.
+pub static RC_CYCLE_DEAD_RC: [AtomicUsize; 3] = [const { AtomicUsize::new(0) }; 3];
+pub static RC_CYCLE_DEAD_SUSPENDED_CONTS: AtomicUsize = AtomicUsize::new(0);
 /// Cached `MMTK_RC_RETAIN` flag (retention accounting at every pause end).
 pub(crate) fn rc_retain_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

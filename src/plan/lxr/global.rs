@@ -608,8 +608,10 @@ impl<VM: VMBinding> LXR<VM> {
             self.get_total_pages(),
         );
         line.push_str(&format!(
-            " stack_slot_incs={}",
-            super::rc::RC_STACK_SLOT_INCS.swap(0, Ordering::Relaxed)
+            " stack_slot_incs={} cont_resume_decs={} sweep_refused_reusing={}",
+            super::rc::RC_STACK_SLOT_INCS.swap(0, Ordering::Relaxed),
+            super::rc::RC_CONT_RESUME_DECS.swap(0, Ordering::Relaxed),
+            super::rc::RC_SWEEP_REFUSED_REUSING.swap(0, Ordering::Relaxed)
         ));
         if full {
             let mut tags: Vec<(usize, usize)> = (0..256)
@@ -619,8 +621,17 @@ impl<VM: VMBinding> LXR<VM> {
             tags.sort_unstable_by(|a, b| b.cmp(a));
             tags.truncate(5);
             line.push_str(&format!(" cycle_dead_tags(n,tag)={tags:?}"));
+            let rcs: Vec<usize> = super::rc::RC_CYCLE_DEAD_RC
+                .iter()
+                .map(|c| c.swap(0, Ordering::Relaxed))
+                .collect();
             line.push_str(&format!(
-                " marked_objs={} marked_KiB={} cycle_dead_objs={cyc_o} cycle_dead_KiB={}",
+                " cycle_dead_rc[1,2,3+]={rcs:?} suspended_conts={}",
+                super::rc::RC_CYCLE_DEAD_SUSPENDED_CONTS.swap(0, Ordering::Relaxed)
+            ));
+            line.push_str(&format!(
+                " marked_rc0={} marked_objs={} marked_KiB={} cycle_dead_objs={cyc_o} cycle_dead_KiB={}",
+                r.marked_rc0,
                 r.marked_objs,
                 r.marked_bytes >> 10,
                 cyc_b >> 10

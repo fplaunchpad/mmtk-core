@@ -753,6 +753,30 @@ impl<VM: VMBinding> ImmixSpace<VM> {
                     continue;
                 }
                 r.blocks_held += 1;
+                if with_marks {
+                    // RC sanity: every object the Full trace reached must be counted, or its
+                    // lines could be handed out as a hole (line reuse) or its block freed.
+                    let mut a = block.start();
+                    while a < block.end() {
+                        let o = unsafe { ObjectReference::from_raw_address_unchecked(a) };
+                        if self.is_marked(o) && rc.count(o) == 0 {
+                            r.marked_rc0 += 1;
+                            if r.marked_rc0 <= 5 {
+                                let hdr: usize = unsafe { (a - 8usize).load() };
+                                let f0: usize = unsafe { a.load() };
+                                eprintln!(
+                                    "[RC-SANITY] marked object {o} has rc 0 (block {block:?} state {:?} promoted {}) hdr={hdr:#x} tag={} wosize={} field0={f0:#x} field0_rc={}",
+                                    block.get_state(),
+                                    block.is_in_place_promoted(),
+                                    hdr & 0xff,
+                                    hdr >> 10,
+                                    if f0 & 1 == 0 && f0 != 0 && crate::memory_manager::is_in_mmtk_spaces(unsafe { ObjectReference::from_raw_address_unchecked(Address::from_usize(f0)) }) { rc.count(unsafe { ObjectReference::from_raw_address_unchecked(Address::from_usize(f0)) }) as i32 } else { -1 }
+                                );
+                            }
+                        }
+                        a += crate::util::rc::MIN_OBJECT_SIZE;
+                    }
+                }
                 let mut line_live = [false; Block::LINES];
                 let mut any = false;
                 let mut cursor = block.start();
@@ -1896,5 +1920,13 @@ pub(crate) struct RcRetention {
     pub marked_bytes: usize,
     /// Pages reserved by the immix space.
     pub reserved_pages: usize,
+    /// Full pauses only: objects the trace marked whose count is zero (must be 0).
+    pub marked_rc0: usize,
 }
 
+
+/// `MMTK_RC_LINE_REUSE`: hand partially free blocks back to mutators under RC (experiment).
+pub(crate) fn rc_line_reuse_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MMTK_RC_LINE_REUSE").is_some())
+}
