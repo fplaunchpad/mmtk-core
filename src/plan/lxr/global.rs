@@ -56,6 +56,9 @@ static BACKUP_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 /// `get_used_pages()` captured at the START of the current pause (before the RC sweeps), so
 /// `end_of_gc` can compute how much the RC pause's nursery+mature sweeps freed.
 static USED_AT_PAUSE_START: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Pause counter for `MMTK_RC_BACKUP_EVERY` and the retention report.
+static PAUSE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static REPORT_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
@@ -189,8 +192,20 @@ impl<VM: VMBinding> Plan for LXR<VM> {
         USED_AT_PAUSE_START.store(self.get_used_pages(), Ordering::Relaxed);
         // RefCount = steady-state in-place RC. Full = the periodic STW backup mark/sweep that
         // reclaims cyclic garbage RC misses (no concurrent marking; the in-place STW cut).
+        let pending_before = BACKUP_PENDING.load(Ordering::Relaxed);
         let pause = self.select_collection_kind();
         self.current_pause.store(Some(pause), Ordering::SeqCst);
+        if super::rc::rc_retain_on() {
+            let st = &self.common.base.global_state;
+            eprintln!(
+                "[RC-SCHED] kind={:?} backup_pending={pending_before} emergency={} attempts={} used={} total={}",
+                pause,
+                st.is_emergency_collection(),
+                st.cur_collection_attempts.load(Ordering::Relaxed),
+                self.get_used_pages(),
+                self.get_total_pages()
+            );
+        }
         match pause {
             Pause::RefCount => self.schedule_rc_collection(scheduler),
             Pause::Full => self.schedule_full_collection(scheduler),
@@ -269,6 +284,7 @@ impl<VM: VMBinding> Plan for LXR<VM> {
     }
 
     fn end_of_gc(&mut self, tls: VMWorkerThread) {
+        self.report_retention();
         self.evaluate_rc_effectiveness();
         self.dump_rc_stats();
         self.previous_pause
@@ -450,6 +466,12 @@ impl<VM: VMBinding> LXR<VM> {
         // here: a GC fires precisely because the heap filled, so `used` is always ~total at pause
         // start, and a pause-start backstop would fire every pause and defeat the signal (the bug
         // that made binarytrees trace on 115/115 pauses).
+        // Diagnostic: `MMTK_RC_BACKUP_EVERY=N` forces every Nth pause to be Full.
+        let every = env_usize("MMTK_RC_BACKUP_EVERY", 0);
+        if every > 0 && PAUSE_COUNT.fetch_add(1, Ordering::Relaxed) % every == every - 1 {
+            BACKUP_PENDING.store(false, Ordering::Relaxed);
+            return Pause::Full;
+        }
         if BACKUP_PENDING.swap(false, Ordering::Relaxed) {
             Pause::Full
         } else {
@@ -550,6 +572,61 @@ impl<VM: VMBinding> LXR<VM> {
                 still_full && under_reclaimed
             );
         }
+    }
+
+    /// `MMTK_RC_RETAIN`: one `[RC-RETAIN]` line per pause, after all sweeps. See
+    /// `ImmixSpace::rc_retention_report`. Ratios: `held_KiB/live_KiB` is the retention factor
+    /// to explain; `lines`/`blocks_live` separates line- from block-granularity retention.
+    fn report_retention(&self) {
+        use super::rc::{rc_retain_on, RC_CYCLE_DEAD_BYTES, RC_CYCLE_DEAD_OBJS};
+        use crate::util::linear_scan::Region;
+        if !rc_retain_on() {
+            return;
+        }
+        let full = self.current_pause() == Some(Pause::Full);
+        let r = self.immix_space.rc_retention_report(full);
+        let n = REPORT_COUNT.fetch_add(1, Ordering::Relaxed);
+        let cyc_o = RC_CYCLE_DEAD_OBJS.swap(0, Ordering::Relaxed);
+        let cyc_b = RC_CYCLE_DEAD_BYTES.swap(0, Ordering::Relaxed);
+        let live_kib = r.bytes >> 10;
+        let held_kib = r.blocks_held * crate::policy::immix::block::Block::BYTES >> 10;
+        let mut line = format!(
+            "[RC-RETAIN] gc={n} kind={} live_objs={} live_KiB={live_kib} stuck={} lines={} (KiB={}) \
+             blocks_live={} (<=25%lines: {}) blocks_held={} (empty={}) held_KiB={held_kib} \
+             reserved_pages={} used_pages={} total_pages={}",
+            if full { "FULL" } else { "RC" },
+            r.objs,
+            r.stuck,
+            r.lines,
+            r.lines * crate::policy::immix::line::Line::BYTES >> 10,
+            r.blocks_live,
+            r.blocks_under_quarter,
+            r.blocks_held,
+            r.blocks_empty_held,
+            r.reserved_pages,
+            self.get_used_pages(),
+            self.get_total_pages(),
+        );
+        line.push_str(&format!(
+            " stack_slot_incs={}",
+            super::rc::RC_STACK_SLOT_INCS.swap(0, Ordering::Relaxed)
+        ));
+        if full {
+            let mut tags: Vec<(usize, usize)> = (0..256)
+                .map(|t| (super::rc::RC_CYCLE_DEAD_TAGS[t].swap(0, Ordering::Relaxed), t))
+                .filter(|(n, _)| *n > 0)
+                .collect();
+            tags.sort_unstable_by(|a, b| b.cmp(a));
+            tags.truncate(5);
+            line.push_str(&format!(" cycle_dead_tags(n,tag)={tags:?}"));
+            line.push_str(&format!(
+                " marked_objs={} marked_KiB={} cycle_dead_objs={cyc_o} cycle_dead_KiB={}",
+                r.marked_objs,
+                r.marked_bytes >> 10,
+                cyc_b >> 10
+            ));
+        }
+        eprintln!("{line}");
     }
 
     fn dump_rc_stats(&self) {

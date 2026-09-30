@@ -64,6 +64,20 @@ pub static RC_INCS_PROMOTED: AtomicUsize = AtomicUsize::new(0); // objects whose
 pub static RC_INCS_TOTAL: AtomicUsize = AtomicUsize::new(0); // total inc() calls
 pub static RC_DECS_TOTAL: AtomicUsize = AtomicUsize::new(0); // total dec attempts processed
 pub static RC_DECS_TO_ZERO: AtomicUsize = AtomicUsize::new(0); // objects whose RC reached 0 (dead)
+/// Objects / bytes the Full pause's dead-cycle sweep reclaimed (rc>0 but unmarked).
+pub static RC_CYCLE_DEAD_OBJS: AtomicUsize = AtomicUsize::new(0);
+pub static RC_CYCLE_DEAD_BYTES: AtomicUsize = AtomicUsize::new(0);
+/// Tag histogram of cycle-dead objects (OCaml header tag, low byte of the word before the object
+/// start's first field); diagnostic only.
+pub static RC_CYCLE_DEAD_TAGS: [AtomicUsize; 256] = [const { AtomicUsize::new(0) }; 256];
+/// Increments generated from slots OUTSIDE the MMTk spaces while scanning a promoted object: the
+/// suspended fiber-stack slots of a promoted continuation. Diagnostic only.
+pub static RC_STACK_SLOT_INCS: AtomicUsize = AtomicUsize::new(0);
+/// Cached `MMTK_RC_RETAIN` flag (retention accounting at every pause end).
+pub(crate) fn rc_retain_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MMTK_RC_RETAIN").is_some())
+}
 
 #[inline(always)]
 pub(super) fn rc_stat_inc(counter: &AtomicUsize) {
@@ -231,6 +245,8 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
                 })
             {
                 sa.unlog_field_relaxed::<VM>();
+            } else if rc_retain_on() && slot.load().is_some() {
+                RC_STACK_SLOT_INCS.fetch_add(1, AtomicOrdering::Relaxed);
             }
             let Some(target) = slot.load() else {
                 return;
