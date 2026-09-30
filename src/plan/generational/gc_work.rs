@@ -74,8 +74,8 @@ impl<VM: VMBinding, P: GenerationalPlanExt<VM> + PlanTraceObject<VM>, const KIND
             .get_or_init(|| std::env::var("MMTK_LOCAL_NURSERY_TRACE").as_deref() == Ok("1"));
         if !enabled
             || cfg!(feature = "extreme_assertions")
-            || *self.mmtk.get_options().plan != crate::util::options::PlanSelector::GenImmix
-            || *self.mmtk.get_options().count_live_bytes_in_gc
+            || *self.mmtk().get_options().plan != crate::util::options::PlanSelector::GenImmix
+            || *self.mmtk().get_options().count_live_bytes_in_gc
         {
             let nodes = self.pop_nodes();
             if !nodes.is_empty() {
@@ -108,7 +108,7 @@ impl<VM: VMBinding, P: GenerationalPlanExt<VM> + PlanTraceObject<VM>, const KIND
             // objects are scanned by the ordinary plan packet, never retraced.
             if current.len() > threshold {
                 let spill = current.split_off(current.len() / 2);
-                self.mmtk.scheduler.work_buckets[self.bucket].add(self.create_scan_work(spill));
+                self.mmtk().scheduler.work_buckets[self.bucket].add(self.create_scan_work(spill));
             }
             for object in current.iter().copied() {
                 if !VM::VMScanning::support_slot_enqueuing(tls, object) {
