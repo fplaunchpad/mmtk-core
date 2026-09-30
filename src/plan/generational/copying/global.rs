@@ -59,7 +59,7 @@ impl<VM: VMBinding> Plan for GenCopy<VM> {
                 _ => CopySelector::Unused,
             },
             space_mapping: vec![
-                // The tospace argument doesn't matter, we will rebind before a GC anyway.
+                // Start in the current mature tospace; full GCs rebind after flipping.
                 (CopySelector::CopySpace(0), self.tospace()),
             ],
             constraints: &GENCOPY_CONSTRAINTS,
@@ -103,7 +103,13 @@ impl<VM: VMBinding> Plan for GenCopy<VM> {
     }
 
     fn prepare_worker(&self, worker: &mut GCWorker<Self::VM>) {
-        unsafe { worker.get_copy_context_mut().copy[0].assume_init_mut() }.rebind(self.tospace());
+        // A nursery GC neither flips nor releases mature tospace, so retain
+        // each worker's unused copy buffer. Rebinding would discard its tail.
+        // Full GCs flip the spaces in prepare(); every worker must reset its
+        // allocator before copying into the new tospace.
+        if !self.gen.is_current_gc_nursery() {
+            unsafe { worker.get_copy_context_mut().copy[0].assume_init_mut() }.rebind(self.tospace());
+        }
     }
 
     fn release(&mut self, tls: VMWorkerThread) {
