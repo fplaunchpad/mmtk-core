@@ -224,6 +224,11 @@ impl<VM: VMBinding> GenerationalPlan for GenImmix<VM> {
         self.gen.nursery.address_in_space(addr)
     }
 
+    fn nursery_range(&self) -> Option<(Address, usize)> {
+        let c = self.gen.nursery.common();
+        if c.contiguous { Some((c.start, c.extent)) } else { None }
+    }
+
     fn get_mature_physical_pages_available(&self) -> usize {
         self.immix_space.available_physical_pages()
     }

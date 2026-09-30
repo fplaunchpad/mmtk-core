@@ -316,6 +316,15 @@ pub trait GenerationalPlan: Plan {
     /// conservative result.
     fn is_address_in_nursery(&self, addr: Address) -> bool;
 
+    /// The contiguous virtual range `(start, extent)` of the nursery space when the
+    /// plan has exactly one and it is contiguous (`GenImmix`, `GenCopy`); `None`
+    /// otherwise. A VM may use it as an inline "is this value young" test in its
+    /// write barrier (ocaml-mmtk: stock OCaml's `Is_young(val)` filter, so
+    /// mature-to-mature stores never reach the remembered set).
+    fn nursery_range(&self) -> Option<(Address, usize)> {
+        None
+    }
+
     /// Return the number of pages available for allocation into the mature space.
     fn get_mature_physical_pages_available(&self) -> usize;
 
