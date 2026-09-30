@@ -739,6 +739,106 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         }
     }
 
+    /// Retention accounting (`MMTK_RC_RETAIN`, diagnostic only): walk every non-free immix block
+    /// and report, from the RC table, the objects with a non-zero count (the RC view of "live"),
+    /// their bytes, the lines and blocks they occupy, and the blocks held with no such object.
+    /// With `with_marks` (a Full pause, after its trace), also count how many of those objects the
+    /// trace marked. Runs in `end_of_gc`, after all sweeps, with mutators stopped.
+    pub(crate) fn rc_retention_report(&self, with_marks: bool) -> RcRetention {
+        let rc = crate::util::rc::RefCountHelper::<VM>::NEW;
+        let mut r = RcRetention::default();
+        for chunk in self.chunk_map.all_chunks() {
+            for block in chunk.iter_region::<Block>() {
+                if block.get_state() == BlockState::Unallocated {
+                    continue;
+                }
+                r.blocks_held += 1;
+                if with_marks {
+                    // RC sanity: every object the Full trace reached must be counted, or the
+                    // sweeps (and any future line reuse) could free memory it occupies.
+                    let mut a = block.start();
+                    while a < block.end() {
+                        let o = unsafe { ObjectReference::from_raw_address_unchecked(a) };
+                        if self.is_marked(o) && rc.count(o) == 0 {
+                            r.marked_rc0 += 1;
+                            if r.marked_rc0 <= 5 {
+                                let hdr: usize = unsafe { (a - 8usize).load() };
+                                eprintln!(
+                                    "[RC-SANITY] marked object {o} has rc 0 (block {block:?} \
+                                     state {:?} promoted {}) hdr={hdr:#x}",
+                                    block.get_state(),
+                                    block.is_in_place_promoted(),
+                                );
+                            }
+                        }
+                        a += crate::util::rc::MIN_OBJECT_SIZE;
+                    }
+                }
+                let mut line_live = [false; Block::LINES];
+                let mut any = false;
+                let mut cursor = block.start();
+                let limit = block.end();
+                while cursor < limit {
+                    let o = unsafe { ObjectReference::from_raw_address_unchecked(cursor) };
+                    let c = rc.count(o);
+                    if c == 0 {
+                        cursor += crate::util::rc::MIN_OBJECT_SIZE;
+                        continue;
+                    }
+                    if o.to_raw_address().is_aligned_to(Line::BYTES)
+                        && c == 1
+                        && rc.is_straddle_line(Line::of(o.to_raw_address()))
+                    {
+                        // A continuation line of a straddling object whose start is in an
+                        // earlier block: count the line only.
+                        let idx = (cursor - block.start()) >> Line::LOG_BYTES;
+                        line_live[idx] = true;
+                        any = true;
+                        cursor += crate::util::rc::MIN_OBJECT_SIZE;
+                        continue;
+                    }
+                    let size = VM::VMObjectModel::get_current_size(o);
+                    let start = VM::VMObjectModel::ref_to_object_start(o);
+                    r.objs += 1;
+                    r.bytes += size;
+                    if c == crate::util::rc::MAX_REF_COUNT {
+                        r.stuck += 1;
+                    }
+                    if with_marks && self.is_marked(o) {
+                        r.marked_objs += 1;
+                        r.marked_bytes += size;
+                    }
+                    let first = if start < block.start() {
+                        block.start()
+                    } else {
+                        start
+                    };
+                    let end = start + size;
+                    let mut a = first;
+                    while a < end && a < limit {
+                        line_live[(a - block.start()) >> Line::LOG_BYTES] = true;
+                        a = Line::align(a) + Line::BYTES;
+                    }
+                    any = true;
+                    let next = end.max(o.to_raw_address() + crate::util::rc::MIN_OBJECT_SIZE);
+                    cursor = next.align_up(crate::util::rc::MIN_OBJECT_SIZE);
+                }
+                let lines = line_live.iter().filter(|b| **b).count();
+                r.lines += lines;
+                if any {
+                    r.blocks_live += 1;
+                    if lines * 4 <= Block::LINES {
+                        r.blocks_under_quarter += 1;
+                    }
+                } else {
+                    r.blocks_empty_held += 1;
+                }
+            }
+        }
+        r.reserved_pages = self.reserved_pages();
+        r
+    }
+
     /// Get the number of defrag headroom pages.
     pub fn defrag_headroom_pages(&self) -> usize {
         self.defrag.defrag_headroom_pages(self)
@@ -1795,4 +1895,32 @@ impl ClearVOBitsAfterPrepare {
             block.clear_vo_bits_for_unmarked_regions(line_mark_state);
         }
     }
+}
+
+/// Result of [`ImmixSpace::rc_retention_report`] (diagnostic; `MMTK_RC_RETAIN`).
+#[derive(Default, Debug, Clone, Copy)]
+pub(crate) struct RcRetention {
+    /// Non-free immix blocks (state != Unallocated).
+    pub blocks_held: usize,
+    /// Blocks with at least one rc>0 object (or straddle line).
+    pub blocks_live: usize,
+    /// Of `blocks_live`, those with at most a quarter of their lines live.
+    pub blocks_under_quarter: usize,
+    /// Held blocks with no rc>0 entry at all.
+    pub blocks_empty_held: usize,
+    /// Lines covered by rc>0 objects.
+    pub lines: usize,
+    /// Objects with rc>0 (object starts only).
+    pub objs: usize,
+    /// Their bytes.
+    pub bytes: usize,
+    /// Of `objs`, those with the sticky maximum count.
+    pub stuck: usize,
+    /// Of `objs`, those marked by this pause's trace (Full pauses only).
+    pub marked_objs: usize,
+    pub marked_bytes: usize,
+    /// Pages reserved by the immix space.
+    pub reserved_pages: usize,
+    /// Full pauses only: objects the trace marked whose count is zero (should be 0).
+    pub marked_rc0: usize,
 }

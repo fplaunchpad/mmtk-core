@@ -858,6 +858,49 @@ pub fn lxr_keep_alive_recursive<VM: VMBinding>(
     }
 }
 
+/// LXR only: the continuation `cont` is being resumed, which takes its suspended stack out of it
+/// without a write barrier. If `cont` was promoted (non-zero count), promotion scanned that stack
+/// as the continuation's fields and incremented every referent, so each referent now needs the
+/// matching decrement; `targets` are the stack's current referents (a suspended stack does not
+/// change between promotion and resume). The decrements are deferred to the next pause like
+/// field-barrier decrements, so the resumed stack's root increments are applied first.
+///
+/// Call it only for a real resume (the stack will run and its referents become roots), not for
+/// a take that puts the stack back (e.g. to walk it for a backtrace): that would decrement the
+/// referents twice. The binding may call it with an empty `targets` to ask whether decrements are
+/// needed. Returns false (and does nothing) unless the plan is LXR and `cont` has a non-zero
+/// count.
+pub fn lxr_continuation_resumed<VM: VMBinding>(
+    mmtk: &'static MMTK<VM>,
+    cont: ObjectReference,
+    targets: &[ObjectReference],
+) -> bool {
+    use crate::plan::lxr::LXR;
+    let Some(lxr) = mmtk.get_plan().downcast_ref::<LXR<VM>>() else {
+        return false;
+    };
+    if !is_in_mmtk_spaces(cont) || lxr.rc.count(cont) == 0 {
+        return false;
+    }
+    let decs: Vec<ObjectReference> = targets
+        .iter()
+        .copied()
+        .filter(|t| is_in_mmtk_spaces(*t))
+        .collect();
+    if !decs.is_empty() {
+        if crate::plan::lxr::rc::rc_retain_on() {
+            crate::plan::lxr::rc::RC_CONT_RESUME_DECS
+                .fetch_add(decs.len(), std::sync::atomic::Ordering::Relaxed);
+        }
+        let w = crate::plan::lxr::rc::ProcessDecs::new(
+            decs,
+            crate::LazySweepingJobsCounter::new_decs(),
+        );
+        mmtk.scheduler.work_buckets[crate::scheduler::WorkBucketStage::STWRCDecsAndSweep].add(w);
+    }
+    true
+}
+
 /// Is the address in the mapped memory? The runtime can use this function to check
 /// if an address is mapped by MMTk. Note that this is different than is_in_mmtk_spaces().
 /// For malloc spaces, MMTk does not map those addresses (malloc does the mmap), so

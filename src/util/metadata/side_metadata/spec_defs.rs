@@ -62,8 +62,8 @@ define_side_metadata_specs!(
     CHUNK_MARK   = (global: true, log_num_of_bits: 3, log_bytes_in_region: crate::util::heap::chunk_map::Chunk::LOG_BYTES),
     // ---- LXR (P1, additive) ----
     // Per-object reference count, used by the LXR plan only. `log_num_of_bits` is the
-    // number of bits per RC entry (LXR default: 2 bits => values 0..3 with MAX_REF_COUNT as
-    // the "sticky" saturated count); `log_bytes_in_region` is LXR's RC granularity (= min
+    // number of bits per RC entry (default 4 bits => values 0..15 with MAX_REF_COUNT as
+    // the "sticky" saturated count; see util/rc.rs); `log_bytes_in_region` is LXR's RC granularity (= min
     // object size). Global so it is mapped once for the whole heap; placed LAST in the global
     // list so it does not perturb the offsets of the pre-existing core global specs (which the
     // generational/concurrent log-bit accounting assumes). See the budget note below.

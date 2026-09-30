@@ -237,14 +237,15 @@ vo_bit_access = []
 # These are the `lxr_*` cargo features that `src/args.rs` and `src/util/rc.rs` read via
 # `cfg!(feature = "...")`. They are declared here (all OFF by default) so that the vendored LXR
 # scaffolding compiles without `unexpected_cfgs` warnings and so the switches are available for
-# later tuning sweeps (P4/P5). With all of them off we get LXR's *default* configuration.
+# later tuning sweeps (P4/P5). With all of them off we get LXR's *default* configuration, except
+# that the RC width defaults to 4 bits (LXR: 2).
 # None of these affect existing plans (they are only read by the LXR-only modules).
 lxr_no_lazy = []           # disable lazy decrements
 lxr_no_nursery_evac = []   # disable RC nursery evacuation
 lxr_no_mature_evac = []    # disable RC mature evacuation
 lxr_no_prefetch = []       # disable RC-table prefetch hints
-lxr_rc_bits_2 = []         # 2-bit RC entries (default)
-lxr_rc_bits_4 = []         # 4-bit RC entries
+lxr_rc_bits_2 = []         # 2-bit RC entries (the reference LXR's default)
+lxr_rc_bits_4 = []         # 4-bit RC entries (default here; see util/rc.rs LOG_REF_COUNT_BITS)
 lxr_rc_bits_8 = []         # 8-bit RC entries
 lxr_buf_256 = []           # inc/dec buffer size 256
 lxr_buf_512 = []           # inc/dec buffer size 512
