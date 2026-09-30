@@ -193,8 +193,13 @@ pub unsafe fn dzmmap(
 ) -> Result<()> {
     let flags = libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_FIXED;
     let ret = mmap_fixed(start, size, flags, strategy, anno);
-    // We do not need to explicitly zero for Linux (memory is guaranteed to be zeroed)
-    #[cfg(not(target_os = "linux"))]
+    // We do not need to explicitly zero for Linux or macOS: anonymous private
+    // mappings are zero-filled by the kernel (and MAP_FIXED over an existing
+    // mapping yields fresh zero pages). Touching every page here made each
+    // freshly mapped 4 MiB chunk -- heap and side metadata alike -- fully
+    // resident on macOS (ocaml-mmtk: ~55 MiB of RSS per process that Linux
+    // never paid), so it is skipped there too.
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     if ret.is_ok() {
         zero(start, size)
     }
@@ -212,8 +217,13 @@ pub fn dzmmap_noreplace(
 ) -> Result<()> {
     let flags = MMAP_FLAGS;
     let ret = mmap_fixed(start, size, flags, strategy, anno);
-    // We do not need to explicitly zero for Linux (memory is guaranteed to be zeroed)
-    #[cfg(not(target_os = "linux"))]
+    // We do not need to explicitly zero for Linux or macOS: anonymous private
+    // mappings are zero-filled by the kernel (and MAP_FIXED over an existing
+    // mapping yields fresh zero pages). Touching every page here made each
+    // freshly mapped 4 MiB chunk -- heap and side metadata alike -- fully
+    // resident on macOS (ocaml-mmtk: ~55 MiB of RSS per process that Linux
+    // never paid), so it is skipped there too.
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     if ret.is_ok() {
         zero(start, size)
     }
