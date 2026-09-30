@@ -888,6 +888,10 @@ pub fn lxr_continuation_resumed<VM: VMBinding>(
         .filter(|t| is_in_mmtk_spaces(*t))
         .collect();
     if !decs.is_empty() {
+        if crate::plan::lxr::rc::rc_retain_on() {
+            crate::plan::lxr::rc::RC_CONT_RESUME_DECS
+                .fetch_add(decs.len(), std::sync::atomic::Ordering::Relaxed);
+        }
         let w = crate::plan::lxr::rc::ProcessDecs::new(
             decs,
             crate::LazySweepingJobsCounter::new_decs(),
