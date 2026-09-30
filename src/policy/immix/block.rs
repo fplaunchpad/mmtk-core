@@ -365,11 +365,6 @@ impl Block {
         }
     }
 
-    /// True during a mutator (odd) phase epoch.
-    fn in_mutatar_phase() -> bool {
-        (Self::global_phase_epoch() & 1) == 1
-    }
-
     /// Update the global phase epoch (bumped at the end of every mutator and GC phase). On the
     /// 8-bit wrap (254→1) the reference also bulk-zeroes the per-block PHASE_EPOCH metadata via
     /// `space.pr.reset_nursery_state()` — see the note on `BlockPageResource::reset_nursery_state`
@@ -503,17 +498,39 @@ impl Block {
     // mutators stopped), so the lock is ALWAYS uncontended and serves no purpose — and, like the
     // deleted `BLOCK_OWNER` clear, `BLOCK_IN_USE` is NOT registered in `side_metadata_specs`, so
     // touching it reads UNMAPPED side-metadata → the atomic-load SIGSEGV the mature sweep hit.
-    // So the lock is a no-op: `lock_skip_reusing_or_unallocated` keeps only the SKIP check (don't
-    // sweep an unallocated or actively-reused block), and `unlock` does nothing.
+    // So the lock is a no-op: `lock_skip_reusing_or_unallocated` keeps only the unallocated SKIP
+    // check, and `unlock` does nothing.
+    //
+    // The reference ALSO refuses to sweep (and to dealloc) a block that "a mutator is reusing this
+    // phase" (`in_mutatar_phase() && is_reusing()`). That refusal is dropped here, because in this
+    // port the condition cannot describe a real mutator:
+    //   - no mutator ever reuses a partially free block: the only `init_rc` call
+    //     (`BlockAllocation::initialize_new_clean_block`) passes `reuse = false`;
+    //   - every decrement and every mature/dead-cycle sweep runs with mutators stopped
+    //     (`ProcessDecs` in `STWRCDecsAndSweep`; `SweepBlocksAfterDecs` / `SweepDeadCycles` queued
+    //     by the `RCBlockSweepEpilogue` sentinel), and there is no lazy-decrement path
+    //     (`args::LAZY_DECREMENTS` is not consulted);
+    //   - each mutator's immix allocator is reset at every pause (`lxr_mutator_release`), and the
+    //     OCaml binding discards its current block after every collection, so no mutator holds a
+    //     cursor into any block once the pause ends.
+    // What the check DID do under our single-bump phase epoch (one bump per GC, at the end of
+    // `RCBlockSweepEpilogue`): while a pause still has its mutator phase's epoch and that epoch is
+    // odd, every block promoted in place in this pause (`set_as_in_place_promoted` stamps the
+    // epoch and makes the block Unmarked) reads as "reusing". `SweepBlocksAfterDecs` packets queued by the
+    // epilogue can run before its bump, so they refused such blocks even when every count in them
+    // was zero (timing-dependent). The packet had already cleared the block's log bit, so nothing
+    // re-queued it and it stayed held until a Full pause: up to ~1600 empty blocks (50 MiB) held
+    // in an effects-heavy OCaml program (chameneos_redux), and 28 MiB held for 8 KiB live in a
+    // plain queue-churn loop.
+    //
+    // A future lazy (concurrent) decrement/sweep path, or mutator line/block reuse, MUST restore a
+    // guard of this kind — keyed on a real "a mutator currently owns this block" state, not on the
+    // phase epoch.
 
-    /// Returns true iff the block may be swept now (not unallocated, not a mutator-reused block this
-    /// phase). No actual locking (STW: uncontended).
+    /// Returns true iff the block may be swept now (i.e. it is allocated). No actual locking and no
+    /// "reusing" refusal: see the note above (STW sweeps, no mutator block reuse).
     fn lock_skip_reusing_or_unallocated(&self) -> bool {
-        let state = self.get_state();
-        if state == BlockState::Unallocated || (Self::in_mutatar_phase() && self.is_reusing()) {
-            return false;
-        }
-        true
+        self.get_state() != BlockState::Unallocated
     }
 
     pub fn unlock(&self) {}
@@ -537,11 +554,11 @@ impl Block {
             .map_err(|x| (x).into())
     }
 
-    /// Try to atomically transition the block to Unallocated, refusing if a mutator is still
-    /// reusing it. Returns true iff the block was deallocated.
+    /// Try to atomically transition the block to Unallocated. Returns true iff the block was
+    /// deallocated. (No "a mutator is reusing it" refusal: see the RC mature-sweep guard note.)
     fn attempt_dealloc(&self) -> bool {
         self.fetch_update_state(|s| {
-            if (Self::in_mutatar_phase() && self.is_reusing()) || s == BlockState::Unallocated {
+            if s == BlockState::Unallocated {
                 None
             } else {
                 Some(BlockState::Unallocated)
