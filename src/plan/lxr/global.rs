@@ -284,6 +284,12 @@ impl<VM: VMBinding> Plan for LXR<VM> {
     }
 
     fn end_of_gc(&mut self, tls: VMWorkerThread) {
+        if crate::policy::immix::immixspace::rc_line_reuse_on() {
+            let (freed, pushed) = self.immix_space.rc_rebuild_reusable_blocks();
+            if super::rc::rc_retain_on() {
+                eprintln!("[RC-REUSE] rebuild: freed_dead_blocks={freed} reusable_blocks={pushed}");
+            }
+        }
         self.report_retention();
         self.evaluate_rc_effectiveness();
         self.dump_rc_stats();

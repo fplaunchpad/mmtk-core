@@ -838,6 +838,115 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         r
     }
 
+    /// RC line liveness: true iff every RC-table entry covering `line` is zero (no live object
+    /// starts in it and no straddle continuation marker is set). Holds only between pauses, when
+    /// all increments and decrements have been applied (our RC work is stop-the-world).
+    fn rc_line_is_free(line: Line) -> bool {
+        use crate::util::metadata::side_metadata::address_to_meta_address;
+        let rc = crate::util::rc::RC_TABLE;
+        let start = address_to_meta_address(&rc, line.start());
+        let end = address_to_meta_address(&rc, line.start() + Line::BYTES);
+        let mut a = start;
+        while a < end {
+            if unsafe { a.load::<u8>() } != 0 {
+                return false;
+            }
+            a += 1usize;
+        }
+        true
+    }
+
+    /// RC hole search (after the reference `rc_get_next_available_lines`, adapted). A hole starts
+    /// at line 0 of the block or at the SECOND of two consecutive free lines (the first free line
+    /// after a live one may hold the tail of an object that starts in the live line: the RC table
+    /// records only object starts and interior straddle lines, not the last partial line). OCaml
+    /// adaptation: an object reference is one word past its header, so an object whose reference
+    /// is the first word of line L has its header in the last word of line L-1; the hole therefore
+    /// ends one line early when the first RC entry of the terminating line is live. The field-unlog
+    /// bits of the hole are cleared so stale bits of dead mature objects do not make the field
+    /// barrier log writes into the young objects allocated there.
+    fn rc_get_next_available_lines(&self, search_start: Line) -> Option<(Line, Line)> {
+        let block = search_start.block();
+        let first = block.start_line();
+        let n = Block::LINES;
+        let mut i = search_start.get_index_within_block();
+        let line_at = |k: usize| first.next_nth(k);
+        while i < n {
+            // Find a start.
+            while i < n {
+                let free = Self::rc_line_is_free(line_at(i));
+                let prev_free = i == 0 || Self::rc_line_is_free(line_at(i - 1));
+                if free && prev_free {
+                    break;
+                }
+                i += 1;
+            }
+            if i >= n {
+                return None;
+            }
+            let start = i;
+            let mut end = i;
+            while end < n && Self::rc_line_is_free(line_at(end)) {
+                end += 1;
+            }
+            let hole_end = if end < n {
+                let term = line_at(end);
+                let first_ref = unsafe { ObjectReference::from_raw_address_unchecked(term.start()) };
+                if crate::util::rc::RefCountHelper::<VM>::NEW.count(first_ref) != 0 {
+                    end - 1
+                } else {
+                    end
+                }
+            } else {
+                end
+            };
+            if hole_end > start {
+                let (s, e) = (line_at(start), line_at(hole_end));
+                VM::VMObjectModel::GLOBAL_FIELD_UNLOG_BIT_SPEC
+                    .as_spec()
+                    .extract_side_spec()
+                    .bzero_metadata(s.start(), (hole_end - start) * Line::BYTES);
+                self.reused_lines_consumed
+                    .fetch_add(hole_end - start, Ordering::Relaxed);
+                return Some((s, e));
+            }
+            i = end + 1;
+        }
+        None
+    }
+
+    /// Rebuild the reusable-block list after a pause (all sweeps done, mutators stopped, their
+    /// allocators reset): free every held block whose RC table is all zero (dead blocks a sweep
+    /// missed), and push every other held block that has at least one hole. Returns (freed, pushed).
+    pub(crate) fn rc_rebuild_reusable_blocks(&mut self) -> (usize, usize) {
+        self.reusable_blocks.reset();
+        let mut freed = 0;
+        let mut pushed = 0;
+        let chunks: Vec<Chunk> = self.chunk_map.all_chunks().collect();
+        for chunk in chunks {
+            for block in chunk.iter_region::<Block>() {
+                if block.get_state() == BlockState::Unallocated {
+                    continue;
+                }
+                if block.rc_dead() {
+                    if block.rc_sweep_mature::<VM>(self, false, true) {
+                        freed += 1;
+                    }
+                    continue;
+                }
+                if self.rc_get_next_available_lines(block.start_line()).is_some() {
+                    self.reusable_blocks.push(block);
+                    pushed += 1;
+                }
+            }
+        }
+        // The search above cleared unlog bits and counted lines for holes it only probed;
+        // neither matters (the holes are free), but reset the counter.
+        self.reused_lines_consumed.store(0, Ordering::Relaxed);
+        self.reusable_blocks.flush_all();
+        (freed, pushed)
+    }
+
     /// Get the number of defrag headroom pages.
     pub fn defrag_headroom_pages(&self) -> usize {
         self.defrag.defrag_headroom_pages(self)
@@ -1161,13 +1270,25 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         if super::BLOCK_ONLY {
             return None;
         }
-        // Minimal RC cut: DISABLE partial-block (recycled-line) reuse — always allocate fresh clean
-        // blocks. The RC reuse path (`init_rc(copy, reuse=true)` + `reused_lines_consumed` tracking +
-        // the per-line RC reuse counter) is the most fragile part of the LXR allocator (phase-epoch
-        // asserts, straddle-line bookkeeping on partially-live blocks); deferring it keeps the first
-        // RC bring-up correct. Throughput cost only. Reusable blocks are still populated by the
-        // standard sweep but never handed back out under RC.
+        // RC: partial-block (recycled-line) reuse is off unless `MMTK_RC_LINE_REUSE` is set. When
+        // on, the list is rebuilt after every pause by `rc_rebuild_reusable_blocks` (blocks with
+        // free lines by the RC table), and holes are found by `rc_get_next_available_lines`. A
+        // block is popped by exactly one allocator per mutator phase (the list is rebuilt only
+        // while mutators are stopped, after their allocators and TLABs were reset), so no two
+        // allocators share a block. Without it, every block holding one survivor stays whole
+        // (research/lxr-capacity: the h probe holds one 32 KiB block per 520-byte survivor).
         if self.rc_enabled {
+            if !rc_line_reuse_on() || copy {
+                return None;
+            }
+            while let Some(block) = self.reusable_blocks.pop() {
+                // Freed since the rebuild (a later sweep in the same pause cannot run, but be
+                // defensive): skip.
+                if block.get_state() == BlockState::Unallocated {
+                    continue;
+                }
+                return Some(block);
+            }
             return None;
         }
         loop {
@@ -1483,6 +1604,9 @@ impl<VM: VMBinding> ImmixSpace<VM> {
     #[allow(clippy::assertions_on_constants)]
     pub fn get_next_available_lines(&self, search_start: Line) -> Option<(Line, Line)> {
         debug_assert!(!super::BLOCK_ONLY);
+        if self.rc_enabled {
+            return self.rc_get_next_available_lines(search_start);
+        }
         let unavail_state = self.line_unavail_state.load(Ordering::Acquire);
         let current_state = self.line_mark_state.load(Ordering::Acquire);
         let block = search_start.block();
