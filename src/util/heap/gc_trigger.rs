@@ -131,6 +131,13 @@ impl<VM: VMBinding> GCTrigger<VM> {
         self.request_flag.store(false, Ordering::Relaxed);
     }
 
+    /// A mutator has requested a collection, but not all mutators have stopped
+    /// yet. The VM's active-pause flag must cover the interval after this flag
+    /// is cleared, until mutators resume.
+    pub(crate) fn is_collection_requested(&self) -> bool {
+        self.request_flag.load(Ordering::Relaxed)
+    }
+
     /// This method is called periodically by the allocation subsystem
     /// (by default, each time a page is consumed), and provides the
     /// collector with an opportunity to collect.

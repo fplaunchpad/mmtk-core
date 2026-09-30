@@ -410,6 +410,14 @@ impl<VM: VMBinding> MMTK<VM> {
         self.state.is_user_triggered_collection()
     }
 
+    /// Whether a mutator-requested collection is pending. The request is
+    /// cleared after all mutators stop, before GC work runs. Bindings whose
+    /// `block_for_gc` waits on their own active-pause flag must also wait on
+    /// this predicate to cover the interval before `stop_all_mutators` starts.
+    pub fn is_collection_requested(&self) -> bool {
+        self.gc_trigger.is_collection_requested()
+    }
+
     /// The application code has requested a collection. This is just a GC hint, and
     /// we may ignore it.
     ///
