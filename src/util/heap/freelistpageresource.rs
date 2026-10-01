@@ -1,8 +1,9 @@
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
-/// Return freed large-object pages to the OS (madvise DONTNEED) on release.
-/// Default ON; opt out with MMTK_RELEASE_LOS_PAGES=0. See release_pages.
-#[cfg(target_os = "linux")]
+/// Return freed large-object pages to the OS (`memory::release_pages`) on
+/// release, on Linux and macOS. Default ON; opt out with
+/// MMTK_RELEASE_LOS_PAGES=0. See release_pages.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn release_los_pages() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("MMTK_RELEASE_LOS_PAGES").map_or(true, |v| v != "0"))
@@ -362,12 +363,17 @@ impl<VM: VMBinding> FreeListPageResource<VM> {
         // and the LOS-aware mature-pressure law bounds its pool via
         // ordinary fulls. Refault zero-fills; the LOS skips acquire-time
         // zeroing when this is active (see CommonPlan). Opt out with
-        // MMTK_RELEASE_LOS_PAGES=0.
-        #[cfg(target_os = "linux")]
+        // MMTK_RELEASE_LOS_PAGES=0. Skipped when the range was just
+        // mprotected (PageProtect): on macOS the release replaces the mapping
+        // and would undo that protection.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             let bytes = (pages as usize) << crate::util::constants::LOG_BYTES_IN_PAGE;
-            if bytes >= (2 << 20) && release_los_pages() {
-                crate::util::memory::madvise_dontneed(first, bytes);
+            if bytes >= (2 << 20)
+                && release_los_pages()
+                && self.protect_memory_on_release.is_none()
+            {
+                crate::util::memory::release_pages(first, bytes, self.common.release_prot);
             }
         }
 
