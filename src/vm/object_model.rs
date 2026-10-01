@@ -81,6 +81,14 @@ use crate::vm::VMBinding;
 /// If a binding allows MMTk to use its header bits for object metadata, it needs to supply an object header
 /// address ([`ObjectModel::ref_to_header`]). MMTk will access header bits using this address.
 pub trait ObjectModel<VM: VMBinding> {
+    /// Experimental permission to omit the object-unlog write on GenImmix
+    /// nursery promotion. Returning true promises that all generational writes
+    /// in this VM use region barriers and never object-log-dependent APIs.
+    /// Other log-bit mapping/initialization and full-heap tracing are unchanged.
+    fn allow_region_only_promotion_unlog_elision() -> bool {
+        false
+    }
+
     // Per-object Metadata Spec definitions go here
     //
     // Note a number of Global and PolicySpecific side metadata specifications are already reserved by mmtk-core.
