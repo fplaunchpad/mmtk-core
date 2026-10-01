@@ -199,6 +199,21 @@ pub trait Scanning<VM: VMBinding> {
         true
     }
 
+    /// Cheap conservative upper bound on slots emitted by `scan_object`.
+    ///
+    /// The local nursery closure only buffers an object's slots when this bound
+    /// fits its width limit. Return `None` for unknown or variable-width layouts;
+    /// those objects use the ordinary scan packet and its bounded slot batches.
+    /// The bound must include every slot emitted by `scan_object`, independent of
+    /// field values, and must not scan fields or allocate proportional to width.
+    /// This does not change `support_slot_enqueuing` or the VM's scan protocol.
+    fn scan_object_slot_upper_bound(
+        _tls: VMWorkerThread,
+        _object: ObjectReference,
+    ) -> Option<usize> {
+        None
+    }
+
     /// OPT-IN single-tracer oldify hook (stock-OCaml-style minor GC fast
     /// path). When a plan drains a nursery closure under a single tracer in
     /// a stopped world, it MAY offer each slot packet to the binding via this
