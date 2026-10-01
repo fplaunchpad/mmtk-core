@@ -312,14 +312,65 @@ pub fn munmap(start: Address, size: usize) -> Result<()> {
     wrap_libc_call(&|| unsafe { libc::munmap(start.to_mut_ptr(), size) }, 0)
 }
 
-/// Return the physical pages backing the range to the OS while keeping the
-/// mapping (madvise MADV_DONTNEED). The range refaults as zero pages on next
-/// touch. Page-granular; best-effort (an madvise failure only means the pages
-/// stay resident).
+/// Return the physical pages backing `[start, start + size)` to the OS while
+/// keeping the range mapped and accessible with protection `prot`. Contract,
+/// identical on every supported OS: the pages leave the resident set now, and
+/// the range reads as zero on its next touch (it refaults as fresh zero
+/// pages). Best-effort on Linux (an madvise failure only means the pages stay
+/// resident). Callers must not hold live data in the range.
+///
+/// - Linux: `madvise(MADV_DONTNEED)` on the private anonymous mapping; the
+///   mapping and its protection are kept, so `prot` is unused.
+/// - macOS: a fresh `mmap(MAP_FIXED | MAP_ANON | MAP_PRIVATE, prot)` over the
+///   range. No madvise advice lowers the resident set on XNU: measured on
+///   macOS 26 (task `resident_size`, `ru_maxrss` and pages refaulted after
+///   release), `MADV_DONTNEED` and `MADV_FREE` leave the pages resident and
+///   their contents intact; `MADV_FREE_REUSABLE` drops only `phys_footprint`
+///   (the pages stay resident and keep their old contents, and must be
+///   re-announced with `MADV_FREE_REUSE` before reuse or the footprint ledger
+///   under-counts them); `MADV_ZERO` zeroes in place but keeps the pages
+///   resident. Only replacing the mapping drops `resident_size` immediately
+///   and gives the Linux zero-on-refault semantics. The range is rounded
+///   inward to the OS page (16 KiB on Apple Silicon, larger than MMTk's
+///   4 KiB `BYTES_IN_PAGE`): a partial OS page at either end stays resident.
 #[cfg(target_os = "linux")]
-pub fn madvise_dontneed(start: Address, size: usize) {
+pub fn release_pages(start: Address, size: usize, _prot: MmapProtection) {
     unsafe {
         libc::madvise(start.to_mut_ptr(), size, libc::MADV_DONTNEED);
+    }
+}
+
+/// See the Linux variant for the contract and the choice of mechanism.
+#[cfg(target_os = "macos")]
+pub fn release_pages(start: Address, size: usize, prot: MmapProtection) {
+    static OS_PAGE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let os_page = *OS_PAGE.get_or_init(|| unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize });
+    let lo = start.align_up(os_page);
+    let hi = (start + size).align_down(os_page);
+    if hi <= lo {
+        return;
+    }
+    let flags = libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_FIXED;
+    let ret = unsafe {
+        libc::mmap(
+            lo.to_mut_ptr(),
+            hi - lo,
+            prot.into_native_flags(),
+            flags,
+            -1,
+            0,
+        )
+    };
+    // XNU replaces a MAP_FIXED range atomically and restores the old entries
+    // if the new mapping cannot be entered, but a failure here still means the
+    // caller's view of the range is unknown: fail loudly rather than run on.
+    if ret != lo.to_mut_ptr() {
+        panic!(
+            "release_pages: mmap(MAP_FIXED) over {}..{} failed: {}",
+            lo,
+            hi,
+            Error::last_os_error()
+        );
     }
 }
 

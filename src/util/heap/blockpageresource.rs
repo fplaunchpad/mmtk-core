@@ -30,8 +30,8 @@ pub struct BlockPageResource<VM: VMBinding, B: Region + 'static> {
 }
 
 /// Whether freed blocks return their pages to the OS (see release_block).
-/// Read once; default off, MMTK_RELEASE_FREED_PAGES=1 enables.
-#[cfg(target_os = "linux")]
+/// Read once; default off, MMTK_RELEASE_FREED_PAGES=1 enables (Linux and macOS).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn release_freed_pages() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -191,17 +191,15 @@ impl<VM: VMBinding, B: Region> BlockPageResource<VM, B> {
         let pages = 1 << Self::LOG_PAGES;
         debug_assert!(pages as usize <= self.common().accounting.get_committed_pages());
         self.common().accounting.release(pages as _);
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         if force_return_pages || release_freed_pages() {
-            unsafe {
-                libc::madvise(
-                    block.start().to_mut_ptr(),
-                    (pages as usize) << crate::util::constants::LOG_BYTES_IN_PAGE,
-                    libc::MADV_DONTNEED,
-                );
-            }
+            crate::util::memory::release_pages(
+                block.start(),
+                (pages as usize) << crate::util::constants::LOG_BYTES_IN_PAGE,
+                self.common().release_prot,
+            );
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let _ = force_return_pages;
         self.block_queue.push(block)
     }

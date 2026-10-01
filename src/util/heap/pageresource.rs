@@ -126,6 +126,10 @@ pub struct CommonPageResource {
 
     pub vm_map: &'static dyn VMMap,
     head_discontiguous_region: Mutex<Address>,
+    /// Protection that page return (`memory::release_pages`) re-establishes
+    /// on macOS, where returning pages replaces the mapping. The owning space
+    /// sets it from its `mmap_strategy()`; read-write by default.
+    pub release_prot: crate::util::memory::MmapProtection,
 }
 
 impl CommonPageResource {
@@ -138,6 +142,7 @@ impl CommonPageResource {
             vm_map,
 
             head_discontiguous_region: Mutex::new(Address::ZERO),
+            release_prot: crate::util::memory::MmapProtection::ReadWrite,
         }
     }
 

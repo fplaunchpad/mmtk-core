@@ -513,20 +513,24 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             num_clean_blocks_released_lazy: AtomicUsize::new(0),
             copy_alloc_bytes: AtomicUsize::new(0),
             reused_lines_consumed: AtomicUsize::new(0),
-            pr: if common.vmrequest.is_discontiguous() {
-                BlockPageResource::new_discontiguous(
-                    Block::LOG_PAGES,
-                    vm_map,
-                    scheduler.num_workers(),
-                )
-            } else {
-                BlockPageResource::new_contiguous(
-                    Block::LOG_PAGES,
-                    common.start,
-                    common.extent,
-                    vm_map,
-                    scheduler.num_workers(),
-                )
+            pr: {
+                let mut pr = if common.vmrequest.is_discontiguous() {
+                    BlockPageResource::new_discontiguous(
+                        Block::LOG_PAGES,
+                        vm_map,
+                        scheduler.num_workers(),
+                    )
+                } else {
+                    BlockPageResource::new_contiguous(
+                        Block::LOG_PAGES,
+                        common.start,
+                        common.extent,
+                        vm_map,
+                        scheduler.num_workers(),
+                    )
+                };
+                pr.common_mut().release_prot = common.mmap_strategy().prot;
+                pr
             },
             common,
             chunk_map: ChunkMap::new(space_index),

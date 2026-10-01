@@ -66,6 +66,67 @@ impl<VM: VMBinding, P: GenerationalPlanExt<VM> + PlanTraceObject<VM>, const KIND
         }
     }
 
+    fn flush(&mut self) {
+        // Experimental closure fusion: preserve the policy's atomic forwarding and
+        // copy hooks. The VM still scans continuations and all special layouts.
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let enabled = *ENABLED
+            .get_or_init(|| std::env::var("MMTK_LOCAL_NURSERY_TRACE").as_deref() == Ok("1"));
+        if !enabled
+            || cfg!(feature = "extreme_assertions")
+            || *self.mmtk().get_options().plan != crate::util::options::PlanSelector::GenImmix
+            || *self.mmtk().get_options().count_live_bytes_in_gc
+        {
+            let nodes = self.pop_nodes();
+            if !nodes.is_empty() {
+                self.start_or_dispatch_scan_work(self.create_scan_work(nodes));
+            }
+            return;
+        }
+        static SPILL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let threshold = *SPILL.get_or_init(|| {
+            std::env::var("MMTK_LOCAL_NURSERY_SPILL")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(4096)
+                .max(2)
+        });
+        struct Slots<S>(Vec<S>);
+        impl<S: crate::vm::slot::Slot> SlotVisitor<S> for Slots<S> {
+            fn visit_slot(&mut self, slot: S) {
+                self.0.push(slot);
+            }
+        }
+        // Reuse storage across frontier waves within this incoming packet.
+        // New packets, vector growth and frontier spills still allocate.
+        let mut slots = Slots(Vec::new());
+        let mut current = Vec::new();
+        let tls = self.worker().tls;
+        while !self.nodes.is_empty() {
+            self.base.nodes.swap(&mut current);
+            // Publish a coarse frontier to retain work stealing. Already traced
+            // objects are scanned by the ordinary plan packet, never retraced.
+            if current.len() > threshold {
+                let spill = current.split_off(current.len() / 2);
+                self.mmtk().scheduler.work_buckets[self.bucket].add(self.create_scan_work(spill));
+            }
+            for object in current.iter().copied() {
+                if !VM::VMScanning::support_slot_enqueuing(tls, object) {
+                    // Keep the VM's direct-tracing protocol for unusual layouts.
+                    self.start_or_dispatch_scan_work(self.create_scan_work(vec![object]));
+                    continue;
+                }
+                slots.0.clear();
+                VM::VMScanning::scan_object(tls, object, &mut slots);
+                self.plan.post_scan_object(object);
+                for index in 0..slots.0.len() {
+                    self.process_slot(slots.0[index]);
+                }
+            }
+            current.clear();
+        }
+    }
+
     fn create_scan_work(&self, nodes: Vec<ObjectReference>) -> Self::ScanObjectsWorkType {
         PlanScanObjects::new(self.plan, nodes, false, self.bucket)
     }

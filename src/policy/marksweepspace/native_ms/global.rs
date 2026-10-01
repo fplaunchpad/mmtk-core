@@ -321,20 +321,24 @@ impl<VM: VMBinding> MarkSweepSpace<VM> {
         let common = CommonSpace::new(args.into_policy_args(false, false, local_specs));
         let space_index = common.descriptor.get_index();
         MarkSweepSpace {
-            pr: if is_discontiguous {
-                BlockPageResource::new_discontiguous(
-                    Block::LOG_PAGES,
-                    vm_map,
-                    scheduler.num_workers(),
-                )
-            } else {
-                BlockPageResource::new_contiguous(
-                    Block::LOG_PAGES,
-                    common.start,
-                    common.extent,
-                    vm_map,
-                    scheduler.num_workers(),
-                )
+            pr: {
+                let mut pr = if is_discontiguous {
+                    BlockPageResource::new_discontiguous(
+                        Block::LOG_PAGES,
+                        vm_map,
+                        scheduler.num_workers(),
+                    )
+                } else {
+                    BlockPageResource::new_contiguous(
+                        Block::LOG_PAGES,
+                        common.start,
+                        common.extent,
+                        vm_map,
+                        scheduler.num_workers(),
+                    )
+                };
+                pr.common_mut().release_prot = common.mmap_strategy().prot;
+                pr
             },
             common,
             chunk_map: ChunkMap::new(space_index),
