@@ -105,7 +105,7 @@ pub struct PrepareCollector;
 impl<VM: VMBinding> GCWork<VM> for PrepareCollector {
     fn do_work(&mut self, worker: &mut GCWorker<VM>, mmtk: &'static MMTK<VM>) {
         trace!("Prepare Collector");
-        worker.get_copy_context_mut().prepare();
+        worker.get_copy_context_mut().prepare(mmtk);
         mmtk.get_plan().prepare_worker(worker);
     }
 }

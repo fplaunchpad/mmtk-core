@@ -1534,7 +1534,7 @@ impl<VM: VMBinding> ImmixSpace<VM> {
     }
 
     /// Post copy routine for Immix copy contexts
-    fn post_copy(&self, object: ObjectReference, _bytes: usize) {
+    fn post_copy(&self, object: ObjectReference, _bytes: usize, omit_unlog: bool) {
         // lxr P2.F: under RC, RC metadata travels with the copy in the trace path (P2.3) and
         // the mark-bit / line-mark post-copy fixups below do not apply, so this is a no-op.
         // Gated; dead for all non-RC plans (rc_enabled always false until the P3 LXR plan).
@@ -1562,7 +1562,7 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         if !super::MARK_LINE_AT_SCAN_TIME {
             self.mark_lines(object);
         }
-        if self.common.unlog_traced_object {
+        if self.common.unlog_traced_object && !omit_unlog {
             VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC
                 .mark_byte_as_unlogged::<VM>(object, Ordering::Relaxed);
         }
@@ -1773,7 +1773,7 @@ impl<VM: VMBinding> PolicyCopyContext for ImmixCopyContext<VM> {
         self.allocator.alloc(bytes, align, offset)
     }
     fn post_copy(&mut self, obj: ObjectReference, bytes: usize) {
-        self.get_space().post_copy(obj, bytes)
+        self.get_space().post_copy(obj, bytes, false)
     }
 }
 
@@ -1826,11 +1826,22 @@ impl<VM: VMBinding> PolicyCopyContext for ImmixHybridCopyContext<VM> {
         }
     }
     fn post_copy(&mut self, obj: ObjectReference, bytes: usize) {
-        self.get_space().post_copy(obj, bytes)
+        self.get_space().post_copy(obj, bytes, false)
     }
 }
 
 impl<VM: VMBinding> ImmixHybridCopyContext<VM> {
+    /// Only the plan/semantics-gated nursery promotion experiment may pass true.
+    pub(crate) fn post_copy_with_unlog_elision(
+        &mut self,
+        obj: ObjectReference,
+        bytes: usize,
+        omit_unlog: bool,
+    ) {
+        debug_assert!(!omit_unlog || !self.get_space().in_defrag());
+        self.get_space().post_copy(obj, bytes, omit_unlog);
+    }
+
     pub(crate) fn new(
         tls: VMWorkerThread,
         context: Arc<AllocatorContext<VM>>,

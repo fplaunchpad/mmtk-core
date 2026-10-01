@@ -60,6 +60,8 @@ pub struct GCWorkerCopyContext<VM: VMBinding> {
     pub immix_hybrid: [MaybeUninit<ImmixHybridCopyContext<VM>>; MAX_IMMIX_HYBRID_COPY_ALLOCATORS],
     /// The config for the plan
     config: CopyConfig<VM>,
+    /// Latched per pause; never enabled for full-heap copies or other plans.
+    omit_promotion_unlog: bool,
 }
 
 impl<VM: VMBinding> GCWorkerCopyContext<VM> {
@@ -127,15 +129,24 @@ impl<VM: VMBinding> GCWorkerCopyContext<VM> {
                 unsafe { self.immix[index as usize].assume_init_mut() }.post_copy(object, bytes)
             }
             CopySelector::ImmixHybrid(index) => {
+                let omit_unlog = self.omit_promotion_unlog
+                    && matches!(semantics, CopySemantics::PromoteToMature);
                 unsafe { self.immix_hybrid[index as usize].assume_init_mut() }
-                    .post_copy(object, bytes)
+                    .post_copy_with_unlog_elision(object, bytes, omit_unlog)
             }
             CopySelector::Unused => unreachable!(),
         }
     }
 
     /// Prepare the copying allocators.
-    pub fn prepare(&mut self) {
+    pub fn prepare(&mut self, mmtk: &MMTK<VM>) {
+        self.omit_promotion_unlog =
+            *mmtk.get_options().plan == crate::util::options::PlanSelector::GenImmix
+                && mmtk
+                    .get_plan()
+                    .generational()
+                    .is_some_and(|g| g.is_current_gc_nursery())
+                && VM::VMObjectModel::allow_region_only_promotion_unlog_elision();
         // Delegate to prepare() for each policy copy context
         for (_, selector) in self.config.copy_mapping.iter() {
             match selector {
@@ -184,6 +195,7 @@ impl<VM: VMBinding> GCWorkerCopyContext<VM> {
             immix: unsafe { MaybeUninit::uninit().assume_init() },
             immix_hybrid: unsafe { MaybeUninit::uninit().assume_init() },
             config,
+            omit_promotion_unlog: false,
         };
         let context = Arc::new(AllocatorContext::new(mmtk));
 
@@ -225,6 +237,7 @@ impl<VM: VMBinding> GCWorkerCopyContext<VM> {
             immix: unsafe { MaybeUninit::uninit().assume_init() },
             immix_hybrid: unsafe { MaybeUninit::uninit().assume_init() },
             config: CopyConfig::default(),
+            omit_promotion_unlog: false,
         }
     }
 }
