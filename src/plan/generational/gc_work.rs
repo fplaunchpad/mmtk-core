@@ -88,7 +88,7 @@ impl<VM: VMBinding, P: GenerationalPlanExt<VM> + PlanTraceObject<VM>, const KIND
             std::env::var("MMTK_LOCAL_NURSERY_SPILL")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(4096)
+                .unwrap_or(64)
                 .max(2)
         });
         struct Slots<S>(Vec<S>);
@@ -111,8 +111,18 @@ impl<VM: VMBinding, P: GenerationalPlanExt<VM> + PlanTraceObject<VM>, const KIND
                 self.mmtk().scheduler.work_buckets[self.bucket].add(self.create_scan_work(spill));
             }
             for object in current.iter().copied() {
-                if !VM::VMScanning::support_slot_enqueuing(tls, object) {
-                    // Keep the VM's direct-tracing protocol for unusual layouts.
+                if !VM::VMScanning::support_slot_enqueuing(tls, object)
+                    || !matches!(
+                        VM::VMScanning::scan_object_slot_upper_bound(tls, object),
+                        Some(bound) if bound <= threshold
+                    )
+                {
+                    // Decide before scanning or growing the local slot vector.
+                    // Ordinary scan work uses ObjectsClosure's bounded slot
+                    // batches, preserving parallelism for a single wide object.
+                    // Preserve the baseline immediate-scan optimization: its
+                    // slot visitor queues edge packets, never processes them
+                    // inline, including while a continuation scan lock is held.
                     self.start_or_dispatch_scan_work(self.create_scan_work(vec![object]));
                     continue;
                 }
